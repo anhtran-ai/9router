@@ -245,7 +245,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       // Codex: start proxy with server-side session (auto-exchange) + fallback to channels
       let codexProxyActive = false;
       let codexServerSide = false;
-      if (provider === "codex") {
+      if (provider === "codex" && isLocalhost) {
         try {
           const proxyUrl = new URL(`${apiBase}/codex/start-proxy`, window.location.origin);
           proxyUrl.searchParams.set("app_port", appPort);
@@ -264,7 +264,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       // xAI: same fixed-port server-side proxy pattern as codex (port 56121)
       let xaiProxyActive = false;
       let xaiServerSide = false;
-      if (provider === "xai") {
+      if (provider === "xai" && isLocalhost) {
         try {
           const proxyUrl = new URL(`${apiBase}/xai/start-proxy`, window.location.origin);
           proxyUrl.searchParams.set("app_port", appPort);
