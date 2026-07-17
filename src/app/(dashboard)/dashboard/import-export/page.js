@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Button, Card } from "@/shared/components";
+import { Button, Card, Modal } from "@/shared/components";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -95,10 +95,111 @@ function StatusPanel({ status }) {
   );
 }
 
+function ExportCombosModal({
+  isOpen,
+  combos,
+  selectedNames,
+  onSelectedNamesChange,
+  onClose,
+  onExport,
+  exporting,
+}) {
+  const selectAllRef = useRef(null);
+  const selectedCount = combos.filter((combo) => selectedNames.has(combo.name)).length;
+  const allSelected = combos.length > 0 && selectedCount === combos.length;
+  const someSelected = selectedCount > 0 && !allSelected;
+
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someSelected;
+  }, [someSelected]);
+
+  const toggleAll = () => {
+    onSelectedNamesChange(new Set(allSelected ? [] : combos.map((combo) => combo.name)));
+  };
+
+  const toggleCombo = (name) => {
+    const next = new Set(selectedNames);
+    if (next.has(name)) next.delete(name);
+    else next.add(name);
+    onSelectedNamesChange(next);
+  };
+
+  return (
+    <Modal isOpen={isOpen} onClose={onClose} title="Export Combos" size="lg">
+      <div className="space-y-4">
+        <div>
+          <p className="text-sm text-text-muted">
+            Choose the Combo items to include in the JSON file. All items are selected by default.
+          </p>
+          <p className="mt-1 text-xs text-text-muted">
+            Only Combo definitions and routing strategies are exported.
+          </p>
+        </div>
+
+        <div className="overflow-hidden rounded-[10px] border border-border">
+          <label className="flex cursor-pointer items-center gap-3 border-b border-border bg-surface-2 px-3 py-2.5">
+            <input
+              ref={selectAllRef}
+              type="checkbox"
+              checked={allSelected}
+              onChange={toggleAll}
+              className="size-4 shrink-0 cursor-pointer accent-primary"
+            />
+            <span className="flex-1 text-sm font-medium text-text-main">Select all</span>
+            <span className="text-xs text-text-muted">{selectedCount} / {combos.length} selected</span>
+          </label>
+
+          <div className="max-h-[340px] overflow-y-auto custom-scrollbar">
+            {combos.map((combo) => (
+              <label
+                key={combo.id || combo.name}
+                className="flex cursor-pointer items-center gap-3 border-b border-border-subtle px-3 py-2.5 transition-colors last:border-0 hover:bg-surface-2"
+              >
+                <input
+                  type="checkbox"
+                  checked={selectedNames.has(combo.name)}
+                  onChange={() => toggleCombo(combo.name)}
+                  className="size-4 shrink-0 cursor-pointer accent-primary"
+                />
+                <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                  <span className="material-symbols-outlined text-[17px]">layers</span>
+                </span>
+                <span className="min-w-0 flex-1">
+                  <code className="block truncate font-mono text-sm font-medium text-text-main">{combo.name}</code>
+                  <span className="text-xs text-text-muted">
+                    {combo.models?.length || 0} model(s) · {combo.kind || "llm"}
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2 pt-1 sm:flex-row">
+          <Button variant="ghost" fullWidth onClick={onClose} disabled={exporting}>
+            Cancel
+          </Button>
+          <Button
+            fullWidth
+            icon="download"
+            loading={exporting}
+            disabled={selectedCount === 0}
+            onClick={onExport}
+          >
+            Export selected ({selectedCount})
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 export default function ImportExportPage() {
   const fileRef = useRef(null);
-  const [comboCount, setComboCount] = useState(0);
-  const [countLoading, setCountLoading] = useState(true);
+  const [combos, setCombos] = useState([]);
+  const [combosLoading, setCombosLoading] = useState(true);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [selectedComboNames, setSelectedComboNames] = useState(new Set());
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [importFile, setImportFile] = useState(null);
@@ -106,29 +207,38 @@ export default function ImportExportPage() {
   const [conflictPolicy, setConflictPolicy] = useState("update");
   const [status, setStatus] = useState(null);
 
-  const loadComboCount = useCallback(async () => {
+  const loadCombos = useCallback(async () => {
     try {
       const response = await fetch("/api/combos", { cache: "no-store" });
       const data = await response.json();
-      if (response.ok) setComboCount((data.combos || []).length);
+      if (response.ok) setCombos(data.combos || []);
     } finally {
-      setCountLoading(false);
+      setCombosLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    loadComboCount();
-  }, [loadComboCount]);
+    loadCombos();
+  }, [loadCombos]);
+
+  const openExportModal = () => {
+    setSelectedComboNames(new Set(combos.map((combo) => combo.name)));
+    setShowExportModal(true);
+  };
 
   const handleExport = async () => {
+    if (selectedComboNames.size === 0) return;
     setExporting(true);
     setStatus(null);
     try {
       const response = await fetch("/api/import-export/combos", { cache: "no-store" });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Unable to export combos");
+      const selectedCombos = data.combos.filter((combo) => selectedComboNames.has(combo.name));
+      if (selectedCombos.length === 0) throw new Error("None of the selected Combos are still available");
+      const exportData = { ...data, combos: selectedCombos };
       const filename = exportFilename();
-      const blob = new Blob([`${JSON.stringify(data, null, 2)}\n`], { type: "application/json" });
+      const blob = new Blob([`${JSON.stringify(exportData, null, 2)}\n`], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -137,10 +247,11 @@ export default function ImportExportPage() {
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
+      setShowExportModal(false);
       setStatus({
         type: "success",
         title: "Combo export completed",
-        message: `Exported ${data.combos.length} combo item(s) to ${filename}.`,
+        message: `Exported ${selectedCombos.length} combo item(s) to ${filename}.`,
         time: new Date().toLocaleString(),
       });
     } catch (error) {
@@ -206,7 +317,7 @@ export default function ImportExportPage() {
         summary,
         results: data.results || [],
       });
-      await loadComboCount();
+      await loadCombos();
     } catch (error) {
       setStatus({
         type: "error",
@@ -248,18 +359,17 @@ export default function ImportExportPage() {
                 <div>
                   <h3 className="font-medium text-text-main">Export Combos</h3>
                   <p className="mt-1 text-sm text-text-muted">
-                    {countLoading ? "Counting combo items..." : `${comboCount} combo item(s) currently available.`}
+                    {combosLoading ? "Counting combo items..." : `${combos.length} combo item(s) currently available.`}
                   </p>
                 </div>
               </div>
               <Button
                 className="mt-5 w-full sm:w-auto"
                 icon="download"
-                loading={exporting}
-                disabled={countLoading}
-                onClick={handleExport}
+                disabled={combosLoading || combos.length === 0}
+                onClick={openExportModal}
               >
-                Export all Combos
+                Export Combos
               </Button>
             </section>
 
@@ -317,6 +427,16 @@ export default function ImportExportPage() {
           <StatusPanel status={status} />
         </div>
       </Card>
+
+      <ExportCombosModal
+        isOpen={showExportModal}
+        combos={combos}
+        selectedNames={selectedComboNames}
+        onSelectedNamesChange={setSelectedComboNames}
+        onClose={() => setShowExportModal(false)}
+        onExport={handleExport}
+        exporting={exporting}
+      />
     </div>
   );
 }
