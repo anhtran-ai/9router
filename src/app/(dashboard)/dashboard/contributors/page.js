@@ -15,6 +15,7 @@ export default function ContributorsAdminPage() {
     () => Object.entries(OAUTH_PROVIDERS).filter(([, provider]) => !provider.hidden),
     [],
   );
+  const [alias, setAlias] = useState("");
   const [selected, setSelected] = useState(DEFAULT_PROVIDERS);
   const [expiresInMinutes, setExpiresInMinutes] = useState(30);
   const [invites, setInvites] = useState([]);
@@ -47,11 +48,12 @@ export default function ContributorsAdminPage() {
       const response = await fetch("/api/contributor-admin/invites", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ allowedProviders: selected, expiresInMinutes }),
+        body: JSON.stringify({ alias, allowedProviders: selected, expiresInMinutes }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Unable to create invite");
       setCreatedUrl(data.url);
+      setAlias("");
       await loadInvites();
     } catch (err) {
       setError(err.message);
@@ -80,6 +82,22 @@ export default function ContributorsAdminPage() {
 
       <Card title="Create contribution link" subtitle="The link closes after the first successful OAuth connection." icon="person_add">
         <div className="space-y-5">
+          <div className="max-w-md">
+            <label htmlFor="contributor-alias" className="mb-2 block text-sm font-medium text-text-main">
+              Alias
+            </label>
+            <input
+              id="contributor-alias"
+              type="text"
+              value={alias}
+              maxLength={100}
+              onChange={(event) => setAlias(event.target.value)}
+              placeholder="e.g. Nguyen Van A / Marketing team"
+              className="h-9 w-full rounded-[10px] border border-border bg-surface px-3 text-sm text-text-main outline-none focus:border-brand-500"
+            />
+            <p className="mt-1.5 text-xs text-text-muted">Internal note identifying who receives this link.</p>
+          </div>
+
           <div>
             <label className="mb-2 block text-sm font-medium text-text-main">Allowed providers</label>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
@@ -115,7 +133,7 @@ export default function ContributorsAdminPage() {
             </select>
           </div>
 
-          <Button icon="link" loading={loading} disabled={selected.length === 0} onClick={createInvite}>
+          <Button icon="link" loading={loading} disabled={selected.length === 0 || !alias.trim()} onClick={createInvite}>
             Create one-time link
           </Button>
 
@@ -141,6 +159,7 @@ export default function ContributorsAdminPage() {
             <thead className="border-b border-border text-xs uppercase text-text-muted">
               <tr>
                 <th className="px-3 py-2">Created</th>
+                <th className="px-3 py-2">Alias</th>
                 <th className="px-3 py-2">Providers</th>
                 <th className="px-3 py-2">Status</th>
                 <th className="px-3 py-2">Expires / Used</th>
@@ -151,6 +170,7 @@ export default function ContributorsAdminPage() {
               {invites.map((invite) => (
                 <tr key={invite.id} className="border-b border-border-subtle last:border-0">
                   <td className="px-3 py-3 text-text-main">{formatDate(invite.createdAt)}</td>
+                  <td className="px-3 py-3 font-medium text-text-main">{invite.alias || "—"}</td>
                   <td className="px-3 py-3 text-text-muted">{invite.allowedProviders.join(", ")}</td>
                   <td className="px-3 py-3 capitalize text-text-main">{invite.status}</td>
                   <td className="px-3 py-3 text-text-muted">{formatDate(invite.usedAt || invite.expiresAt)}</td>
@@ -162,7 +182,7 @@ export default function ContributorsAdminPage() {
                 </tr>
               ))}
               {invites.length === 0 && (
-                <tr><td colSpan={5} className="px-3 py-8 text-center text-text-muted">No contribution links yet.</td></tr>
+                <tr><td colSpan={6} className="px-3 py-8 text-center text-text-muted">No contribution links yet.</td></tr>
               )}
             </tbody>
           </table>

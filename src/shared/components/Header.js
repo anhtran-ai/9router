@@ -154,6 +154,13 @@ const getPageInfo = (pathname) => {
       icon: "settings",
       breadcrumbs: [],
     };
+  if (pathname.includes("/contributors"))
+    return {
+      title: "Contributors",
+      description: "Create and manage scoped OAuth contribution links",
+      icon: "group_add",
+      breadcrumbs: [],
+    };
   if (pathname.includes("/translator"))
     return {
       title: "Translator",

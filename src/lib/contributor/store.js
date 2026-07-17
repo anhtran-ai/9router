@@ -25,13 +25,14 @@ async function saveInvite(invite) {
   return invite;
 }
 
-export async function createContributorInvite({ allowedProviders, expiresInMinutes = 30 }) {
+export async function createContributorInvite({ alias, allowedProviders, expiresInMinutes = 30 }) {
   const id = crypto.randomUUID();
   const secret = crypto.randomBytes(32).toString("base64url");
   const now = new Date();
   const safeMinutes = Math.min(Math.max(Number(expiresInMinutes) || 30, 5), 1440);
   const invite = {
     id,
+    alias,
     tokenHash: hashSecret(secret),
     allowedProviders: [...new Set(allowedProviders)],
     status: "active",

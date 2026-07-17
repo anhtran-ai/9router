@@ -17,6 +17,10 @@ export async function POST(request) {
   }
   try {
     const body = await request.json();
+    const alias = typeof body.alias === "string" ? body.alias.trim().slice(0, 100) : "";
+    if (!alias) {
+      return NextResponse.json({ error: "Alias is required" }, { status: 400 });
+    }
     const supported = new Set(getProviderNames());
     const allowedProviders = Array.isArray(body.allowedProviders)
       ? [...new Set(body.allowedProviders.filter((id) => supported.has(id)))]
@@ -25,6 +29,7 @@ export async function POST(request) {
       return NextResponse.json({ error: "Select at least one OAuth provider" }, { status: 400 });
     }
     const { invite, token } = await createContributorInvite({
+      alias,
       allowedProviders,
       expiresInMinutes: body.expiresInMinutes,
     });
