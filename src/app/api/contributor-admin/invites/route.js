@@ -6,6 +6,7 @@ import {
   revokeContributorInvite,
 } from "@/lib/contributor/store";
 import { isSameOrigin } from "@/lib/contributor/session";
+import { getPublicOrigin } from "@/lib/auth/oidc";
 
 export async function GET() {
   return NextResponse.json({ invites: await listContributorInvites() });
@@ -33,7 +34,11 @@ export async function POST(request) {
       allowedProviders,
       expiresInMinutes: body.expiresInMinutes,
     });
-    const url = new URL(`/contribute/${token}`, request.url).toString();
+    // Behind a reverse proxy, request.url can contain the container bind address
+    // (for example 0.0.0.0:20128). POST requests from the dashboard carry the
+    // browser's public Origin, which has already passed the same-origin check.
+    const publicOrigin = request.headers.get("origin") || getPublicOrigin(request);
+    const url = new URL(`/contribute/${token}`, publicOrigin).toString();
     const { tokenHash, ...safeInvite } = invite;
     return NextResponse.json({ invite: safeInvite, url }, { status: 201 });
   } catch (error) {
