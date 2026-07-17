@@ -75,11 +75,6 @@ export default function ContributorsAdminPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-text-main">Contributors</h1>
-        <p className="mt-1 text-sm text-text-muted">Create scoped, one-time links for people contributing OAuth accounts.</p>
-      </div>
-
       <Card title="Create contribution link" subtitle="The link closes after the first successful OAuth connection." icon="person_add">
         <div className="space-y-5">
           <div className="max-w-md">

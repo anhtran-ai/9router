@@ -305,28 +305,6 @@ export default function Sidebar({ onClose }) {
               <span className="text-[13px] font-medium">Remote</span>
             </button>
 
-            {/* Settings */}
-            <Link
-              href="/dashboard/profile"
-              onClick={onClose}
-              className={cn(
-                "flex items-center gap-3 px-3 py-1 rounded-lg transition-all group",
-                isActive("/dashboard/profile")
-                  ? "bg-primary/10 text-primary"
-                  : "text-text-muted hover:bg-surface-2 hover:text-text-main"
-              )}
-            >
-              <span
-                className={cn(
-                  "material-symbols-outlined text-[18px]",
-                  isActive("/dashboard/profile") ? "fill-1" : "group-hover:text-primary transition-colors"
-                )}
-              >
-                settings
-              </span>
-              <span className="text-[13px] font-medium">Settings</span>
-            </Link>
-
             {/* Contributors */}
             <Link
               href="/dashboard/contributors"
@@ -347,6 +325,28 @@ export default function Sidebar({ onClose }) {
                 group_add
               </span>
               <span className="text-[13px] font-medium">Contributors</span>
+            </Link>
+
+            {/* Settings */}
+            <Link
+              href="/dashboard/profile"
+              onClick={onClose}
+              className={cn(
+                "flex items-center gap-3 px-3 py-1 rounded-lg transition-all group",
+                isActive("/dashboard/profile")
+                  ? "bg-primary/10 text-primary"
+                  : "text-text-muted hover:bg-surface-2 hover:text-text-main"
+              )}
+            >
+              <span
+                className={cn(
+                  "material-symbols-outlined text-[18px]",
+                  isActive("/dashboard/profile") ? "fill-1" : "group-hover:text-primary transition-colors"
+                )}
+              >
+                settings
+              </span>
+              <span className="text-[13px] font-medium">Settings</span>
             </Link>
           </div>
         </nav>
