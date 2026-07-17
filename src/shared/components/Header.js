@@ -154,6 +154,13 @@ const getPageInfo = (pathname) => {
       icon: "settings",
       breadcrumbs: [],
     };
+  if (pathname.includes("/import-export"))
+    return {
+      title: "Import / Export",
+      description: "Transfer selected 9Router configuration items",
+      icon: "import_export",
+      breadcrumbs: [],
+    };
   if (pathname.includes("/contributors"))
     return {
       title: "Contributors",
