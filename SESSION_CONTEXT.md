@@ -8,7 +8,7 @@ provider credential, Docker environment value, private key, or host address.
 
 ## Repository state
 
-- Customized repository: `https://github.com/anhtran-ai/9router`
+- Canonical customized repository: `https://github.com/azox-ai/azox-9router`
 - Upstream repository: `https://github.com/decolua/9router`
 - Active branch: `main`
 - Current source commit: `226c4596d7bfd9ea1b0840e093e6eea6ebd41681`
