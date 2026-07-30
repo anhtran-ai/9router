@@ -2,6 +2,17 @@
 
 This repository is the canonical Azox-maintained 9Router codebase.
 
+## Mandatory session bootstrap
+
+Before planning or changing this repository, read the latest `main` version of:
+
+1. `azox-ai/azox-knowledge/MASTER_AGENT.md`
+2. `azox-ai/azox-knowledge/MEMORY.md`
+3. `azox-ai/azox-knowledge/agent-guidance/session-start.md`
+
+If canonical knowledge is unavailable, limit work to reversible discovery and
+report the missing context.
+
 Before changing code:
 
 1. Read `CLAUDE.md` for repository-specific commands and architecture guidance.
