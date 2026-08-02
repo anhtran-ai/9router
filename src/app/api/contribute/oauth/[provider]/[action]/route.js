@@ -12,8 +12,9 @@ const GET_ACTIONS = new Set([
   "start-proxy",
   "poll-status",
   "stop-proxy",
+  "ide-status",
 ]);
-const POST_ACTIONS = new Set(["exchange", "poll", "manual-code"]);
+const POST_ACTIONS = new Set(["exchange", "poll", "manual-code", "register-session"]);
 
 async function authorize(request, params, actions) {
   const values = await params;

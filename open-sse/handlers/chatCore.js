@@ -291,12 +291,16 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // Execute request
   let providerResponse, providerUrl, providerHeaders, finalBody;
+  // Most executors return their registry format. Cursor AgentService is an
+  // exception: it is decoded by the executor into OpenAI-compatible output.
+  let providerResponseFormat = targetFormat;
   try {
     const result = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
     providerResponse = result.response;
     providerUrl = result.url;
     providerHeaders = result.headers;
     finalBody = result.transformedBody;
+    providerResponseFormat = result.responseFormat || targetFormat;
     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
   } catch (error) {
     trackPendingRequest(model, provider, connectionId, false, true);
@@ -326,7 +330,18 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Handle 401/403 - try token refresh (skip for noAuth providers)
   if (!executor.noAuth && (providerResponse.status === HTTP_STATUS.UNAUTHORIZED || providerResponse.status === HTTP_STATUS.FORBIDDEN)) {
     try {
-      const newCredentials = await refreshWithRetry(() => executor.refreshCredentials(credentials, log), 3, log);
+      // Mutate credentials after each successful refresh: rotating refresh_token
+      // providers (xAI/grok-cli) issue a new RT on every refresh; without this,
+      // refreshWithRetry's 2nd/3rd attempt reuses the already-consumed RT →
+      // invalid_grant → auth_failed retryable=false.
+      const newCredentials = await refreshWithRetry(async () => {
+        const result = await executor.refreshCredentials(credentials, log);
+        if (result?.refreshToken && result.refreshToken !== credentials.refreshToken) {
+          if (result.accessToken) credentials.accessToken = result.accessToken;
+          credentials.refreshToken = result.refreshToken;
+        }
+        return result;
+      }, 3, log);
       if (newCredentials?.accessToken || newCredentials?.copilotToken) {
         if (log?.line) log.line(reqTag, "🔑", `TOKEN REFRESHED · ${provider}/${model}`);
         Object.assign(credentials, newCredentials);
@@ -335,7 +350,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         }
         try {
           const retryResult = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
-          if (retryResult.response.ok) { providerResponse = retryResult.response; providerUrl = retryResult.url; }
+          if (retryResult.response.ok) {
+            providerResponse = retryResult.response;
+            providerUrl = retryResult.url;
+            providerResponseFormat = retryResult.responseFormat || targetFormat;
+          }
         } catch { log?.warn?.("TOKEN", `${provider.toUpperCase()} | retry after refresh failed`); }
       } else {
         log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh failed`);
@@ -382,14 +401,14 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // True non-streaming response
   if (!stream) {
-    const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, reqLogger, toolNameMap, trackDone, appendLog });
+    const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, trackDone, appendLog });
     streamController.handleComplete();
     return result;
   }
 
   // Streaming response
   const { onStreamComplete, streamDetailId } = buildOnStreamComplete({ ...sharedCtx });
-  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete, streamDetailId });
+  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete, streamDetailId });
 }
 
 export function isTokenExpiringSoon(expiresAt, bufferMs = 5 * 60 * 1000) {
