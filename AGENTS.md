@@ -21,6 +21,11 @@ Before changing code:
 4. Read relevant shared policy in `azox-ai/azox-knowledge`.
 5. Confirm the issue has objective acceptance criteria and a risk level.
 
+For every upstream version upgrade, follow
+`docs/UPSTREAM_UPGRADE_HANDBOOK.md`. Do not merge a moving upstream branch,
+rewrite `main`, or deploy before its review, backup, regression, and approval
+gates are satisfied.
+
 Preserve upstream attribution and the MIT license. Never commit provider
 credentials, OAuth tokens, local databases, or generated runtime state.
 

@@ -1,6 +1,6 @@
 # 9Router customization context
 
-Last updated: 2026-07-18
+Last updated: 2026-08-02
 
 This is the safe handoff file for continuing the customized 9Router work in a
 new session. It intentionally contains no admin password, API key, OAuth token,
@@ -10,20 +10,28 @@ provider credential, Docker environment value, private key, or host address.
 
 - Canonical customized repository: `https://github.com/azox-ai/azox-9router`
 - Upstream repository: `https://github.com/decolua/9router`
-- Active branch: `main`
-- Current source commit: `226c4596d7bfd9ea1b0840e093e6eea6ebd41681`
-- `origin/main` matched local `main` when this file was written.
-- Upstream base tag: `v0.5.35` at `bc252ea80298d4879dc6b3c69585af1610d2c76f`
-- Package version inherited from upstream: `0.5.35`
+- Current reviewed branch: `main`
+- Upgrade candidate branch: `codex/upgrade-upstream-v0.5.45`
+- Upstream integration commit: `30720e958c7b24c392cf3a5a857dddc39f521e3d`
+- Pre-upgrade source commit: `a83f308b4e5dd539a936d25df220d6780b304a26`
+- Target upstream tag: `v0.5.45` at
+  `6fcd27337a7893642c7fe630840d0a641743f28f`
+- Upstream merge-base: `v0.5.35` at
+  `bc252ea80298d4879dc6b3c69585af1610d2c76f`
+- Candidate package version inherited from upstream: `0.5.45`
 - Existing custom tag: `v0.5.35-anhtran` at `a6d9c50`.
 
-Important: `v0.5.35-anhtran` contains the Contributors work but predates the
-Combo Import/Export commits. The complete current build is `main` at
-`226c459`; create a new tag before treating the full feature set as a release.
+Important: the verified live deployment remains on
+`llm-gateway/9router-contributor:0.5.35-226c459`. The `v0.5.45` candidate is
+not a release and has not been published or deployed. Publishing, tagging, or
+production deployment requires explicit human approval.
 
-The local `upstream` remote is currently configured to fetch only tag
-`v0.5.35`, not upstream branches. To inspect a newer upstream branch without
-changing `main`, use an explicit refspec such as:
+The repeatable upgrade procedure and the `v0.5.45` worked example are in
+`docs/UPSTREAM_UPGRADE_HANDBOOK.md`.
+
+Configure the local `upstream` remote to fetch the upstream branch and tags.
+To inspect a newer upstream branch without changing `main`, use an explicit
+refspec such as:
 
 ```bash
 git fetch upstream refs/heads/master:refs/remotes/upstream/master --tags
@@ -155,32 +163,39 @@ must never be reused in a deployed environment.
 
 ## Verification snapshot
 
-- `npm run build` passed on 2026-07-18 and included the Contributors and
-  Import/Export pages and APIs in the production route manifest.
-- `npm audit --omit=dev` currently reports five inherited findings: one low
-  and four moderate, involving DOMPurify/Monaco and PostCSS/Next.js.
-- Do not run `npm audit fix --force` blindly; the suggested DOMPurify path
-  changes Monaco across a breaking version, while the reported bundled
-  PostCSS issue had no fix in the installed dependency graph.
-- There are no dedicated automated tests for the custom Contributors and
-  Combo Import/Export routes yet. Production build success is not a substitute
-  for security and integration tests; add them before proposing upstream.
+- On 2026-08-02, four dedicated Contributor/OAuth/Combo test files passed all
+  14 focused tests.
+- The full candidate suite was compared with a clean `v0.5.45` worktree on the
+  same Windows host: candidate failures `88`, clean-upstream failures `91`,
+  new candidate failures `0`. Three upstream failures were absent from the
+  candidate run. Treat raw totals as environment-sensitive; the zero-delta
+  failure identity comparison is the acceptance gate.
+- A clean `npm run build` passed with `better-sqlite3` absent, exercised the
+  `sql.js` fallback, and included Contributors and Import/Export pages and APIs
+  in the production route manifest.
+- An isolated server using a fresh temporary `DATA_DIR` returned HTTP `200`
+  for `/api/health`, `/api/v1/models`, `/dashboard/contributors`, and
+  `/dashboard/import-export`; login was disabled in that fresh test profile.
+- Focused ESLint passed except for `OAuthModal.js`'s inherited
+  `react-hooks/set-state-in-effect` violation, reproduced unchanged on the
+  clean upstream `v0.5.45` worktree.
+- The root dependency graph is locked in `package-lock.json`; Docker copies it
+  and uses `npm ci --legacy-peer-deps` so the candidate build is reproducible.
+  Webpack explicitly externalizes the optional native `better-sqlite3` package
+  so the documented database fallback works when npm skips that package.
+- `npm audit --omit=dev --audit-level=high` reported three high and three
+  moderate inherited findings in Next/PostCSS/Sharp and Monaco/DOMPurify.
+  PostCSS and Sharp had no available fix; the DOMPurify recommendation requires
+  a breaking Monaco update. Do not use `npm audit fix --force`.
+- No image has been published, no protected volume migration has been run, and
+  no live deployment has changed.
 
 ## Upgrade and upstream contribution guidance
 
-For a future upstream update:
-
-1. Back up the live data volume first.
-2. Fetch the desired upstream branch/tag explicitly.
-3. Create an upgrade branch from that upstream release.
-4. Reapply or cherry-pick the seven meaningful feature commits in the order
-   listed above, resolving upstream conflicts narrowly.
-5. Run production build, unit/integration tests, Contributor OAuth tests, and
-   Combo import round-trip/conflict tests.
-6. Build an immutable image tagged with the upstream version and Git commit.
-7. Replace the container without changing or deleting the data volume.
-8. Smoke-test admin login, existing providers/API keys, Contributors, callback
-   domain generation, and Combo Import/Export.
+Follow `docs/UPSTREAM_UPGRADE_HANDBOOK.md` for every upstream update. It is the
+authoritative procedure for release selection, conflict resolution, baseline
+comparison, isolated migration checks, immutable images, approval gates,
+rollback, and Knowledge closeout.
 
 To contribute upstream, create a clean feature branch from the latest
 `decolua/9router` branch, split Contributors and Import/Export into reviewable

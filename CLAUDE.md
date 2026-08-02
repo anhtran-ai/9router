@@ -17,7 +17,7 @@ The code lives in `src/` (Next.js app + dashboard/compat APIs), `open-sse/` (the
 Dashboard/gateway (run from repo root):
 ```bash
 cp .env.example .env
-npm install
+npm ci --legacy-peer-deps
 PORT=20128 NEXT_PUBLIC_BASE_URL=http://localhost:20128 npm run dev   # dev (webpack, port 20127 by default via next dev)
 npm run build && PORT=20128 HOSTNAME=0.0.0.0 npm run start           # production
 ```
@@ -33,7 +33,7 @@ cd cli && npm run dev  # nodemon watch
 
 Tests (vitest, in `tests/`, an **independent** ESM package — not wired into root `npm test`):
 ```bash
-npm install                             # ROOT deps first — tests import from src/ which needs `open`, `undici`, etc.
+npm ci --legacy-peer-deps               # ROOT deps first — tests import from src/ which needs `open`, `undici`, etc.
 cd tests && npm install                 # then tests' own deps (vitest) → tests/node_modules (allowed by tests/.gitignore)
 npx vitest run                          # all tests; auto-discovers tests/vitest.config.js
 npx vitest run unit/capabilities.test.js   # single file (path relative to tests/)
