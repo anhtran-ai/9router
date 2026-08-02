@@ -300,6 +300,16 @@ candidate introduced zero failures relative to a clean `v0.5.45` worktree on
 the same Windows environment. A clean production build passed without the
 optional `better-sqlite3` package by using `sql.js`, and isolated localhost
 smoke checks returned `200` for health, models, Contributor, and Import/Export
-with login disabled in the fresh test data. This candidate was not published
-or deployed; protected-volume migration and production rollout remain separate
-approval-gated phases.
+with login disabled in the fresh test data.
+
+After explicit production approval, PR #4 was merged by fast-forward so the
+upstream merge history remained intact. A checksum-verified volume snapshot
+was restored twice: the candidate passed migration on one isolated volume and
+the previous image passed rollback rehearsal on another. Production then
+replaced only the 9Router application container and retained the existing
+`llm-gateway_ninerouter-data:/app/data` mount. Post-cutover SQLite integrity
+was `ok`; all 15 combos, 4 provider connections, 5 KV records, settings, and
+the contributor signing secret matched the tested state. Health, authentication
+status, login guards, and a LiteLLM-to-9Router inference smoke passed. The two
+test volumes were removed, while the verified backup and previous immutable
+image were retained for rollback.

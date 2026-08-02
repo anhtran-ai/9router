@@ -11,7 +11,8 @@ provider credential, Docker environment value, private key, or host address.
 - Canonical customized repository: `https://github.com/azox-ai/azox-9router`
 - Upstream repository: `https://github.com/decolua/9router`
 - Current reviewed branch: `main`
-- Upgrade candidate branch: `codex/upgrade-upstream-v0.5.45`
+- Upgrade branch: `codex/upgrade-upstream-v0.5.45` (merged by fast-forward in
+  PR #4)
 - Upstream integration commit: `30720e958c7b24c392cf3a5a857dddc39f521e3d`
 - Pre-upgrade source commit: `a83f308b4e5dd539a936d25df220d6780b304a26`
 - Target upstream tag: `v0.5.45` at
@@ -19,12 +20,15 @@ provider credential, Docker environment value, private key, or host address.
 - Upstream merge-base: `v0.5.35` at
   `bc252ea80298d4879dc6b3c69585af1610d2c76f`
 - Candidate package version inherited from upstream: `0.5.45`
+- Reviewed/deployed source commit:
+  `a3ec8af4c9e6243e860e163d535f3af6dec324a5`
 - Existing custom tag: `v0.5.35-anhtran` at `a6d9c50`.
 
-Important: the verified live deployment remains on
-`llm-gateway/9router-contributor:0.5.35-226c459`. The `v0.5.45` candidate is
-not a release and has not been published or deployed. Publishing, tagging, or
-production deployment requires explicit human approval.
+The verified live deployment now runs
+`llm-gateway/9router-contributor:0.5.45-azox.1-a3ec8af4`, image ID
+`sha256:a3dcc0dda80f5e39f4b076b9a7cc05e1ff2e64f197cd8ffc58b590f9195d23e2`.
+It was deployed on `zbs3` at 2026-08-02 14:10 ICT after explicit approval.
+The image is local to the host and was not published to a registry.
 
 The repeatable upgrade procedure and the `v0.5.45` worked example are in
 `docs/UPSTREAM_UPGRADE_HANDBOOK.md`.
@@ -140,8 +144,8 @@ repository-history parent; they are not standalone product features.
 
 The verified workstation deployment currently runs container
 `llm-gateway-9router` from image
-`llm-gateway/9router-contributor:0.5.35-226c459`. Its persistent state is in
-Docker volume `llm-gateway_ninerouter-data`.
+`llm-gateway/9router-contributor:0.5.45-azox.1-a3ec8af4`. Its persistent state
+remains in Docker volume `llm-gateway_ninerouter-data`.
 
 9Router state—including settings, API keys, connected providers, OAuth data,
 combos, contributor invites, and `contributor-secret`—lives under `DATA_DIR`.
@@ -187,8 +191,17 @@ must never be reused in a deployed environment.
   moderate inherited findings in Next/PostCSS/Sharp and Monaco/DOMPurify.
   PostCSS and Sharp had no available fix; the DOMPurify recommendation requires
   a breaking Monaco update. Do not use `npm audit fix --force`.
-- No image has been published, no protected volume migration has been run, and
-  no live deployment has changed.
+- Before deployment, a checksum-verified 19 MiB volume snapshot was created at
+  `/srv/llm-gateway/backups/9router-20260802-140136/`. Candidate migration and
+  old-image rollback were both exercised on separate restored volumes, which
+  were removed after verification.
+- Production retained `15` combos, `4` provider connections, `5` KV records,
+  the settings state, and the exact `contributor-secret`; SQLite integrity was
+  `ok` before and after cutover.
+- Post-deploy health, auth status, Contributor and Import/Export login guards,
+  and a LiteLLM-to-9Router inference smoke passed. The previous immutable image
+  `llm-gateway/9router-contributor:0.5.35-226c459` remains available for
+  rollback.
 
 ## Upgrade and upstream contribution guidance
 
