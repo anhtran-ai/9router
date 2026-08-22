@@ -4,7 +4,6 @@ import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selec
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
 import { OAUTH_ENDPOINTS, buildKimiHeaders } from "../config/appConstants.js";
 import { buildClineHeaders } from "../shared/clineAuth.js";
-import { getCachedClaudeHeaders } from "../utils/claudeHeaderCache.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
@@ -43,16 +42,6 @@ const HEADER_HOOKS = {
   kimiHeaders: (h, c) => Object.assign(h, buildKimiHeaders(c?.providerSpecificData?.deviceId)),
   clineHeaders: (h, c) => Object.assign(h, buildClineHeaders(c.apiKey || c.accessToken)),
   kilocodeOrg: (h, c) => { if (c.providerSpecificData?.orgId) h["X-Kilocode-OrganizationID"] = c.providerSpecificData.orgId; },
-  claudeOverlay: (h) => {
-    const cached = getCachedClaudeHeaders();
-    if (!cached) return;
-    const overlay = { ...cached };
-    for (const lcKey of Object.keys(cached)) {
-      const titleKey = lcKey.replace(/(^|-)([a-z])/g, (_, sep, ch) => sep + ch.toUpperCase());
-      if (titleKey !== lcKey && h[titleKey] !== undefined) delete h[titleKey];
-    }
-    Object.assign(h, overlay);
-  },
 };
 
 // Config-driven OAuth refresh grants — derived from registry oauth.refresh.
@@ -166,14 +155,7 @@ export class DefaultExecutor extends BaseExecutor {
     applyAuth(headers, desc, credentials);
 
     if (this.provider === "claude" && model) {
-      const merged = new Set(
-        `${headers["anthropic-beta"] || ""},${selectAnthropicBeta(model)}`
-          .split(",")
-          .map((flag) => flag.trim())
-          .filter(Boolean)
-      );
-      delete headers["anthropic-beta"];
-      headers["Anthropic-Beta"] = Array.from(merged).join(",");
+      headers["Anthropic-Beta"] = selectAnthropicBeta(model);
     }
 
     // Strip first-party Claude Code identity headers for non-Anthropic anthropic-compatible upstreams
