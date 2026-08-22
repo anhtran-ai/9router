@@ -116,6 +116,12 @@ import p113 from "./morph.js";
 // import p114 from "./devin-cli.js";
 // import p104 from "./windsurf.js";
 import p115 from "./poolside.js";
+import p116 from "./tokenrouter.js";
+import p117 from "./selfhosted-stt.js";
+import p118 from "./selfhosted-tts.js";
+import p119 from "./selfhosted-embedding.js";
+import p120 from "./fish-audio.js";
+import p121 from "./alitp-intl.js";
 
 export default [
   p0,
@@ -233,4 +239,10 @@ export default [
   // p114, // devin-cli — hidden, spawns local agent with shell/fs access
   // p104, // windsurf — hidden, no tool calling
   p115,
+  p116,
+  p117,
+  p118,
+  p119,
+  p120,
+  p121,
 ];

@@ -28,6 +28,9 @@ export default {
     tokenUrl: "https://chat.qwen.ai/api/v1/oauth2/token",
     scope: "openid profile email model.completion",
     codeChallengeMethod: "S256",
+    refresh: {
+      encoding: "form",
+    },
     refreshLeadMs: 1200000,
   },
 };
