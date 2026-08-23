@@ -56,35 +56,27 @@ describe("getCapabilitiesForModel", () => {
     expect(getCapabilitiesForModel("kiro", "gpt-5.6-sol-thinking-agentic")).toMatchObject(kiroGpt56Expected);
   });
 
-  it("disables assistant prefill for Claude 4.6+ model families", () => {
+  // Prefill is now decided by the Claude target policy
+  // (translator/concerns/assistantPrefillPolicy.js), not per-model capabilities.
+  it("no longer reports an assistant prefill capability for any Claude model", () => {
     for (const model of [
+      "claude-opus-4-20250514",
+      "claude-haiku-4-5",
       "claude-opus-4-6",
       "claude-opus-4.7-thinking-agentic",
       "anthropic/claude-opus-4-8-agentic",
       "claude-sonnet-4.6-thinking",
       "claude-opus-5-agentic",
       "claude-sonnet-5-thinking-agentic",
-    ]) {
-      expect(getCapabilitiesForModel("anthropic", model).assistantPrefill).toBe(false);
-    }
-  });
-
-  it("disables assistant prefill for Claude Fable 5 variants", () => {
-    for (const model of [
       "claude-fable-5",
       "anthropic/claude-fable-5",
       "blackboxai/anthropic/claude-fable-5",
     ]) {
-      expect(getCapabilitiesForModel("anthropic", model).assistantPrefill).toBe(false);
+      expect(getCapabilitiesForModel("anthropic", model)).not.toHaveProperty("assistantPrefill");
     }
   });
 
-  it("keeps assistant prefill enabled for older Claude models", () => {
-    expect(getCapabilitiesForModel("anthropic", "claude-opus-4-20250514").assistantPrefill).toBe(true);
-    expect(getCapabilitiesForModel("anthropic", "claude-haiku-4-5").assistantPrefill).toBe(true);
-  });
-
-  it("keeps Claude 4.6+ adaptive thinking while disabling prefill", () => {
+  it("keeps Claude 4.6+ adaptive thinking", () => {
     for (const model of [
       "claude-sonnet-4.7",
       "claude-sonnet-4.7-thinking",
@@ -93,7 +85,6 @@ describe("getCapabilitiesForModel", () => {
     ]) {
       expect(getCapabilitiesForModel("anthropic", model)).toMatchObject({
         thinkingFormat: "claude-adaptive",
-        assistantPrefill: false,
       });
     }
   });

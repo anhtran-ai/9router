@@ -196,7 +196,7 @@ describe("OpenAI → Claude context mapping", () => {
       }));
     });
 
-    it("keeps trailing assistant prefill for supported models", () => {
+    it("normalizes trailing assistant prefill for every Claude target model", () => {
       const out = prepareClaudeRequest({
         model: "claude-opus-4-20250514",
         messages: [
@@ -205,8 +205,8 @@ describe("OpenAI → Claude context mapping", () => {
         ],
       }, "anthropic");
 
-      expect(out.messages).toHaveLength(2);
-      expect(out.messages.at(-1).role).toBe("assistant");
+      expect(out.messages).toHaveLength(3);
+      expect(out.messages.at(-1).role).toBe("user");
     });
 
     it("drops a thinking-only trailing assistant on unsupported models", () => {

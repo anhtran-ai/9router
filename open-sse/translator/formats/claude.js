@@ -8,10 +8,10 @@ import { isValidClaudeSignature } from "../../utils/claudeSignature.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { DEFAULT_MAX_TOKENS } from "../../config/runtimeConfig.js";
+import { applyAssistantPrefillPolicy } from "../concerns/assistantPrefillPolicy.js";
 
 const CACHE_CONTROL_5M = { type: "ephemeral" };
 const CACHE_CONTROL_1H = { type: "ephemeral", ttl: "1h" };
-const ASSISTANT_CONTINUATION_PROMPT = "Continue from the assistant response above without repeating it.";
 
 // Check if message has valid non-empty content
 export function hasValidContent(msg) {
@@ -114,7 +114,7 @@ function buildThinkingPlaceholder(provider) {
 // 1. thinking.type "adaptive" → unsupported on Haiku
 // 2. output_config.effort → unsupported on Haiku
 // 3. role "system" messages (mid-conversation-system beta) → only top-level system is allowed
-export function normalizeClaudePassthrough(body, model = "") {
+export function normalizeClaudePassthrough(body, model = "", rawHeaders = null) {
   if (!body || typeof body !== "object") return body;
 
   // 1. Downgrade adaptive thinking for models that don't support it
@@ -188,6 +188,8 @@ export function normalizeClaudePassthrough(body, model = "") {
       }
     }
   }
+
+  applyAssistantPrefillPolicy(body, rawHeaders);
 
   return body;
 }
@@ -329,25 +331,9 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
     // Each tool_use must have tool_result in the NEXT message (not same message with other content)
     filtered = fixToolUseOrdering(filtered);
 
-    const capabilities = getCapabilitiesForModel(provider, body.model);
-    const trailingAssistant = filtered[filtered.length - 1];
-    if (capabilities.assistantPrefill === false && trailingAssistant?.role === ROLE.ASSISTANT) {
-      const content = Array.isArray(trailingAssistant.content) ? trailingAssistant.content : [];
-      const hasToolUse = content.some(block => block.type === CLAUDE_BLOCK.TOOL_USE);
-      const hasText = content.some(block => block.type === CLAUDE_BLOCK.TEXT && block.text?.trim());
-
-      if (!hasToolUse) {
-        if (!hasText) filtered.pop();
-        else {
-          filtered.push({
-            role: ROLE.USER,
-            content: [{ type: CLAUDE_BLOCK.TEXT, text: ASSISTANT_CONTINUATION_PROMPT }],
-          });
-        }
-      }
-    }
-
     body.messages = filtered;
+    applyAssistantPrefillPolicy(body, rawHeaders);
+    filtered = body.messages;
 
     // Check if thinking is enabled AND last message is from user
     const lastMessage = filtered[filtered.length - 1];
