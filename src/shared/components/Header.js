@@ -11,6 +11,7 @@ import ThemeToggle from "@/shared/components/ThemeToggle";
 import DonateModal from "@/shared/components/DonateModal";
 import { useHeaderSearchStore } from "@/store/headerSearchStore";
 import { OAUTH_PROVIDERS, APIKEY_PROVIDERS } from "@/shared/constants/config";
+import { getCustomPageInfo } from "@/shared/constants/customNavigation";
 import { MEDIA_PROVIDER_KINDS, AI_PROVIDERS } from "@/shared/constants/providers";
 import { getProviderIconSrc } from "@/shared/utils/providerIcon";
 import { translate } from "@/i18n/runtime";
@@ -155,20 +156,8 @@ const getPageInfo = (pathname) => {
       icon: "settings",
       breadcrumbs: [],
     };
-  if (pathname.includes("/import-export"))
-    return {
-      title: "Import / Export",
-      description: "Transfer selected 9Router configuration items",
-      icon: "import_export",
-      breadcrumbs: [],
-    };
-  if (pathname.includes("/contributors"))
-    return {
-      title: "Contributors",
-      description: "Create and manage scoped OAuth contribution links",
-      icon: "group_add",
-      breadcrumbs: [],
-    };
+  const customPageInfo = getCustomPageInfo(pathname);
+  if (customPageInfo) return customPageInfo;
   if (pathname.includes("/translator"))
     return {
       title: "Translator",
