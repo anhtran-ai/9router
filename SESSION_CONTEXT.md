@@ -18,14 +18,16 @@ provider credential, Docker environment value, private key, or host address.
   `699edac3273e13d4744bc46f6082618f08560702`
 - Candidate package version inherited from upstream: `0.5.55`
 - Reviewed/deployed source commit:
-  `cbcb0b904a8cb05e39d8a1874d21cac3667dd851`
+  `0522ca95d86ec42dafc930ef05f57b7e6d561962` (PR `#13`, Fable 5 prefill
+  capability hotfix)
 - Existing custom tag: `v0.5.35-anhtran` at `a6d9c50`.
 
 The verified live deployment now runs
-`llm-gateway/9router-contributor:0.5.55-azox.1-cbcb0b90`, image ID
-`sha256:6cba663f4d91c642381fcdbbdb9e968706752f242209698979bcf6d44f82c74e`.
-It was deployed on `zbs3` on 2026-08-23 after explicit approval. The image is
-local to the host and was not published to a registry.
+`llm-gateway/9router-contributor:0.5.55-azox.1-0522ca95`, image ID
+`sha256:bc33d935a0681dc343b5e91c381a63e2da890a64c932c38d5e776348e6cd53dd`.
+It was deployed on `zbs3` on 2026-08-23 after explicit approval; the container
+started at `2026-08-23T07:51:05Z` and has restart count `0`. The image is local
+to the host and was not published to a registry.
 
 The repeatable upgrade procedure and worked examples are in
 `docs/UPSTREAM_UPGRADE_HANDBOOK.md`.
@@ -141,10 +143,13 @@ repository-history parent; they are not standalone product features.
 
 The verified workstation deployment currently runs container
 `llm-gateway-9router` from image
-`llm-gateway/9router-contributor:0.5.55-azox.1-cbcb0b90`. Its persistent state
+`llm-gateway/9router-contributor:0.5.55-azox.1-0522ca95`. Its persistent state
 remains in Docker volume `llm-gateway_ninerouter-data`. The checksum-verified
 cutover backup is retained at
-`/srv/llm-gateway/backups/azo530-9router-20260823-053902/`.
+`/srv/llm-gateway/backups/azo559-9router-20260823-074433/`; its quiesced
+`ninerouter-data.tar.gz` archive is `28,187,639` bytes with SHA-256
+`7fbbf8030be9d84e4d40ac7e7b67482095aa55dca911738276dbc4c556d526ae`.
+The checksum and pre-cutover Compose checksum both verify successfully.
 
 9Router state—including settings, API keys, connected providers, OAuth data,
 combos, contributor invites, and `contributor-secret`—lives under `DATA_DIR`.
@@ -187,21 +192,28 @@ must never be reused in a deployed environment.
   moderate inherited findings in Next/PostCSS/Sharp and Monaco/DOMPurify.
   PostCSS and Sharp had no available fix; the DOMPurify recommendation requires
   a breaking Monaco update. Do not use `npm audit fix --force`.
-- A planned-downtime snapshot checkpointed the WAL, passed SQLite integrity,
-  archived `/app/data`, and passed checksum verification at
-  `/srv/llm-gateway/backups/azo530-9router-20260823-053902/`. Restore and old-
-  image rollback were exercised on a separate test volume.
+- The initial upgrade snapshot at
+  `/srv/llm-gateway/backups/azo530-9router-20260823-053902/` passed checksum,
+  restore, migration, and old-image rollback rehearsal. The later Fable 5
+  hotfix cutover used a new quiesced, checksum-verified backup at
+  `/srv/llm-gateway/backups/azo559-9router-20260823-074433/` before recreating
+  only the 9Router service.
 - Production retained `14` combos, `5` provider connections, `9` KV records,
   settings, API-key state, and the existing contributor signing secret;
   SQLite integrity was `ok` before and after cutover.
-- Post-deploy version, model discovery, auth guards, Contributor and Import /
-  Export routes, LiteLLM inference, and host health smoke checks passed. The
-  original trailing-assistant case and the trailing-assistant-plus-image case
-  both returned HTTP `200` through 9Router.
-- The rollback image
-  `llm-gateway/9router-contributor:0.5.45-azox.1-a3ec8af4` remains available as
+- Post-hotfix health, model discovery, auth guards, Contributor and Import /
+  Export routes, and inference smoke checks passed. Trailing-assistant requests
+  returned HTTP `200` for Fable 5 single and `cc/*` routes, Fable-to-GPT combo,
+  Opus 5, Sonnet 5, Haiku 4.5, and LiteLLM `mix/model-max`, `mix/model-high`,
+  and `mix/model-medium`; the fresh nine-case matrix was `9/9`, with zero
+  prefill or `invalid_request_error` log matches.
+- The immediate rollback image
+  `llm-gateway/9router-contributor:0.5.55-azox.1-cbcb0b90` remains available as
   image ID
-  `sha256:a3dcc0dda80f5e39f4b076b9a7cc05e1ff2e64f197cd8ffc58b590f9195d23e2`.
+  `sha256:6cba663f4d91c642381fcdbbdb9e968706752f242209698979bcf6d44f82c74e`.
+  Rollback restores that tag in Compose and recreates only `ninerouter` with
+  `docker compose up -d --no-deps --force-recreate ninerouter`, preserving the
+  data volume. The earlier `0.5.45-azox.1-a3ec8af4` image also remains local.
 
 ## Upgrade and upstream contribution guidance
 
