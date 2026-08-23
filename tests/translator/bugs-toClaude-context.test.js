@@ -88,6 +88,95 @@ describe("OpenAI → Claude context mapping", () => {
     );
   });
 
+  it("user message with only a document is not dropped as empty", () => {
+    const out = prepareClaudeRequest({
+      model: "claude-opus-4-20250514",
+      messages: [{
+        role: "user",
+        content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: "AAAA" } }],
+      }],
+    }, "anthropic");
+
+    expect(out.messages).toHaveLength(1);
+    expect(out.messages[0].content).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "document" })])
+    );
+  });
+
+  describe("trailing assistant prefill normalization", () => {
+    it("adds a user continuation after trailing assistant text on unsupported models", () => {
+      const out = prepareClaudeRequest({
+        model: "claude-opus-4-7",
+        messages: [
+          { role: "user", content: "Start" },
+          { role: "assistant", content: "Partial answer" },
+        ],
+      }, "anthropic");
+
+      expect(out.messages).toHaveLength(3);
+      expect(out.messages[1]).toEqual(expect.objectContaining({ role: "assistant" }));
+      expect(out.messages[2]).toEqual(expect.objectContaining({ role: "user" }));
+      expect(JSON.stringify(out.messages[2].content)).toMatch(/continue/i);
+      expect(JSON.stringify(out.messages[2].content)).toMatch(/without repeating/i);
+    });
+
+    it("drops an empty trailing assistant on unsupported models", () => {
+      const out = prepareClaudeRequest({
+        model: "claude-sonnet-4-6",
+        messages: [
+          { role: "user", content: "Start" },
+          { role: "assistant", content: "   " },
+        ],
+      }, "anthropic");
+
+      expect(out.messages).toHaveLength(1);
+      expect(out.messages.at(-1).role).toBe("user");
+    });
+
+    it("keeps trailing assistant tool_use unchanged on unsupported models", () => {
+      const toolUse = { type: "tool_use", id: "tool-1", name: "lookup", input: {} };
+      const out = prepareClaudeRequest({
+        model: "claude-opus-5-thinking",
+        messages: [
+          { role: "user", content: "Start" },
+          { role: "assistant", content: [toolUse] },
+        ],
+      }, "anthropic");
+
+      expect(out.messages).toHaveLength(2);
+      expect(out.messages.at(-1)).toEqual(expect.objectContaining({
+        role: "assistant",
+        content: expect.arrayContaining([expect.objectContaining({ type: "tool_use", id: "tool-1" })]),
+      }));
+    });
+
+    it("keeps trailing assistant prefill for supported models", () => {
+      const out = prepareClaudeRequest({
+        model: "claude-opus-4-20250514",
+        messages: [
+          { role: "user", content: "Start" },
+          { role: "assistant", content: "Partial answer" },
+        ],
+      }, "anthropic");
+
+      expect(out.messages).toHaveLength(2);
+      expect(out.messages.at(-1).role).toBe("assistant");
+    });
+
+    it("drops a thinking-only trailing assistant on unsupported models", () => {
+      const out = prepareClaudeRequest({
+        model: "claude-opus-4-7",
+        messages: [
+          { role: "user", content: "Start" },
+          { role: "assistant", content: [{ type: "thinking", thinking: "internal", signature: "sig" }] },
+        ],
+      }, "anthropic");
+
+      expect(out.messages).toHaveLength(1);
+      expect(out.messages.at(-1).role).toBe("user");
+    });
+  });
+
   // prepareClaudeRequest reconciles max_tokens vs thinking.budget_tokens.
   // applyThinking runs after adjustMaxTokens caps max_tokens, so a claude-budget
   // model at "max" effort (budget 128000) can exceed the clamped max_tokens and

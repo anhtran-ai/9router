@@ -40,6 +40,7 @@ export const DEFAULT_CAPABILITIES = {
   // features
   search: false,        // built-in web search tool / grounding
   tools: true,          // function / tool calling
+  assistantPrefill: true,
   reasoning: false,     // thinking / reasoning
   // thinking wire format (only meaningful when reasoning:true). null → derive from transport.format.
   // enum: openai|claude-adaptive|claude-budget|gemini-level|gemini-budget|zai|qwen|deepseek|kimi|minimax|hunyuan|step
@@ -72,24 +73,24 @@ export function capabilitiesFromServiceKind(kind) {
  */
 export const MODEL_CAPABILITIES = {
   // Claude Opus 5, 4.6/4.7/4.8, and Kiro Sonnet 5 have 1M context + adaptive thinking (override generic claude pattern)
-  "claude-opus-5":     { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-5-thinking": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-5-agentic": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-5-thinking-agentic": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4.6":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4.7":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4-7":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4.8":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4-6":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4-8":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4.8-thinking": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-opus-4-8-thinking": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-4.6": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-4-6": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-5": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-5-thinking": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-5-agentic": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
-  "claude-sonnet-5-thinking-agentic": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-5":     { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-5-thinking": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-5-agentic": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-5-thinking-agentic": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-4.6":   { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-4.7":   { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-4-7":   { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-4.8":   { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-4-6":   { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-4-8":   { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-4.8-thinking": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-4-8-thinking": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-sonnet-4.6": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-sonnet-4-6": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-sonnet-5": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-sonnet-5-thinking": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-sonnet-5-agentic": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-sonnet-5-thinking-agentic": { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
 
   // Gemini image-gen / OpenAI image / xai image variants
   "gpt-image-1":       { imageOutput: true, tools: false },
@@ -189,12 +190,18 @@ export const PROVIDER_CAPABILITIES = {
  */
 export const PATTERN_CAPABILITIES = [
   // ── Claude (4.6+ = adaptive thinking; older/haiku = budget) ──────
-  { pattern: "*claude*opus-5*",     caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
-  { pattern: "*claude*opus-4.6*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
-  { pattern: "*claude*opus-4.7*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
-  { pattern: "*claude*opus-4.8*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
-  { pattern: "*claude*sonnet-4.6*", caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
-  { pattern: "*claude*sonnet-4.7*", caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
+  { pattern: "*claude*opus-5*",     caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
+  { pattern: "*claude*opus-4.6*",   caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
+  { pattern: "*claude*opus-4-6*",   caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
+  { pattern: "*claude*opus-4.7*",   caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
+  { pattern: "*claude*opus-4-7*",   caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
+  { pattern: "*claude*opus-4.8*",   caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
+  { pattern: "*claude*opus-4-8*",   caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
+  { pattern: "*claude*sonnet-4.6*", caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
+  { pattern: "*claude*sonnet-4-6*", caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
+  { pattern: "*claude*sonnet-4.7*", caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
+  { pattern: "*claude*sonnet-4-7*", caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
+  { pattern: "*claude*sonnet-5*",   caps: { vision: true, assistantPrefill: false, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
   { pattern: "*claude*haiku*",  caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
   { pattern: "*claude*opus*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
   { pattern: "*claude*sonnet*", caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-budget" } },

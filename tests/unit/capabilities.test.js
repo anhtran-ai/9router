@@ -55,4 +55,35 @@ describe("getCapabilitiesForModel", () => {
     expect(getCapabilitiesForModel("kiro", "gpt-5.6-luna-agentic")).toMatchObject(kiroGpt56Expected);
     expect(getCapabilitiesForModel("kiro", "gpt-5.6-sol-thinking-agentic")).toMatchObject(kiroGpt56Expected);
   });
+
+  it("disables assistant prefill for Claude 4.6+ model families", () => {
+    for (const model of [
+      "claude-opus-4-6",
+      "claude-opus-4.7-thinking-agentic",
+      "anthropic/claude-opus-4-8-agentic",
+      "claude-sonnet-4.6-thinking",
+      "claude-opus-5-agentic",
+      "claude-sonnet-5-thinking-agentic",
+    ]) {
+      expect(getCapabilitiesForModel("anthropic", model).assistantPrefill).toBe(false);
+    }
+  });
+
+  it("keeps assistant prefill enabled for older Claude models", () => {
+    expect(getCapabilitiesForModel("anthropic", "claude-opus-4-20250514").assistantPrefill).toBe(true);
+  });
+
+  it("keeps Claude 4.6+ adaptive thinking while disabling prefill", () => {
+    for (const model of [
+      "claude-sonnet-4.7",
+      "claude-sonnet-4.7-thinking",
+      "claude-sonnet-4.6",
+      "claude-opus-4.7",
+    ]) {
+      expect(getCapabilitiesForModel("anthropic", model)).toMatchObject({
+        thinkingFormat: "claude-adaptive",
+        assistantPrefill: false,
+      });
+    }
+  });
 });
