@@ -217,8 +217,13 @@ temporary `DATA_DIR`. Verify:
 
 Next, test migration using a protected copy of the deployed data volume:
 
-1. checkpoint SQLite/WAL safely;
-2. create a timestamped backup without printing contents;
+1. checkpoint SQLite/WAL safely; when the application image ships no `sqlite3`
+   CLI, run the checkpoint and `integrity_check` through the image's bundled
+   `node:sqlite` runtime and report only the result, never row contents;
+2. create a timestamped backup without printing contents; for the production
+   snapshot, stop only the application container for the archive step and arm a
+   restart trap before stopping it, so an interrupted planned downtime cannot
+   leave the service stopped;
 3. restore the backup to a separate test volume;
 4. mount only the test volume into the candidate container;
 5. verify login, settings, providers, keys, aliases, combos, invite state, and
@@ -259,6 +264,10 @@ candidate image, backup, migration test, and rollback evidence are available.
 Immediately before rollout:
 
 - verify the live container image, mounts, environment references, and health;
+- verify that the dedicated Docker operator account can read the required
+  environment reference, update the Compose file, and create files in the
+  backup directory; request only those minimum ACLs, and test them without
+  printing any environment value;
 - create and verify a fresh backup;
 - confirm the prior immutable image is locally available;
 - confirm the rollback command and responsible operator;
@@ -313,3 +322,37 @@ the contributor signing secret matched the tested state. Health, authentication
 status, login guards, and a LiteLLM-to-9Router inference smoke passed. The two
 test volumes were removed, while the verified backup and previous immutable
 image were retained for rollback.
+
+## v0.5.55 worked example
+
+The 2026-08-23 rollout upgraded the deployment from `v0.5.45` to upstream
+`v0.5.55` (`699edac3273e13d4744bc46f6082618f08560702`). The reviewed source was
+`cbcb0b904a8cb05e39d8a1874d21cac3667dd851`; Contributor/OAuth/Combo tests
+passed `14/14`, capability/prefill/trailing-assistant tests passed `15/15`, the
+production build passed, and comparison with a clean upstream worktree left
+zero deterministic new failure identity. Beyond the upstream merge, the
+release dropped fork-only routing code and fixed the trailing assistant prefill
+path by declaring an `assistantPrefill` capability and normalizing a trailing
+assistant message.
+
+Two operational lessons are now folded into Phase 4 and Phase 6. First, the
+application image ships no `sqlite3` CLI, so the WAL checkpoint and integrity
+check ran through the image's `node:sqlite` runtime. Second, the dedicated
+Docker operator account initially could not read the Compose environment
+reference, update the Compose file, or write the backup directory; rollout
+resumed only after minimum read, write, and directory ACLs were granted and
+verified without printing any value.
+
+The production snapshot stopped only the 9Router container under a restart trap
+for roughly `43` seconds, then archived `/app/data` to the checksum-verified
+`/srv/llm-gateway/backups/azo530-9router-20260823-053902/`. Restore and
+old-image rollback rehearsal both passed on a separate test volume.
+
+Cutover changed only the 9Router service image to
+`llm-gateway/9router-contributor:0.5.55-azox.1-cbcb0b90` and recreated that
+service alone; the four sibling containers kept their identity and restart
+count. Post-deploy checks confirmed the reported version, model discovery,
+governance guards on Contributor and Import/Export surfaces, LiteLLM inference,
+host health, unchanged data counts with `integrity_check=ok`, and HTTP `200` for
+both the original trailing-assistant case and its image variant. The previous
+immutable image and the verified backup remain available for rollback.

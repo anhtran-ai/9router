@@ -1,6 +1,6 @@
 # 9Router customization context
 
-Last updated: 2026-08-02
+Last updated: 2026-08-23
 
 This is the safe handoff file for continuing the customized 9Router work in a
 new session. It intentionally contains no admin password, API key, OAuth token,
@@ -11,26 +11,23 @@ provider credential, Docker environment value, private key, or host address.
 - Canonical customized repository: `https://github.com/azox-ai/azox-9router`
 - Upstream repository: `https://github.com/decolua/9router`
 - Current reviewed branch: `main`
-- Upgrade branch: `codex/upgrade-upstream-v0.5.45` (merged by fast-forward in
-  PR #4)
-- Upstream integration commit: `30720e958c7b24c392cf3a5a857dddc39f521e3d`
-- Pre-upgrade source commit: `a83f308b4e5dd539a936d25df220d6780b304a26`
-- Target upstream tag: `v0.5.45` at
-  `6fcd27337a7893642c7fe630840d0a641743f28f`
-- Upstream merge-base: `v0.5.35` at
-  `bc252ea80298d4879dc6b3c69585af1610d2c76f`
-- Candidate package version inherited from upstream: `0.5.45`
-- Reviewed/deployed source commit:
+- Upstream integration commit: `ab0de796`.
+- Pre-upgrade deployed source commit:
   `a3ec8af4c9e6243e860e163d535f3af6dec324a5`
+- Target upstream tag: `v0.5.55` at
+  `699edac3273e13d4744bc46f6082618f08560702`
+- Candidate package version inherited from upstream: `0.5.55`
+- Reviewed/deployed source commit:
+  `cbcb0b904a8cb05e39d8a1874d21cac3667dd851`
 - Existing custom tag: `v0.5.35-anhtran` at `a6d9c50`.
 
 The verified live deployment now runs
-`llm-gateway/9router-contributor:0.5.45-azox.1-a3ec8af4`, image ID
-`sha256:a3dcc0dda80f5e39f4b076b9a7cc05e1ff2e64f197cd8ffc58b590f9195d23e2`.
-It was deployed on `zbs3` at 2026-08-02 14:10 ICT after explicit approval.
-The image is local to the host and was not published to a registry.
+`llm-gateway/9router-contributor:0.5.55-azox.1-cbcb0b90`, image ID
+`sha256:6cba663f4d91c642381fcdbbdb9e968706752f242209698979bcf6d44f82c74e`.
+It was deployed on `zbs3` on 2026-08-23 after explicit approval. The image is
+local to the host and was not published to a registry.
 
-The repeatable upgrade procedure and the `v0.5.45` worked example are in
+The repeatable upgrade procedure and worked examples are in
 `docs/UPSTREAM_UPGRADE_HANDBOOK.md`.
 
 Configure the local `upstream` remote to fetch the upstream branch and tags.
@@ -144,8 +141,10 @@ repository-history parent; they are not standalone product features.
 
 The verified workstation deployment currently runs container
 `llm-gateway-9router` from image
-`llm-gateway/9router-contributor:0.5.45-azox.1-a3ec8af4`. Its persistent state
-remains in Docker volume `llm-gateway_ninerouter-data`.
+`llm-gateway/9router-contributor:0.5.55-azox.1-cbcb0b90`. Its persistent state
+remains in Docker volume `llm-gateway_ninerouter-data`. The checksum-verified
+cutover backup is retained at
+`/srv/llm-gateway/backups/azo530-9router-20260823-053902/`.
 
 9Router state—including settings, API keys, connected providers, OAuth data,
 combos, contributor invites, and `contributor-secret`—lives under `DATA_DIR`.
@@ -167,22 +166,19 @@ must never be reused in a deployed environment.
 
 ## Verification snapshot
 
-- On 2026-08-02, four dedicated Contributor/OAuth/Combo test files passed all
-  14 focused tests.
-- The full candidate suite was compared with a clean `v0.5.45` worktree on the
-  same Windows host: candidate failures `88`, clean-upstream failures `91`,
-  new candidate failures `0`. Three upstream failures were absent from the
-  candidate run. Treat raw totals as environment-sensitive; the zero-delta
-  failure identity comparison is the acceptance gate.
-- A clean `npm run build` passed with `better-sqlite3` absent, exercised the
-  `sql.js` fallback, and included Contributors and Import/Export pages and APIs
-  in the production route manifest.
+- On 2026-08-23, the four dedicated Contributor/OAuth/Combo files passed
+  `14/14`, and the capability/prefill/trailing-assistant focused gate passed
+  `15/15`.
+- The full candidate suite was compared with a clean `v0.5.55` worktree on the
+  same Linux host. No deterministic candidate-only failure identity remained;
+  observed deltas were inherited or environment-sensitive SQLite/time-out
+  failures. Treat raw totals as environment-sensitive and zero deterministic
+  new failure identity as the acceptance gate.
+- `npm run build` passed and included Contributor and Import/Export pages and
+  APIs in the production route manifest.
 - An isolated server using a fresh temporary `DATA_DIR` returned HTTP `200`
-  for `/api/health`, `/api/v1/models`, `/dashboard/contributors`, and
-  `/dashboard/import-export`; login was disabled in that fresh test profile.
-- Focused ESLint passed except for `OAuthModal.js`'s inherited
-  `react-hooks/set-state-in-effect` violation, reproduced unchanged on the
-  clean upstream `v0.5.45` worktree.
+  for `/api/health` and `/api/v1/models`; Contributor and Import/Export pages
+  followed the expected login redirect policy.
 - The root dependency graph is locked in `package-lock.json`; Docker copies it
   and uses `npm ci --legacy-peer-deps` so the candidate build is reproducible.
   Webpack explicitly externalizes the optional native `better-sqlite3` package
@@ -191,17 +187,21 @@ must never be reused in a deployed environment.
   moderate inherited findings in Next/PostCSS/Sharp and Monaco/DOMPurify.
   PostCSS and Sharp had no available fix; the DOMPurify recommendation requires
   a breaking Monaco update. Do not use `npm audit fix --force`.
-- Before deployment, a checksum-verified 19 MiB volume snapshot was created at
-  `/srv/llm-gateway/backups/9router-20260802-140136/`. Candidate migration and
-  old-image rollback were both exercised on separate restored volumes, which
-  were removed after verification.
-- Production retained `15` combos, `4` provider connections, `5` KV records,
-  the settings state, and the exact `contributor-secret`; SQLite integrity was
-  `ok` before and after cutover.
-- Post-deploy health, auth status, Contributor and Import/Export login guards,
-  and a LiteLLM-to-9Router inference smoke passed. The previous immutable image
-  `llm-gateway/9router-contributor:0.5.35-226c459` remains available for
-  rollback.
+- A planned-downtime snapshot checkpointed the WAL, passed SQLite integrity,
+  archived `/app/data`, and passed checksum verification at
+  `/srv/llm-gateway/backups/azo530-9router-20260823-053902/`. Restore and old-
+  image rollback were exercised on a separate test volume.
+- Production retained `14` combos, `5` provider connections, `9` KV records,
+  settings, API-key state, and the existing contributor signing secret;
+  SQLite integrity was `ok` before and after cutover.
+- Post-deploy version, model discovery, auth guards, Contributor and Import /
+  Export routes, LiteLLM inference, and host health smoke checks passed. The
+  original trailing-assistant case and the trailing-assistant-plus-image case
+  both returned HTTP `200` through 9Router.
+- The rollback image
+  `llm-gateway/9router-contributor:0.5.45-azox.1-a3ec8af4` remains available as
+  image ID
+  `sha256:a3dcc0dda80f5e39f4b076b9a7cc05e1ff2e64f197cd8ffc58b590f9195d23e2`.
 
 ## Upgrade and upstream contribution guidance
 
