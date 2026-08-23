@@ -69,8 +69,19 @@ describe("getCapabilitiesForModel", () => {
     }
   });
 
+  it("disables assistant prefill for Claude Fable 5 variants", () => {
+    for (const model of [
+      "claude-fable-5",
+      "anthropic/claude-fable-5",
+      "blackboxai/anthropic/claude-fable-5",
+    ]) {
+      expect(getCapabilitiesForModel("anthropic", model).assistantPrefill).toBe(false);
+    }
+  });
+
   it("keeps assistant prefill enabled for older Claude models", () => {
     expect(getCapabilitiesForModel("anthropic", "claude-opus-4-20250514").assistantPrefill).toBe(true);
+    expect(getCapabilitiesForModel("anthropic", "claude-haiku-4-5").assistantPrefill).toBe(true);
   });
 
   it("keeps Claude 4.6+ adaptive thinking while disabling prefill", () => {

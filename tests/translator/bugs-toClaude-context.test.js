@@ -120,9 +120,38 @@ describe("OpenAI → Claude context mapping", () => {
       expect(JSON.stringify(out.messages[2].content)).toMatch(/without repeating/i);
     });
 
+    it("adds a user continuation after trailing assistant text on Claude Fable 5", () => {
+      const out = prepareClaudeRequest({
+        model: "claude-fable-5",
+        messages: [
+          { role: "user", content: "Start" },
+          { role: "assistant", content: "Partial answer" },
+        ],
+      }, "anthropic");
+
+      expect(out.messages).toHaveLength(3);
+      expect(out.messages[1]).toEqual(expect.objectContaining({ role: "assistant" }));
+      expect(out.messages[2]).toEqual(expect.objectContaining({ role: "user" }));
+      expect(JSON.stringify(out.messages[2].content)).toMatch(/continue/i);
+      expect(JSON.stringify(out.messages[2].content)).toMatch(/without repeating/i);
+    });
+
     it("drops an empty trailing assistant on unsupported models", () => {
       const out = prepareClaudeRequest({
         model: "claude-sonnet-4-6",
+        messages: [
+          { role: "user", content: "Start" },
+          { role: "assistant", content: "   " },
+        ],
+      }, "anthropic");
+
+      expect(out.messages).toHaveLength(1);
+      expect(out.messages.at(-1).role).toBe("user");
+    });
+
+    it("drops an empty trailing assistant on Claude Fable 5", () => {
+      const out = prepareClaudeRequest({
+        model: "anthropic/claude-fable-5",
         messages: [
           { role: "user", content: "Start" },
           { role: "assistant", content: "   " },
@@ -137,6 +166,23 @@ describe("OpenAI → Claude context mapping", () => {
       const toolUse = { type: "tool_use", id: "tool-1", name: "lookup", input: {} };
       const out = prepareClaudeRequest({
         model: "claude-opus-5-thinking",
+        messages: [
+          { role: "user", content: "Start" },
+          { role: "assistant", content: [toolUse] },
+        ],
+      }, "anthropic");
+
+      expect(out.messages).toHaveLength(2);
+      expect(out.messages.at(-1)).toEqual(expect.objectContaining({
+        role: "assistant",
+        content: expect.arrayContaining([expect.objectContaining({ type: "tool_use", id: "tool-1" })]),
+      }));
+    });
+
+    it("keeps trailing assistant tool_use unchanged on Claude Fable 5", () => {
+      const toolUse = { type: "tool_use", id: "tool-1", name: "lookup", input: {} };
+      const out = prepareClaudeRequest({
+        model: "claude-fable-5",
         messages: [
           { role: "user", content: "Start" },
           { role: "assistant", content: [toolUse] },
