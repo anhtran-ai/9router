@@ -4,10 +4,10 @@
   "upstream_ref": "v0.5.55",
   "counts": {
     "additive_total": 34,
-    "modified_total": 20,
-    "modified_runtime": 12,
+    "modified_total": 21,
+    "modified_runtime": 13,
     "modified_runtime_target_approx": 10,
-    "target_note": "Twelve runtime source seams remain, close to the approximate target of ten. Header.js and Sidebar.js are the two small registry hook exceptions needed to move downstream navigation into an additive module."
+    "target_note": "Thirteen runtime source seams remain, above the approximate target of ten. combo.js is an explicit model-fallback seam; Header.js and Sidebar.js remain small registry hook exceptions."
   },
   "boundaries": {
     "additive": [
@@ -54,7 +54,8 @@
       { "path": "open-sse/config/errorConfig.js", "category": "runtime", "reason": "Classify unsupported Claude prefill as request-shape failure." },
       { "path": "open-sse/handlers/chatCore.js", "category": "runtime", "reason": "Apply Claude-target policy on native passthrough." },
       { "path": "open-sse/providers/capabilities.js", "category": "runtime", "reason": "Remove model-based assistant prefill capability." },
-      { "path": "open-sse/services/accountFallback.js", "category": "runtime", "reason": "Respect non-fallback request-shape errors." },
+      { "path": "open-sse/services/accountFallback.js", "category": "runtime", "reason": "Classify exact HTTP 400 assistant-prefill errors without account cooldown." },
+      { "path": "open-sse/services/combo.js", "category": "runtime", "reason": "Allow model-only fallback for exact assistant-prefill HTTP 400 while stopping other HTTP 400 responses." },
       { "path": "open-sse/translator/formats/claude.js", "category": "runtime", "reason": "Apply Claude-target policy on translated requests." },
       { "path": "src/dashboardGuard.js", "category": "runtime", "reason": "Expose contributor session endpoint without widening admin routes." },
       { "path": "src/lib/db/index.js", "category": "runtime", "reason": "Register combo transfer repository seam." },

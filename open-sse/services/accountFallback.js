@@ -1,5 +1,13 @@
 import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/errorConfig.js";
 
+const ASSISTANT_PREFILL_UNSUPPORTED = "does not support assistant message prefill";
+
+export function isAssistantPrefillUnsupportedError(status, errorText) {
+  if (status !== 400 || !errorText) return false;
+  const normalized = typeof errorText === "string" ? errorText : JSON.stringify(errorText);
+  return normalized.toLowerCase().includes(ASSISTANT_PREFILL_UNSUPPORTED);
+}
+
 /**
  * Calculate exponential backoff cooldown for rate limits (429)
  * Level 1: 1s, Level 2: 2s, Level 3: 4s... → max 4 min
@@ -21,6 +29,10 @@ export function getQuotaCooldown(backoffLevel = 0) {
  * @returns {{ shouldFallback: boolean, cooldownMs: number, newBackoffLevel?: number }}
  */
 export function checkFallbackError(status, errorText, backoffLevel = 0) {
+  if (isAssistantPrefillUnsupportedError(status, errorText)) {
+    return { shouldFallback: false, cooldownMs: 0 };
+  }
+
   const lowerError = errorText
     ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
     : "";

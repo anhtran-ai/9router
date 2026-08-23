@@ -61,15 +61,40 @@ describe.each(paths)("assistant prefill policy — %s", (_name, run) => {
     expect(out.messages.at(-1).role).toBe("user");
   });
 
-  it("keeps trailing assistant tool_use unchanged", () => {
+  it("completes trailing assistant tool_use with an error tool_result", () => {
     const toolUse = { type: "tool_use", id: "tool-1", name: "lookup", input: {} };
     const out = run([
       { role: "user", content: "Start" },
       { role: "assistant", content: [toolUse] },
     ]);
 
-    expect(out.messages).toHaveLength(2);
-    expect(out.messages.at(-1)).toEqual({ role: "assistant", content: [expect.objectContaining(toolUse)] });
+    expect(out.messages).toHaveLength(3);
+    expect(out.messages.at(-1)).toEqual({
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "tool-1",
+        is_error: true,
+        content: expect.stringMatching(/not completed/i),
+      }],
+    });
+  });
+
+  it("completes every trailing tool_use with matching error results", () => {
+    const out = run([
+      { role: "user", content: "Start" },
+      { role: "assistant", content: [
+        { type: "tool_use", id: "tool-1", name: "lookup", input: {} },
+        { type: "tool_use", id: "tool-2", name: "fetch", input: {} },
+      ] },
+    ]);
+
+    expect(out.messages.at(-1).role).toBe("user");
+    expect(out.messages.at(-1).content).toEqual([
+      expect.objectContaining({ type: "tool_result", tool_use_id: "tool-1", is_error: true }),
+      expect.objectContaining({ type: "tool_result", tool_use_id: "tool-2", is_error: true }),
+    ]);
+    expect(JSON.stringify(out.messages.at(-1))).not.toMatch(/success/i);
   });
 
   it("keeps final user unchanged", () => {
@@ -90,5 +115,21 @@ describe.each(paths)("assistant prefill policy — %s", (_name, run) => {
 
     expect(out.messages).toHaveLength(2);
     expect(out.messages.at(-1).role).toBe("assistant");
+  });
+
+  it("preserves exact trailing tool_use when header opts in", () => {
+    const messages = [
+      { role: "user", content: "Start" },
+      { role: "assistant", content: [{ type: "tool_use", id: "tool-1", name: "lookup", input: {} }] },
+    ];
+    const out = run(messages, {
+      headers: { "x-9router-assistant-prefill": "preserve" },
+    });
+
+    expect(out.messages).toHaveLength(2);
+    expect(out.messages.at(-1).role).toBe("assistant");
+    expect(out.messages.at(-1).content).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "tool_use", id: "tool-1" }),
+    ]));
   });
 });

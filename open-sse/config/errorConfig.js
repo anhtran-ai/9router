@@ -59,8 +59,6 @@ const COOLDOWN = {
  */
 export const ERROR_RULES = [
   // --- Text-based rules (checked first, order = priority) ---
-  // Request-shape rejection, not an account fault: every account fails alike.
-  { text: "does not support assistant message prefill", shouldFallback: false },
   { text: "no credentials",           cooldownMs: COOLDOWN.long },
   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
   { text: "improperly formed request", cooldownMs: COOLDOWN.long },

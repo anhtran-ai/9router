@@ -2,7 +2,11 @@
  * Shared combo (model combo) handling with fallback support
  */
 
-import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
+import {
+  checkFallbackError,
+  formatRetryAfter,
+  isAssistantPrefillUnsupportedError,
+} from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
@@ -332,7 +336,13 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       }
 
       // Check if should fallback to next model
-      const { shouldFallback, cooldownMs } = checkFallbackError(result.status, errorText);
+      const isPrefillCompatibilityError = isAssistantPrefillUnsupportedError(result.status, errorText);
+      const fallbackDecision = isPrefillCompatibilityError
+        ? { shouldFallback: true, cooldownMs: 0 }
+        : result.status === 400
+          ? { shouldFallback: false, cooldownMs: 0 }
+          : checkFallbackError(result.status, errorText);
+      const { shouldFallback, cooldownMs } = fallbackDecision;
 
       if (!shouldFallback) {
         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });

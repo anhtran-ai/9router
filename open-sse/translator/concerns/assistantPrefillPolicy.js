@@ -1,6 +1,7 @@
 import { CLAUDE_BLOCK, ROLE } from "../schema/index.js";
 
 const ASSISTANT_CONTINUATION_PROMPT = "Continue from the assistant response above without repeating it.";
+const INCOMPLETE_TOOL_RESULT = "Tool execution was not completed before this request continued.";
 const PRESERVE_HEADER = "x-9router-assistant-prefill";
 
 function getHeader(headers, name) {
@@ -12,10 +13,6 @@ function getHeader(headers, name) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function hasBlock(content, type) {
-  return Array.isArray(content) && content.some(block => block?.type === type);
-}
-
 function hasText(content) {
   if (typeof content === "string") return !!content.trim();
   return Array.isArray(content) && content.some(block =>
@@ -25,11 +22,28 @@ function hasText(content) {
 
 export function applyAssistantPrefillPolicy(body, rawHeaders = null) {
   if (!Array.isArray(body?.messages)) return body;
+  // Explicit compatibility escape hatch: preserving assistant prefill bypasses
+  // the Claude terminal-user invariant and can reproduce upstream HTTP 400s.
   if (String(getHeader(rawHeaders, PRESERVE_HEADER) || "").toLowerCase() === "preserve") return body;
 
   const trailingAssistant = body.messages.at(-1);
   if (trailingAssistant?.role !== ROLE.ASSISTANT) return body;
-  if (hasBlock(trailingAssistant.content, CLAUDE_BLOCK.TOOL_USE)) return body;
+
+  const toolUses = Array.isArray(trailingAssistant.content)
+    ? trailingAssistant.content.filter(block => block?.type === CLAUDE_BLOCK.TOOL_USE && block.id)
+    : [];
+  if (toolUses.length > 0) {
+    body.messages.push({
+      role: ROLE.USER,
+      content: toolUses.map(toolUse => ({
+        type: CLAUDE_BLOCK.TOOL_RESULT,
+        tool_use_id: toolUse.id,
+        is_error: true,
+        content: INCOMPLETE_TOOL_RESULT,
+      })),
+    });
+    return body;
+  }
 
   if (!hasText(trailingAssistant.content)) {
     body.messages.pop();

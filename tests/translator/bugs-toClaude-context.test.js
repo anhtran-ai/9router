@@ -162,7 +162,7 @@ describe("OpenAI → Claude context mapping", () => {
       expect(out.messages.at(-1).role).toBe("user");
     });
 
-    it("keeps trailing assistant tool_use unchanged on unsupported models", () => {
+    it("completes trailing assistant tool_use on unsupported models", () => {
       const toolUse = { type: "tool_use", id: "tool-1", name: "lookup", input: {} };
       const out = prepareClaudeRequest({
         model: "claude-opus-5-thinking",
@@ -172,14 +172,18 @@ describe("OpenAI → Claude context mapping", () => {
         ],
       }, "anthropic");
 
-      expect(out.messages).toHaveLength(2);
+      expect(out.messages).toHaveLength(3);
       expect(out.messages.at(-1)).toEqual(expect.objectContaining({
-        role: "assistant",
-        content: expect.arrayContaining([expect.objectContaining({ type: "tool_use", id: "tool-1" })]),
+        role: "user",
+        content: expect.arrayContaining([expect.objectContaining({
+          type: "tool_result",
+          tool_use_id: "tool-1",
+          is_error: true,
+        })]),
       }));
     });
 
-    it("keeps trailing assistant tool_use unchanged on Claude Fable 5", () => {
+    it("completes trailing assistant tool_use on Claude Fable 5", () => {
       const toolUse = { type: "tool_use", id: "tool-1", name: "lookup", input: {} };
       const out = prepareClaudeRequest({
         model: "claude-fable-5",
@@ -189,10 +193,14 @@ describe("OpenAI → Claude context mapping", () => {
         ],
       }, "anthropic");
 
-      expect(out.messages).toHaveLength(2);
+      expect(out.messages).toHaveLength(3);
       expect(out.messages.at(-1)).toEqual(expect.objectContaining({
-        role: "assistant",
-        content: expect.arrayContaining([expect.objectContaining({ type: "tool_use", id: "tool-1" })]),
+        role: "user",
+        content: expect.arrayContaining([expect.objectContaining({
+          type: "tool_result",
+          tool_use_id: "tool-1",
+          is_error: true,
+        })]),
       }));
     });
 
