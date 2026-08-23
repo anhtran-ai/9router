@@ -54,6 +54,7 @@ source/*
 docs/*
 !docs/ARCHITECTURE.md
 !docs/UPSTREAM_UPGRADE_HANDBOOK.md
+!docs/CUSTOMIZATIONS.yaml
 test/*
 open-sse/test/*
 RM.vn.md

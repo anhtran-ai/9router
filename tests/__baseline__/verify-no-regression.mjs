@@ -2,6 +2,9 @@
 // PASS nếu KHÔNG có test nào pass(baseline) → fail(now). Test mới được phép.
 // Usage: node tests/__baseline__/verify-no-regression.mjs <current-results.json>
 import { readFileSync } from "fs";
+import { runBoundaryGuard } from "../../scripts/check-customization-boundary.mjs";
+
+runBoundaryGuard();
 
 function normalizeTestPath(name) {
   const normalized = String(name || "").replaceAll("\\", "/");
