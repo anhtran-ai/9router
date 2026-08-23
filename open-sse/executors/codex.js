@@ -45,13 +45,34 @@ const RESPONSES_API_ALLOWLIST = new Set([
   "text"
 ]);
 
-// Convert role=system → role=developer in body.input (keeps content in cacheable prefix)
-function convertSystemToDeveloperRole(body) {
+function extractInstructionText(item) {
+  if (typeof item.content === "string") return item.content;
+  if (!Array.isArray(item.content) || item.content.length === 0) return null;
+  const text = [];
+  for (const part of item.content) {
+    if (part?.type !== "input_text" || typeof part.text !== "string") return null;
+    text.push(part.text);
+  }
+  return text.join("\n");
+}
+
+function hoistInstructionMessages(body) {
   if (!Array.isArray(body.input)) return;
-  for (const item of body.input) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-    const isSystemMsg = item.role === "system" && (!item.type || item.type === "message");
-    if (isSystemMsg) item.role = "developer";
+  const instructionParts = [];
+  body.input = body.input.filter((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+    const isInstructionMessage = ["system", "developer"].includes(item.role)
+      && (!item.type || item.type === "message");
+    if (!isInstructionMessage) return true;
+    const text = extractInstructionText(item);
+    if (text === null) return true;
+    if (text) instructionParts.push(text);
+    return false;
+  });
+  if (instructionParts.length > 0) {
+    body.instructions = [body.instructions, ...instructionParts]
+      .filter((part) => typeof part === "string" && part.trim() !== "")
+      .join("\n\n");
   }
 }
 
@@ -404,8 +425,7 @@ export class CodexExecutor extends BaseExecutor {
       body.input = [{ type: "message", role: "user", content: [{ type: "input_text", text: "..." }] }];
     }
 
-    // Keep system prompts in body.input as role=developer so they stay in the cacheable prefix
-    convertSystemToDeveloperRole(body);
+    hoistInstructionMessages(body);
     // Strip server-generated item IDs (rs_/fc_/resp_/msg_) — Codex /responses can't resolve when store=false
     stripStoredItemReferences(body);
     // Flatten function tools + drop unsupported types

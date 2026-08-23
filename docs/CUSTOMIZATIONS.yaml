@@ -4,10 +4,10 @@
   "upstream_ref": "v0.5.55",
   "counts": {
     "additive_total": 34,
-    "modified_total": 21,
-    "modified_runtime": 13,
+    "modified_total": 23,
+    "modified_runtime": 14,
     "modified_runtime_target_approx": 10,
-    "target_note": "Thirteen runtime source seams remain, above the approximate target of ten. combo.js is an explicit model-fallback seam; Header.js and Sidebar.js remain small registry hook exceptions."
+    "target_note": "Fourteen runtime source seams remain, above the approximate target of ten. codex.js is an explicit Responses compatibility seam; combo.js is an explicit model-fallback seam; Header.js and Sidebar.js remain small registry hook exceptions."
   },
   "boundaries": {
     "additive": [
@@ -52,6 +52,7 @@
       { "path": "Dockerfile", "category": "build", "reason": "Use committed lockfile for deterministic container builds." },
       { "path": "next.config.mjs", "category": "build", "reason": "Keep optional better-sqlite3 external so fallback builds remain reproducible." },
       { "path": "open-sse/config/errorConfig.js", "category": "runtime", "reason": "Classify unsupported Claude prefill as request-shape failure." },
+      { "path": "open-sse/executors/codex.js", "category": "runtime", "reason": "Normalize Codex CLI developer input messages for the OAuth Responses backend." },
       { "path": "open-sse/handlers/chatCore.js", "category": "runtime", "reason": "Apply Claude-target policy on native passthrough." },
       { "path": "open-sse/providers/capabilities.js", "category": "runtime", "reason": "Remove model-based assistant prefill capability." },
       { "path": "open-sse/services/accountFallback.js", "category": "runtime", "reason": "Classify exact HTTP 400 assistant-prefill errors without account cooldown." },
@@ -67,7 +68,8 @@
       { "path": "tests/__baseline__/verify-no-regression.mjs", "category": "tests", "reason": "Run boundary guard as part of existing local regression gate." },
       { "path": "tests/translator/__snapshots__/golden-url-header.test.js.snap", "category": "tests", "reason": "Record intentional upstream-provider cleanup output." },
       { "path": "tests/translator/bugs-toClaude-context.test.js", "category": "tests", "reason": "Cover Claude-target prefill behavior in existing translator suite." },
-      { "path": "tests/unit/capabilities.test.js", "category": "tests", "reason": "Cover removal of model-based assistant prefill capability." }
+      { "path": "tests/unit/capabilities.test.js", "category": "tests", "reason": "Cover removal of model-based assistant prefill capability." },
+      { "path": "tests/unit/codex-tool-normalization.test.js", "category": "tests", "reason": "Cover Codex CLI Responses passthrough normalization and strict unsupported-content handling." }
     ]
   }
 }

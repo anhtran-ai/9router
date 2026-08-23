@@ -20,6 +20,72 @@ function normalizeTools(tools) {
 }
 
 describe("CodexExecutor tool normalization", () => {
+  it("hoists Codex CLI 0.147 developer input into instructions", () => {
+    const executor = new CodexExecutor();
+    const body = {
+      model: "gpt-5.6-luna",
+      instructions: "Base instructions.",
+      input: [
+        {
+          type: "additional_tools",
+          role: "developer",
+          tools: [{ type: "namespace", name: "functions", tools: [] }],
+        },
+        {
+          type: "message",
+          role: "developer",
+          content: [{ type: "input_text", text: "Follow workspace rules." }],
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Reply with OK only." }],
+        },
+      ],
+      stream: true,
+      store: false,
+    };
+
+    executor.transformRequest("gpt-5.6-luna", body, true, {
+      connectionId: "test-codex-cli-0147",
+      providerSpecificData: {},
+    });
+
+    expect(body.instructions).toBe("Base instructions.\n\nFollow workspace rules.");
+    expect(body.input).toEqual([
+      {
+        type: "additional_tools",
+        role: "developer",
+        tools: [{ type: "namespace", name: "functions", tools: [] }],
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Reply with OK only." }],
+      },
+    ]);
+  });
+
+  it("leaves unsupported developer content for upstream validation", () => {
+    const executor = new CodexExecutor();
+    const developerItem = {
+      type: "message",
+      role: "developer",
+      content: [{ type: "input_image", image_url: "https://example.com/rules.png" }],
+    };
+    const body = {
+      model: "gpt-5.6-luna",
+      input: [developerItem, { role: "user", content: "Hello" }],
+    };
+
+    executor.transformRequest("gpt-5.6-luna", body, true, {
+      connectionId: "test-codex-developer-validation",
+      providerSpecificData: {},
+    });
+
+    expect(body.input[0]).toEqual(developerItem);
+  });
+
   it("preserves Responses text.format for structured outputs", () => {
     const executor = new CodexExecutor();
     const schema = {
