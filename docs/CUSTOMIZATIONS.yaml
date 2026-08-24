@@ -52,7 +52,7 @@
       { "path": "Dockerfile", "category": "build", "reason": "Use committed lockfile for deterministic container builds." },
       { "path": "next.config.mjs", "category": "build", "reason": "Keep optional better-sqlite3 external so fallback builds remain reproducible." },
       { "path": "open-sse/config/errorConfig.js", "category": "runtime", "reason": "Classify unsupported Claude prefill as request-shape failure." },
-      { "path": "open-sse/executors/codex.js", "category": "runtime", "reason": "Normalize Codex CLI developer input messages for the OAuth Responses backend." },
+      { "path": "open-sse/executors/codex.js", "category": "runtime", "reason": "Normalize Codex CLI developer messages and additional_tools content for the OAuth Responses backend." },
       { "path": "open-sse/handlers/chatCore.js", "category": "runtime", "reason": "Apply Claude-target policy on native passthrough." },
       { "path": "open-sse/providers/capabilities.js", "category": "runtime", "reason": "Remove model-based assistant prefill capability." },
       { "path": "open-sse/services/accountFallback.js", "category": "runtime", "reason": "Classify exact HTTP 400 assistant-prefill errors without account cooldown." },

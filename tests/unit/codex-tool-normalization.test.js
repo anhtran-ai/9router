@@ -20,6 +20,61 @@ function normalizeTools(tools) {
 }
 
 describe("CodexExecutor tool normalization", () => {
+  it("strips only content from Codex CLI additional_tools input items", () => {
+    const executor = new CodexExecutor();
+    const additionalToolsItem = {
+      type: "additional_tools",
+      role: "developer",
+      content: [{ type: "input_text", text: "Unsupported by Codex OAuth." }],
+      tools: [{ type: "namespace", name: "functions", tools: [] }],
+      metadata: { source: "codex-cli-0.147" },
+    };
+    const unknownItem = {
+      type: "future_item",
+      content: [{ type: "input_text", text: "Keep this untouched." }],
+    };
+    const userItem = {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "Reply with OK only." }],
+    };
+    const body = {
+      model: "gpt-5.6-luna",
+      input: [additionalToolsItem, unknownItem, userItem],
+    };
+
+    executor.transformRequest("gpt-5.6-luna", body, true, {
+      connectionId: "test-codex-additional-tools-content",
+      providerSpecificData: {},
+    });
+
+    expect(body.input).toEqual([
+      {
+        type: "additional_tools",
+        role: "developer",
+        tools: [{ type: "namespace", name: "functions", tools: [] }],
+        metadata: { source: "codex-cli-0.147" },
+      },
+      unknownItem,
+      userItem,
+    ]);
+  });
+
+  it("ignores null and malformed Responses input items", () => {
+    const executor = new CodexExecutor();
+    const body = {
+      model: "gpt-5.6-luna",
+      input: [null, "raw-item", [], { type: "additional_tools", content: null, tools: [] }],
+    };
+
+    expect(() => executor.transformRequest("gpt-5.6-luna", body, true, {
+      connectionId: "test-codex-malformed-input",
+      providerSpecificData: {},
+    })).not.toThrow();
+
+    expect(body.input).toEqual([null, "raw-item", [], { type: "additional_tools", tools: [] }]);
+  });
+
   it("hoists Codex CLI 0.147 developer input into instructions", () => {
     const executor = new CodexExecutor();
     const body = {

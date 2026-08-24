@@ -6,6 +6,7 @@ import {
   shouldRefreshCredentials,
 } from "../services/oauthCredentialManager.js";
 import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
+import { RESPONSES_ITEM } from "../translator/schema/index.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
 import { getModelUpstreamId } from "../config/providerModels.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
@@ -73,6 +74,15 @@ function hoistInstructionMessages(body) {
     body.instructions = [body.instructions, ...instructionParts]
       .filter((part) => typeof part === "string" && part.trim() !== "")
       .join("\n\n");
+  }
+}
+
+function stripAdditionalToolsContent(body) {
+  if (!Array.isArray(body.input)) return;
+  for (const item of body.input) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    if (item.type !== RESPONSES_ITEM.ADDITIONAL_TOOLS) continue;
+    delete item.content;
   }
 }
 
@@ -426,6 +436,7 @@ export class CodexExecutor extends BaseExecutor {
     }
 
     hoistInstructionMessages(body);
+    stripAdditionalToolsContent(body);
     // Strip server-generated item IDs (rs_/fc_/resp_/msg_) — Codex /responses can't resolve when store=false
     stripStoredItemReferences(body);
     // Flatten function tools + drop unsupported types
