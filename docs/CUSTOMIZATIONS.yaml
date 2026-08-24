@@ -2,8 +2,21 @@
   "schema_version": 1,
   "format_note": "JSON-compatible YAML; parsed with Node.js JSON.parse to avoid a runtime dependency.",
   "upstream_ref": "v0.5.55",
-  "counts": {
+  "upstream_sha": "699edac3273e13d4744bc46f6082618f08560702",
+  "fork_snapshot": {
+    "sha": "ffda39de061ef515eef6814719c39222948203f4",
+    "date": "2026-08-24",
+    "files_changed": 57,
+    "insertions": 13464,
+    "deletions": 57,
     "additive_total": 34,
+    "modified_total": 23,
+    "modified_runtime": 14,
+    "note": "Baseline before FORK_DIFF_INVENTORY.md was added; current guarded set includes the inventory itself."
+  },
+  "inventory_path": "docs/FORK_DIFF_INVENTORY.md",
+  "counts": {
+    "additive_total": 35,
     "modified_total": 23,
     "modified_runtime": 14,
     "modified_runtime_target_approx": 10,
@@ -20,7 +33,11 @@
       "boundary": "open-sse/executors/codex.js",
       "normalizations": ["Hoist Codex CLI developer instructions.", "Remove only content from additional_tools items while preserving items, order, tools, and metadata."],
       "scope": "Provider compatibility for the Codex OAuth Responses backend; not a mandatory OpenAI Responses specification rule.",
-      "upstream_references": ["decolua/9router#2796", "decolua/9router#2508", "decolua/9router#2497", "decolua/9router#3390"],
+      "upstream_reference_roles": {
+        "instruction_hoisting": "decolua/9router#2508",
+        "additional_tools_content": "decolua/9router#2796",
+        "related_open_bugs": ["decolua/9router#2497", "decolua/9router#3390"]
+      },
       "retirement": "Drop the fork seam after upstream ships an equivalent fix and direct cx/* Codex CLI regression passes."
     }
   },
@@ -30,6 +47,7 @@
       { "path": "AGENTS.md", "reason": "Fork agent operating policy." },
       { "path": "SESSION_CONTEXT.md", "reason": "Fork session context." },
       { "path": "docs/CUSTOMIZATIONS.yaml", "reason": "Customization boundary source of truth." },
+      { "path": "docs/FORK_DIFF_INVENTORY.md", "reason": "Generated human-readable map of every fork-vs-upstream path." },
       { "path": "docs/UPSTREAM_UPGRADE_HANDBOOK.md", "reason": "Fork upgrade procedure." },
       { "path": "open-sse/translator/concerns/assistantPrefillPolicy.js", "reason": "Claude-target prefill policy module." },
       { "path": "package-lock.json", "reason": "Reproducible fork dependency lock." },

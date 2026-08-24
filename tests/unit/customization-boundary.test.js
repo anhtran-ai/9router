@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   loadCustomizationManifest,
   parseNameStatus,
+  renderForkDiffInventory,
   validateCustomizationDiff,
 } from "../../scripts/check-customization-boundary.mjs";
 
@@ -26,11 +27,32 @@ describe("customization boundary guard", () => {
     const manifest = loadCustomizationManifest(manifestPath);
     const diff = execFileSync(
       "git",
-      ["diff", "--name-status", "--find-renames=100%", `${manifest.upstream_ref}...HEAD`],
+      ["diff", "--name-status", "--find-renames=100%", `${manifest.upstream_sha}...HEAD`],
       { cwd: repoRoot, encoding: "utf8" },
     );
 
     expect(validateCustomizationDiff(manifest, parseNameStatus(diff))).toEqual([]);
+  });
+
+  it("keeps the human inventory synchronized with the manifest", () => {
+    const manifest = loadCustomizationManifest(manifestPath);
+    const inventory = readFileSync(
+      new URL("../../docs/FORK_DIFF_INVENTORY.md", import.meta.url),
+      "utf8",
+    );
+
+    expect(inventory).toBe(renderForkDiffInventory(manifest));
+  });
+
+  it("renders baseline counts from manifest snapshot fields", () => {
+    const manifest = structuredClone(loadCustomizationManifest(manifestPath));
+    manifest.fork_snapshot.additive_total = 91;
+    manifest.fork_snapshot.modified_total = 82;
+    manifest.fork_snapshot.modified_runtime = 73;
+
+    expect(renderForkDiffInventory(manifest)).toContain(
+      "`91` additive, `82` modified, `73` modified runtime seams.",
+    );
   });
 
   it("rejects a fixture that modifies a file outside an approved seam", () => {

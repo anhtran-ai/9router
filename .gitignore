@@ -55,6 +55,7 @@ docs/*
 !docs/ARCHITECTURE.md
 !docs/UPSTREAM_UPGRADE_HANDBOOK.md
 !docs/CUSTOMIZATIONS.yaml
+!docs/FORK_DIFF_INVENTORY.md
 test/*
 open-sse/test/*
 RM.vn.md

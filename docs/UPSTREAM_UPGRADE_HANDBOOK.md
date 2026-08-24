@@ -17,6 +17,13 @@ runtime data, and a tested rollback target.
 Use a fixed upstream tag. Never upgrade a deployed service directly from the
 moving upstream `master` branch or a floating container tag.
 
+Before planning any upgrade, read the generated
+[`FORK_DIFF_INVENTORY.md`](FORK_DIFF_INVENTORY.md) beside the machine-readable
+[`CUSTOMIZATIONS.yaml`](CUSTOMIZATIONS.yaml). The registry defines allowed
+fork boundaries; the inventory maps every path to behavior, upgrade action, and
+tests. `node scripts/check-customization-boundary.mjs` fails when either source
+or the actual upstream diff drifts.
+
 ## Non-negotiable invariants
 
 1. Keep `azox-ai/azox-9router` private and independent; use an `upstream`
@@ -53,11 +60,13 @@ high-risk runtime seams have separate classifiers and must not be collapsed:
   `additional_tools` items. This is provider compatibility for the Codex OAuth
   backend, not a mandatory OpenAI Responses specification rule.
 
-Community/upstream work `decolua/9router#2796` and `#2508` uses the same
-`additional_tools.content` normalization pattern. Bugs `#2497` and `#3390`
-remain open references. During each upstream upgrade, inspect their current
-state. If upstream has merged equivalent behavior, delete the downstream seam
-only after focused tests and a direct `cx/*` Codex CLI Responses check pass.
+Community/upstream work maps to two distinct Codex Responses seams:
+`decolua/9router#2508` hoists instruction/system-prompt content into top-level
+`instructions`, while `#2796` removes `content` from `additional_tools` items.
+Bugs `#2497` and `#3390` remain open references. During each upstream upgrade,
+inspect their current state. If upstream has merged equivalent behavior, delete
+only the matching downstream seam after focused tests and a direct `cx/*`
+Codex CLI Responses check pass.
 
 ## Repository setup
 
