@@ -35,6 +35,30 @@ moving upstream `master` branch or a floating container tag.
 7. Production deployment, publishing an image/release, and authentication or
    authorization changes require explicit human approval.
 
+## Fork runtime seams that upgrades must preserve
+
+`docs/CUSTOMIZATIONS.yaml` is the machine-readable source of truth. Current
+high-risk runtime seams have separate classifiers and must not be collapsed:
+
+- Claude assistant prefill is decided by target format at the final translated
+  and native passthrough boundaries, never by model name. Preserve the additive
+  policy module, both call sites, focused tests, and the explicit
+  `x-9router-assistant-prefill: preserve` escape hatch.
+- Combo model fallback is separate from account fallback. Only HTTP `400` with
+  exact text `does not support assistant message prefill` advances to the next
+  combo model without account cooldown or rotation. Other `400` responses stop;
+  existing `401`, `403`, `404`, `429`, and `5xx` account/error handling remains.
+- Codex Responses compatibility belongs at `open-sse/executors/codex.js`:
+  developer instructions are hoisted, and only `content` is removed from
+  `additional_tools` items. This is provider compatibility for the Codex OAuth
+  backend, not a mandatory OpenAI Responses specification rule.
+
+Community/upstream work `decolua/9router#2796` and `#2508` uses the same
+`additional_tools.content` normalization pattern. Bugs `#2497` and `#3390`
+remain open references. During each upstream upgrade, inspect their current
+state. If upstream has merged equivalent behavior, delete the downstream seam
+only after focused tests and a direct `cx/*` Codex CLI Responses check pass.
+
 ## Repository setup
 
 Verify the remotes before every upgrade:
@@ -356,3 +380,40 @@ governance guards on Contributor and Import/Export surfaces, LiteLLM inference,
 host health, unchanged data counts with `integrity_check=ok`, and HTTP `200` for
 both the original trailing-assistant case and its image variant. The previous
 immutable image and the verified backup remain available for rollback.
+
+## Prefill and Codex Responses release worked example
+
+The 2026-08-23/24 release replaced model-name prefill capability handling and
+fixed two Codex Responses compatibility defects across three merges:
+`b5ccd109487a6f53bbb7fc8771f2c8f9ee79b179` (PR `#19`),
+`57c31404508c783b3e961b6bbf4e6c7df0ae05e9` (PR `#20`), and
+`fcf4300e6e0b263ad28a8a475a18702cb7c6774c` (PR `#21`). The deployed image is
+`llm-gateway/9router-contributor:0.5.55-azox.1-fcf4300e`, image ID
+`sha256:bae7c6eb0d38fa587565aaaf98d42f3cb20b2379e0545d17583a850222b7e16a`,
+built from the source archive with SHA-256
+`2bf30893094cc04141d7d07c6eefa35b32b26d842f8d66c9d76383d06bdfa7ce`. Rollback
+target is source `57c31404`, whose immutable image remains on the host.
+
+Three lessons are now mandatory for this deployment:
+
+1. 9Router is upstream of LiteLLM, which serves the operating agent's own LLM
+   API. Run cutover as a single self-contained host script launched detached
+   (`setsid nohup`) with built-in backup, checksums, build, service-scoped
+   recreate, health, integrity, smoke, and health/integrity auto-rollback, then
+   poll its log. A foreground cutover can lose its own API mid-recreate. The
+   final run logged `PID`, `PPID`, `detached=yes`, and `RESULT=SUCCESS`.
+2. Protocol-level `curl` checks are not sufficient acceptance. Verify with the
+   real clients: `codex` CLI and `claude` CLI across direct `cx/*`, direct
+   `cc/*`, both combo directions, and all `mix/*` aliases. The `cx/*`
+   `Unknown parameter: 'input[0].content'` defect was invisible to protocol
+   tests that passed. The final matrix passed `18/18` with trailing-assistant
+   prefill `10/10`, `unknown_input_content=0`, and no default-case prefill
+   `400`.
+3. Exercise combo fallback with the `x-9router-assistant-prefill: preserve`
+   seam as a deterministic hard-fail source instead of changing live
+   configuration or burning Claude quota.
+
+A functional regression on healthy storage stops the matrix and escalates; it
+is not a reason to roll back automatically. Container timezone for 9Router and
+LiteLLM is `Asia/Ho_Chi_Minh`, while host-level Docker output may still print
+UTC, so compare timestamps by explicit offset.

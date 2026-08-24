@@ -1,6 +1,6 @@
 # 9Router customization context
 
-Last updated: 2026-08-23
+Last updated: 2026-08-24
 
 This is the safe handoff file for continuing the customized 9Router work in a
 new session. It intentionally contains no admin password, API key, OAuth token,
@@ -18,16 +18,28 @@ provider credential, Docker environment value, private key, or host address.
   `699edac3273e13d4744bc46f6082618f08560702`
 - Candidate package version inherited from upstream: `0.5.55`
 - Reviewed/deployed source commit:
-  `0522ca95d86ec42dafc930ef05f57b7e6d561962` (PR `#13`, Fable 5 prefill
-  capability hotfix)
+  `fcf4300e6e0b263ad28a8a475a18702cb7c6774c` (PR `#21`, Codex Responses
+  `additional_tools.content` compatibility fix), including PR `#20` at
+  `57c31404508c783b3e961b6bbf4e6c7df0ae05e9` and final-boundary prefill PR
+  `#19` at `b5ccd109487a6f53bbb7fc8771f2c8f9ee79b179`
 - Existing custom tag: `v0.5.35-anhtran` at `a6d9c50`.
 
 The verified live deployment now runs
-`llm-gateway/9router-contributor:0.5.55-azox.1-0522ca95`, image ID
-`sha256:bc33d935a0681dc343b5e91c381a63e2da890a64c932c38d5e776348e6cd53dd`.
-It was deployed on `zbs3` on 2026-08-23 after explicit approval; the container
-started at `2026-08-23T07:51:05Z` and has restart count `0`. The image is local
-to the host and was not published to a registry.
+`llm-gateway/9router-contributor:0.5.55-azox.1-fcf4300e`, image ID
+`sha256:bae7c6eb0d38fa587565aaaf98d42f3cb20b2379e0545d17583a850222b7e16a`.
+It was deployed on `zbs3` on 2026-08-24 after explicit approval by a detached
+cutover script; the container started at `2026-08-24T00:53:23.437779205Z` and
+has restart count `0`. The image is local to the host and was not published to
+a registry. Source archive SHA-256 is
+`2bf30893094cc04141d7d07c6eefa35b32b26d842f8d66c9d76383d06bdfa7ce`;
+rollback source is `57c31404` with its immutable image retained locally.
+
+Production acceptance passed actual CLI matrix `18/18` and Claude-target
+trailing-assistant matrix `10/10`; logs reported `unknown_input_content=0` and
+no default-case prefill `400`. One non-blocking direct `luna` observation ended
+`ResponseAborted` without a usage row, but returned no `400` and CLI exit was
+`0`. 9Router and LiteLLM container timezone is `Asia/Ho_Chi_Minh`; host Docker
+logs may still print UTC.
 
 The repeatable upgrade procedure and worked examples are in
 `docs/UPSTREAM_UPGRADE_HANDBOOK.md`.

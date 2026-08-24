@@ -9,6 +9,21 @@
     "modified_runtime_target_approx": 10,
     "target_note": "Fourteen runtime source seams remain, above the approximate target of ten. codex.js is an explicit Responses compatibility seam; combo.js is an explicit model-fallback seam; Header.js and Sidebar.js remain small registry hook exceptions."
   },
+  "runtime_policies": {
+    "claude_assistant_prefill": {
+      "classifier": "Target format is Claude/Anthropic Messages; model IDs and aliases are not capability classifiers.",
+      "boundaries": ["open-sse/translator/formats/claude.js", "open-sse/handlers/chatCore.js"],
+      "preserve_header": "x-9router-assistant-prefill: preserve",
+      "fallback_rule": "Only HTTP 400 containing exact text 'does not support assistant message prefill' advances a combo model without cooling down or rotating the account."
+    },
+    "codex_responses": {
+      "boundary": "open-sse/executors/codex.js",
+      "normalizations": ["Hoist Codex CLI developer instructions.", "Remove only content from additional_tools items while preserving items, order, tools, and metadata."],
+      "scope": "Provider compatibility for the Codex OAuth Responses backend; not a mandatory OpenAI Responses specification rule.",
+      "upstream_references": ["decolua/9router#2796", "decolua/9router#2508", "decolua/9router#2497", "decolua/9router#3390"],
+      "retirement": "Drop the fork seam after upstream ships an equivalent fix and direct cx/* Codex CLI regression passes."
+    }
+  },
   "boundaries": {
     "additive": [
       { "path": ".github/CODEOWNERS", "reason": "Fork ownership policy." },
