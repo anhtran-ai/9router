@@ -16,7 +16,7 @@
   },
   "inventory_path": "docs/FORK_DIFF_INVENTORY.md",
   "counts": {
-    "additive_total": 40,
+    "additive_total": 45,
     "modified_total": 25,
     "modified_runtime": 16,
     "modified_runtime_target_approx": 10,
@@ -43,9 +43,13 @@
   },
   "boundaries": {
     "additive": [
+      { "path": ".code-review-graphignore", "reason": "Exclude restricted data and generated artifacts from local CRG indexing." },
+      { "path": ".codex/config.toml", "reason": "Pinned local CRG MCP server for Codex." },
       { "path": ".github/CODEOWNERS", "reason": "Fork ownership policy." },
+      { "path": ".mcp.json", "reason": "Pinned local CRG MCP server for compatible coding clients." },
       { "path": "AGENTS.md", "reason": "Fork agent operating policy." },
       { "path": "SESSION_CONTEXT.md", "reason": "Fork session context." },
+      { "path": "docs/CODE_REVIEW_GRAPH.md", "reason": "Reproducible local graph setup, exclusions, and source-navigation fallback." },
       { "path": "docs/CUSTOMIZATIONS.yaml", "reason": "Customization boundary source of truth." },
       { "path": "docs/FORK_DIFF_INVENTORY.md", "reason": "Generated human-readable map of every fork-vs-upstream path." },
       { "path": "docs/UPSTREAM_UPGRADE_HANDBOOK.md", "reason": "Fork upgrade procedure." },
@@ -54,6 +58,7 @@
       { "path": "package-lock.json", "reason": "Reproducible fork dependency lock." },
       { "path": "scripts/check-customization-boundary.mjs", "reason": "Deterministic boundary guard." },
       { "path": "scripts/compare-test-results.mjs", "reason": "Fork regression baseline helper." },
+      { "path": "scripts/crg.py", "reason": "Repository-root-aware launcher pinned to Code Review Graph v2.3.7." },
       { "path": "scripts/start-contributor-local.ps1", "reason": "Contributor local operations helper." },
       { "path": "scripts/stop-contributor-local.ps1", "reason": "Contributor local operations helper." },
       { "path": "src/app/(dashboard)/dashboard/contributors/page.js", "reason": "Contributor dashboard feature." },

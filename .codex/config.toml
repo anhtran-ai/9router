@@ -1,0 +1,5 @@
+[mcp_servers.code-review-graph]
+command = "uvx"
+args = ["code-review-graph@2.3.7", "serve", "--repo", "."]
+cwd = "."
+startup_timeout_sec = 60

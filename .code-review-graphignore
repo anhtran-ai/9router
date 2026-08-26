@@ -1,0 +1,26 @@
+# Restricted material and runtime data must never enter the graph.
+restricted/**
+secrets/**
+data/**
+models/**
+.env*
+*.key
+*.pem
+
+# Dependencies and generated artifacts
+.code-review-graph/**
+**/node_modules/**
+.venv/**
+venv/**
+.next*/**
+**/dist/**
+build/**
+out/**
+logs/**
+coverage/**
+tests/.task-tmp/**
+.claude/**
+.repo/**
+.docs/**
+cli/.build-home/**
+open-sse.old/**

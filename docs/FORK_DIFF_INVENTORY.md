@@ -10,7 +10,7 @@ Fork baseline: `azox-ai/azox-9router` at `ffda39de061ef515eef6814719c39222948203
 
 Baseline snapshot before this inventory file: `57 files changed, 13464 insertions(+), 57 deletions(-)`; `34` additive, `23` modified, `14` modified runtime seams.
 
-Current guarded path set: `65` paths. It adds `docs/FORK_DIFF_INVENTORY.md` to the exact 57-path baseline, so the inventory can guard its own presence.
+Current guarded path set: `70` paths. It adds `docs/FORK_DIFF_INVENTORY.md` to the exact 57-path baseline, so the inventory can guard its own presence.
 
 `docs/CUSTOMIZATIONS.yaml` is the machine-readable boundary source. This document is the generated human upgrade map. Edit the registry first, then regenerate this file; the guard fails when registry, inventory, and actual fork diff disagree.
 
@@ -24,7 +24,7 @@ Current guarded path set: `65` paths. It adds `docs/FORK_DIFF_INVENTORY.md` to t
 | Combo import-export | 5 | reapply |
 | Contributor portal, OAuth, session, store, and admin | 16 | keep |
 | Custom navigation and UI seams | 4 | reapply |
-| Governance, docs, tests, and upgrade guard | 25 | keep |
+| Governance, docs, tests, and upgrade guard | 30 | keep |
 
 ## Regenerate and validate
 
@@ -43,11 +43,15 @@ After every fork merge or upstream upgrade, update the pinned baseline fields in
 
 | A/M | Path | Category | Why different upstream | Behavior to preserve | Upgrade action | Test or guard |
 |---|---|---|---|---|---|---|
+| A | `.code-review-graphignore` | additive | Exclude restricted data and generated artifacts from local CRG indexing. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
+| A | `.codex/config.toml` | additive | Pinned local CRG MCP server for Codex. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | A | `.github/CODEOWNERS` | additive | Fork ownership policy. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | M | `.gitignore` | tooling | Ignore fork test/build artifacts while retaining upgrade documentation. | Preserve deterministic installs/builds and safe local Contributor start/stop workflows. | `re-evaluate` | clean `npm ci`; production build; local helper smoke; customization boundary guard |
+| A | `.mcp.json` | additive | Pinned local CRG MCP server for compatible coding clients. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | A | `AGENTS.md` | additive | Fork agent operating policy. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | M | `CLAUDE.md` | documentation | Document reproducible npm install commands and regression baseline. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | M | `Dockerfile` | build | Use committed lockfile for deterministic container builds. | Preserve deterministic installs/builds and safe local Contributor start/stop workflows. | `re-evaluate` | clean `npm ci`; production build; local helper smoke; customization boundary guard |
+| A | `docs/CODE_REVIEW_GRAPH.md` | additive | Reproducible local graph setup, exclusions, and source-navigation fallback. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | A | `docs/CUSTOMIZATIONS.yaml` | additive | Customization boundary source of truth. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | A | `docs/FORK_DIFF_INVENTORY.md` | additive | Generated human-readable map of every fork-vs-upstream path. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | A | `docs/UPSTREAM_UPGRADE_HANDBOOK.md` | additive | Fork upgrade procedure. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
@@ -66,6 +70,7 @@ After every fork merge or upstream upgrade, update the pinned baseline fields in
 | A | `package-lock.json` | additive | Reproducible fork dependency lock. | Preserve deterministic installs/builds and safe local Contributor start/stop workflows. | `re-evaluate` | clean `npm ci`; production build; local helper smoke; customization boundary guard |
 | A | `scripts/check-customization-boundary.mjs` | additive | Deterministic boundary guard. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | A | `scripts/compare-test-results.mjs` | additive | Fork regression baseline helper. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
+| A | `scripts/crg.py` | additive | Repository-root-aware launcher pinned to Code Review Graph v2.3.7. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
 | A | `scripts/start-contributor-local.ps1` | additive | Contributor local operations helper. | Preserve scoped contributor onboarding without exposing dashboard-admin credentials or widening provider access. | `keep` | `tests/unit/contributor-oauth-guard.test.js`; `tests/unit/contributor-store.test.js`; `tests/unit/oauth-register-session.test.js`; `tests/unit/oauth-modal-api-base.test.js` |
 | A | `scripts/stop-contributor-local.ps1` | additive | Contributor local operations helper. | Preserve scoped contributor onboarding without exposing dashboard-admin credentials or widening provider access. | `keep` | `tests/unit/contributor-oauth-guard.test.js`; `tests/unit/contributor-store.test.js`; `tests/unit/oauth-register-session.test.js`; `tests/unit/oauth-modal-api-base.test.js` |
 | A | `SESSION_CONTEXT.md` | additive | Fork session context. | Keep fork policy, evidence, and regression coverage reproducible and reviewable. | `keep` | `node scripts/check-customization-boundary.mjs`; relevant documented test or review gate |
