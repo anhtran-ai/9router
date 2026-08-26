@@ -60,6 +60,8 @@ function normalizeKey(value) {
 
 export function resolveHostedTool(type, name = "") {
   const key = normalizeKey(type);
+  // A client-defined custom tool is not hosted, even when its name is an alias.
+  if (key === "custom") return null;
   if (key) {
     const exact = EXACT_ALIASES.get(key);
     if (exact) return exact;
@@ -74,14 +76,14 @@ export function resolveHostedTool(type, name = "") {
 }
 
 const CODEX_FIELDS = {
-  [HOSTED_TOOL.WEB_SEARCH]: ["search_context_size", "user_location", "filters"],
+  [HOSTED_TOOL.WEB_SEARCH]: ["search_context_size", "user_location", "filters", "external_web_access", "indexed_web_access"],
   [HOSTED_TOOL.FILE_SEARCH]: ["vector_store_ids", "max_num_results", "ranking_options", "filters"],
   [HOSTED_TOOL.IMAGE_GENERATION]: ["background", "input_fidelity", "model", "moderation", "output_compression", "output_format", "partial_images", "quality", "size"],
   [HOSTED_TOOL.CODE_EXECUTION]: ["container"],
   [HOSTED_TOOL.COMPUTER]: ["display_width", "display_height", "environment"],
   [HOSTED_TOOL.LOCAL_SHELL]: [],
-  [HOSTED_TOOL.TOOL_SEARCH]: [],
-  [HOSTED_TOOL.MCP]: ["server_label", "server_url", "server_description", "connector_id", "authorization", "allowed_tools", "require_approval", "headers"],
+  [HOSTED_TOOL.TOOL_SEARCH]: ["execution", "description", "parameters"],
+  [HOSTED_TOOL.MCP]: ["server_label", "server_url", "server_description", "connector_id", "authorization", "allowed_tools", "require_approval", "headers", "defer_loading"],
 };
 
 const CODEX_TYPES = {

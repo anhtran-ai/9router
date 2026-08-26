@@ -80,6 +80,22 @@ export function loadCustomizationManifest(manifestPath = defaultManifestPath) {
     }
   }
 
+  for (const fix of manifest.compatibility_fixes || []) {
+    if (!fix.issue || !fix.provenance || !fix.preserve || !allowedActions.has(fix.upgrade_action)) {
+      throw new Error("Each compatibility fix needs an issue, provenance, preserve behavior, and upgrade action");
+    }
+    for (const field of ["boundaries", "tests"]) {
+      if (!Array.isArray(fix[field]) || fix[field].length === 0) {
+        throw new Error(`${fix.issue}.${field} must be a non-empty array`);
+      }
+      for (const fixPath of fix[field]) {
+        if (!additive.has(fixPath) && !modified.has(fixPath)) {
+          throw new Error(`${fix.issue}.${field} references an unregistered boundary: ${fixPath}`);
+        }
+      }
+    }
+  }
+
   return manifest;
 }
 
@@ -89,7 +105,8 @@ function describeInventoryEntry(status, entry) {
     || boundaryPath.includes("OAuthModal")
     || boundaryPath.includes("oauth-modal-api-base")
     || boundaryPath.includes("oauth-register-session");
-  const combo = boundaryPath.includes("combo") || boundaryPath.includes("import-export");
+  const combo = boundaryPath.includes("import-export") || boundaryPath.endsWith("/combosRepo.js")
+    || boundaryPath === "src/lib/db/index.js" || boundaryPath === "src/lib/localDb.js";
   const navigation = boundaryPath.includes("customNavigation")
     || boundaryPath.endsWith("/Header.js")
     || boundaryPath.endsWith("/Sidebar.js")
@@ -106,10 +123,19 @@ function describeInventoryEntry(status, entry) {
     || boundaryPath.endsWith("/claude.js");
   const codexResponses = boundaryPath.endsWith("/codex.js")
     || boundaryPath.includes("codex-tool-normalization");
+  const hostedTools = boundaryPath.includes("hostedToolPolicy") || boundaryPath.includes("hosted-tool")
+    || boundaryPath.endsWith("/request/openai-responses.js")
+    || boundaryPath.endsWith("/request/openai-to-claude.js")
+    || boundaryPath.endsWith("/formats/openai.js") || boundaryPath.endsWith("/schema/blocks.js");
+  const modelFallback = boundaryPath.endsWith("/combo.js") || boundaryPath.endsWith("/accountFallback.js")
+    || boundaryPath.endsWith("/errorConfig.js") || boundaryPath.includes("unsupported-tool-fallback")
+    || boundaryPath.includes("account-fallback-prefill");
+  const crg = [".code-review-graphignore", ".codex/config.toml", ".mcp.json", "scripts/crg.py", "docs/CODE_REVIEW_GRAPH.md"].includes(boundaryPath);
   const buildLocal = boundaryPath === ".gitignore"
     || boundaryPath === "Dockerfile"
     || boundaryPath === "next.config.mjs"
     || boundaryPath === "package-lock.json"
+    || boundaryPath.startsWith("scripts/offline-tests/")
     || boundaryPath.includes("start-contributor-local")
     || boundaryPath.includes("stop-contributor-local");
 
@@ -133,21 +159,36 @@ function describeInventoryEntry(status, entry) {
     behavior = "Preserve Contributor and Import/Export navigation through the additive registry while retaining upstream entries.";
     action = status === "A" ? "keep" : "reapply";
     tests = "`tests/unit/custom-navigation.test.js`; customization boundary guard";
-  } else if (claudePrefill) {
+  } else if (modelFallback) {
+    group = "Model compatibility and combo fallback";
+    behavior = "Advance only recognized prefill/unsupported-tool HTTP 400 errors without account cooldown; retain a coherent exhausted error and prefer retryable failures.";
+    action = "drop-if-upstream";
+    tests = "`tests/unit/unsupported-tool-fallback.test.js`; `tests/unit/account-fallback-prefill.test.js`";
+  } else if (claudePrefill || boundaryPath.endsWith("/chatCore.js")) {
     group = "Claude prefill and exact combo fallback";
-    behavior = "Preserve Claude-target final-boundary normalization and exact prefill-only model fallback, separate from account fallback.";
+    behavior = "Preserve Claude-target final-boundary prefill normalization, separate from model/account fallback classification.";
     action = boundaryPath.includes("assistantPrefillPolicy") ? "keep" : "drop-if-upstream";
     tests = "`tests/translator/assistant-prefill-policy.test.js`; `tests/unit/account-fallback-prefill.test.js`; `tests/translator/bugs-toClaude-context.test.js`; `tests/unit/capabilities.test.js`";
   } else if (codexResponses) {
     group = "Codex Responses compatibility";
-    behavior = "Preserve instruction hoisting and additional_tools.content normalization at the Codex OAuth executor boundary.";
+    behavior = "Preserve instruction hoisting, additional_tools.content cleanup, independent MCP servers/selectors, custom choices and native constraints without mutating fallback input.";
     action = "drop-if-upstream";
     tests = "`tests/unit/codex-tool-normalization.test.js`; direct `cx/*` Codex CLI Responses regression";
+  } else if (hostedTools) {
+    group = "Hosted and client tool translation";
+    behavior = "Keep native search/discovery constraints and explicit custom identity; retain hosted tools in the pivot but remove them with dangling choices at the final Chat boundary.";
+    action = "drop-if-upstream";
+    tests = "`tests/unit/hosted-tool-policy.test.js`; `tests/translator/hosted-tools-to-claude.test.js`; `tests/translator/hosted-tools-matrix.test.js`";
+  } else if (crg) {
+    group = "Local Code Review Graph tooling";
+    behavior = "Keep pinned local source navigation, excluded data paths, and ignored derived graph; no external embeddings.";
+    action = "keep";
+    tests = "`python scripts/crg.py build`; `python scripts/crg.py search normalizeCodexTools`; customization boundary guard";
   } else if (buildLocal) {
     group = "Build, dependency, and local scripts";
-    behavior = "Preserve deterministic installs/builds and safe local Contributor start/stop workflows.";
+    behavior = "Preserve deterministic installs/builds, isolated offline regression reports, and safe local Contributor start/stop workflows.";
     action = "re-evaluate";
-    tests = "clean `npm ci`; production build; local helper smoke; customization boundary guard";
+    tests = "clean `npm ci`; production build; offline baseline comparison; local helper smoke; customization boundary guard";
   }
 
   if (!allowedActions.has(action)) throw new Error(`Invalid inventory action for ${boundaryPath}: ${action}`);
@@ -183,7 +224,7 @@ export function renderForkDiffInventory(manifest) {
     "",
     `Baseline snapshot before this inventory file: \`${manifest.fork_snapshot.files_changed} files changed, ${manifest.fork_snapshot.insertions} insertions(+), ${manifest.fork_snapshot.deletions} deletions(-)\`; \`${manifest.fork_snapshot.additive_total}\` additive, \`${manifest.fork_snapshot.modified_total}\` modified, \`${manifest.fork_snapshot.modified_runtime}\` modified runtime seams.`,
     "",
-    `Current guarded path set: \`${rows.length}\` paths. It adds \`${manifest.inventory_path}\` to the exact ${manifest.fork_snapshot.files_changed}-path baseline, so the inventory can guard its own presence.`,
+    `Current guarded path set: \`${rows.length}\` paths (${manifest.counts.additive_total} additive, ${manifest.counts.modified_total} modified, ${manifest.counts.modified_runtime} runtime seams), including the inventory itself. The dated snapshot above is historical, not the current count.`,
     "",
     "`docs/CUSTOMIZATIONS.yaml` is the machine-readable boundary source. This document is the generated human upgrade map. Edit the registry first, then regenerate this file; the guard fails when registry, inventory, and actual fork diff disagree.",
     "",
@@ -195,6 +236,15 @@ export function renderForkDiffInventory(manifest) {
   for (const [group, count] of [...groupCounts].sort(([left], [right]) => left.localeCompare(right))) {
     const sample = describeInventoryEntry(rows.find((row) => describeInventoryEntry(row.status, row.entry).group === group).status, rows.find((row) => describeInventoryEntry(row.status, row.entry).group === group).entry);
     lines.push(`| ${escapeCell(group)} | ${count} | ${escapeCell(sample.action)} |`);
+  }
+  if (manifest.compatibility_fixes?.length) {
+    lines.push("", "## Compatibility fixes to recheck during upgrades", "",
+      "Keep each behavior until an equivalent upstream implementation passes its listed regressions. Retire only the redundant patch, not the coverage. Issue links retain implementation, review, and merge evidence.", "",
+      "| Issue / origin | Behavior to preserve | Boundaries | Regression tests | Upgrade action |",
+      "|---|---|---|---|---|");
+    for (const fix of manifest.compatibility_fixes) {
+      lines.push(`| [#${fix.issue.split("/").at(-1)}](${fix.issue}) — ${escapeCell(fix.provenance)} | ${escapeCell(fix.preserve)} | ${fix.boundaries.map(value => `\`${escapeCell(value)}\``).join("; ")} | ${fix.tests.map(value => `\`${escapeCell(value)}\``).join("; ")} | \`${fix.upgrade_action}\` |`);
+    }
   }
   lines.push(
     "",
@@ -209,7 +259,7 @@ export function renderForkDiffInventory(manifest) {
     "node scripts/check-customization-boundary.mjs",
     "```",
     "",
-    "After every fork merge or upstream upgrade, update the pinned baseline fields in `docs/CUSTOMIZATIONS.yaml`, regenerate this inventory, and review every changed action. Never copy credentials, runtime databases, or `restricted/**` material into either document.",
+    "After fork changes, update registry boundaries/counts and regenerate this inventory. Change the pinned upstream tag/SHA only for an actual upstream upgrade; keep the dated fork snapshot historical. Review each upgrade action. Never copy credentials, runtime databases, or `restricted/**` material into either document.",
     "",
     "## Full path inventory",
     "",
@@ -224,16 +274,18 @@ export function renderForkDiffInventory(manifest) {
   return lines.join("\n");
 }
 
-function validateInventory(manifest) {
+export function validateInventory(manifest, inventoryText) {
   const inventoryPath = path.join(repoRoot, manifest.inventory_path);
   const expected = renderForkDiffInventory(manifest);
-  let actual;
+  let actual = inventoryText;
   try {
-    actual = readFileSync(inventoryPath, "utf8");
+    actual ??= readFileSync(inventoryPath, "utf8");
   } catch (error) {
     return [`Cannot read fork inventory ${manifest.inventory_path}: ${error.message}`];
   }
-  return actual === expected ? [] : [`${manifest.inventory_path} is stale; run node scripts/check-customization-boundary.mjs --write-inventory`];
+  // Git may materialize Markdown as CRLF on Windows. Compare content without
+  // weakening the guard for any difference other than that checkout conversion.
+  return actual.replaceAll("\r\n", "\n") === expected ? [] : [`${manifest.inventory_path} is stale; run node scripts/check-customization-boundary.mjs --write-inventory`];
 }
 
 export function parseNameStatus(text) {

@@ -1,10 +1,25 @@
 # 9Router customization context
 
-Last updated: 2026-08-24
+Last updated: 2026-08-26
 
 This is the safe handoff file for continuing the customized 9Router work in a
 new session. It intentionally contains no admin password, API key, OAuth token,
 provider credential, Docker environment value, private key, or host address.
+
+## Source repair, separate from deployment
+
+The 2026-08-26 source repair covers issues #25–#32: MCP/custom selectors, native
+web-search and discovery fields, mutation-free combo tool normalization, custom
+alias identity, final Chat tool filtering, and coherent combo failure selection.
+Seven groups came from fork PR #24; #32 is inherited from upstream v0.5.55.
+`docs/CUSTOMIZATIONS.yaml` records each issue, boundary, regression gate, and
+upstream retirement condition; `docs/FORK_DIFF_INVENTORY.md` is generated from it.
+Follow the tool compatibility section of `docs/UPSTREAM_UPGRADE_HANDBOOK.md`.
+
+CRG was added separately in PR #33, pinned to2.3.7 and local-only. The bug issues
+link implementation PRs and verification evidence. These source changes do not
+deploy or publish an image. All deployment details below are historical
+snapshots; production has not been re-inspected or changed in this repair.
 
 ## Repository state
 
@@ -24,7 +39,7 @@ provider credential, Docker environment value, private key, or host address.
   `#19` at `b5ccd109487a6f53bbb7fc8771f2c8f9ee79b179`
 - Existing custom tag: `v0.5.35-anhtran` at `a6d9c50`.
 
-The verified live deployment now runs
+The last deployment verified here on 2026-08-24 used
 `llm-gateway/9router-contributor:0.5.55-azox.1-fcf4300e`, image ID
 `sha256:bae7c6eb0d38fa587565aaaf98d42f3cb20b2379e0545d17583a850222b7e16a`.
 It was deployed on `zbs3` on 2026-08-24 after explicit approval by a detached
@@ -153,7 +168,8 @@ repository-history parent; they are not standalone product features.
 
 ## Persistence and deployment
 
-The verified workstation deployment currently runs container
+The earlier 2026-08-23 hotfix snapshot (superseded by the 2026-08-24 record above)
+used container
 `llm-gateway-9router` from image
 `llm-gateway/9router-contributor:0.5.55-azox.1-0522ca95`. Its persistent state
 remains in Docker volume `llm-gateway_ninerouter-data`. The checksum-verified

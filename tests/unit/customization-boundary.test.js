@@ -8,6 +8,7 @@ import {
   parseNameStatus,
   renderForkDiffInventory,
   validateCustomizationDiff,
+  validateInventory,
 } from "../../scripts/check-customization-boundary.mjs";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
@@ -41,7 +42,21 @@ describe("customization boundary guard", () => {
       "utf8",
     );
 
-    expect(inventory).toBe(renderForkDiffInventory(manifest));
+    expect(validateInventory(manifest, inventory)).toEqual([]);
+  });
+
+  it.each(["\n", "\r\n"])("accepts checkout line endings %j but still rejects stale content", (eol) => {
+    const manifest = loadCustomizationManifest(manifestPath);
+    const inventory = renderForkDiffInventory(manifest).replaceAll("\n", eol);
+    expect(validateInventory(manifest, inventory)).toEqual([]);
+    expect(validateInventory(manifest, `${inventory}stale`)).toHaveLength(1);
+  });
+
+  it("maps combo failures and hosted tool policy to their regression gates", () => {
+    const inventory = renderForkDiffInventory(loadCustomizationManifest(manifestPath));
+    const rows = inventory.split("\n").filter(row => row.startsWith("| M |") || row.startsWith("| A |"));
+    expect(rows.find(row => row.includes("`open-sse/services/combo.js`"))).toContain("unsupported-tool-fallback.test.js");
+    expect(rows.find(row => row.includes("`open-sse/translator/concerns/hostedToolPolicy.js`"))).toContain("hosted-tool-policy.test.js");
   });
 
   it("renders baseline counts from manifest snapshot fields", () => {

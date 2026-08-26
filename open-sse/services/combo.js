@@ -10,6 +10,7 @@ import {
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
+import { HTTP_STATUS } from "../config/runtimeConfig.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
@@ -297,9 +298,9 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
     }
   }
   
-  let lastError = null;
+  let lastFailure = null;
+  let retryableFailure = null;
   let earliestRetryAfter = null;
-  let lastStatus = null;
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
@@ -359,14 +360,16 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       }
 
       // Fallback to next model
-      lastError = errorText || String(result.status);
-      if (!lastStatus) lastStatus = result.status;
+      lastFailure = { status: result.status, message: errorText || String(result.status) };
+      if (result.status === HTTP_STATUS.RATE_LIMITED || result.status >= HTTP_STATUS.SERVER_ERROR) {
+        retryableFailure = lastFailure;
+      }
       log.warn("COMBO", `Model ${modelStr} failed, trying next`, { status: result.status });
     } catch (error) {
       // Catch unexpected exceptions to ensure fallback continues
-      lastError = error.message || String(error);
-      if (!lastStatus) lastStatus = 500;
-      log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
+      lastFailure = { status: HTTP_STATUS.SERVER_ERROR, message: String(error?.message || error) };
+      retryableFailure = lastFailure;
+      log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastFailure.message });
     }
   }
 
@@ -374,9 +377,12 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   // Use 503 (Service Unavailable) rather than 406 (Not Acceptable) — 406 implies
   // the request itself is invalid, but here the providers are simply unavailable
   // or have no active credentials. 503 is more accurate and retryable by clients.
-  const allDisabled = lastError && lastError.toLowerCase().includes("no credentials");
-  const status = allDisabled ? 503 : (lastStatus || 503);
-  const msg = lastError || "All combo models unavailable";
+  // Keep status/message from the same attempt. A temporarily unavailable route
+  // remains retryable even if another model rejects this request's tools.
+  const failure = retryableFailure || lastFailure;
+  const allDisabled = failure?.message.toLowerCase().includes("no credentials");
+  const status = allDisabled ? HTTP_STATUS.SERVICE_UNAVAILABLE : (failure?.status || HTTP_STATUS.SERVICE_UNAVAILABLE);
+  const msg = failure?.message || "All combo models unavailable";
 
   if (earliestRetryAfter) {
     const retryHuman = formatRetryAfter(earliestRetryAfter);

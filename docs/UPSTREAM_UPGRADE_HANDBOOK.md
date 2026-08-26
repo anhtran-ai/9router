@@ -51,14 +51,25 @@ high-risk runtime seams have separate classifiers and must not be collapsed:
   and native passthrough boundaries, never by model name. Preserve the additive
   policy module, both call sites, focused tests, and the explicit
   `x-9router-assistant-prefill: preserve` escape hatch.
-- Combo model fallback is separate from account fallback. Only HTTP `400` with
-  exact text `does not support assistant message prefill` advances to the next
-  combo model without account cooldown or rotation. Other `400` responses stop;
-  existing `401`, `403`, `404`, `429`, and `5xx` account/error handling remains.
+- Combo model fallback is separate from account fallback. HTTP `400` matching
+  the prefill phrase or recognized unsupported-tool phrases in
+  `isModelCompatibilityError` advances to the next model without account cooldown
+  or rotation. Other `400` responses stop. Exhausted combos select a coherent
+  status/message pair, preferring the latest `429`/`5xx` failure if present;
+  thrown attempts count as `500`. Keep existing retry-after aggregation and
+  all-no-credentials handling; do not change account cooldown rules incidentally.
 - Codex Responses compatibility belongs at `open-sse/executors/codex.js`:
   developer instructions are hoisted, and only `content` is removed from
   `additional_tools` items. This is provider compatibility for the Codex OAuth
   backend, not a mandatory OpenAI Responses specification rule.
+- Hosted tool normalization must retain native access/discovery constraints,
+  independent MCP configurations and selectors, and explicit custom-tool identity.
+  Do not mutate tool objects shared by combo attempts. Keep hosted tools in the
+  intermediate representation for compatible targets, but filter them and repair
+  tool choices at the final Chat Completions boundary. An empty allowed subset or
+  removed forced selector must not enable unrelated functions: use `none` when
+  other declarations remain. Preserve bare Claude client schemas even when their
+  names match hosted aliases.
 
 Community/upstream work maps to two distinct Codex Responses seams:
 `decolua/9router#2508` hoists instruction/system-prompt content into top-level
@@ -67,6 +78,76 @@ Bugs `#2497` and `#3390` remain open references. During each upstream upgrade,
 inspect their current state. If upstream has merged equivalent behavior, delete
 only the matching downstream seam after focused tests and a direct `cx/*`
 Codex CLI Responses check pass.
+
+### Tool compatibility repair register (2026-08-26)
+
+The `compatibility_fixes` array in `CUSTOMIZATIONS.yaml` and generated inventory
+map each issue to its source boundary, behavior, regression files, and retirement
+action. Issues [#25–#31](https://github.com/azox-ai/azox-9router/pull/24) were
+introduced by fork PR #24 (`31296537`); [#32](https://github.com/azox-ai/azox-9router/issues/32)
+was already present in upstream `v0.5.55` (`699edac3`). The two P1 repairs are
+native web-search access flags (#27) and shared tool mutation during fallback
+(#28). These are source findings, not claims of a production incident.
+
+For each upstream upgrade:
+
+1. Compare the new pinned upstream implementation against each register entry;
+   do not replay the entire old executor or translator file over upstream.
+2. Carry the regression tests forward first, then retain only missing behavior.
+   Drop a redundant patch only when equivalent upstream code passes the tests.
+   Keep `hostedToolPolicy.js` and final-target filtering distinct from the pivot.
+3. Run the focused gate below, the other fork feature gates, a same-environment
+   full-suite comparison against clean upstream, and a production build. The
+   full suite has inherited failures; report exact new failure identities and
+   collection/suite errors, not only totals. Do not edit known-fail snapshots to
+   conceal new regressions.
+4. Review the required client matrix separately before a production rollout.
+   Offline request-shape tests do not prove provider support or successful live
+   tool execution. Publishing/deploying still requires human approval.
+
+Focused gate (from `tests/`, no credentials or provider calls):
+
+```sh
+npx vitest run unit/codex-tool-normalization.test.js unit/hosted-tool-policy.test.js unit/unsupported-tool-fallback.test.js unit/account-fallback-prefill.test.js translator/hosted-tools-to-claude.test.js translator/hosted-tools-matrix.test.js translator/assistant-prefill-policy.test.js unit/customization-boundary.test.js
+```
+
+For a source-only fork fix, compare the complete offline suite with the exact
+pre-fix fork SHA in another worktree. Use identical Node/Vitest versions, exclude
+`**/*.real.test.js`, disable live/E2E gates, and isolate both `DATA_DIR` and the
+process home/profile (usage storage does not fully honor `DATA_DIR`). Block
+external network calls; some upstream tests are ungated. Preserve both JSON
+reports and run `scripts/compare-test-results.mjs`; it compares both assertion
+and collection/suite-error identities, including failed hooks with passing tests.
+
+The reusable runner implements these safeguards without changing the upstream
+test files. Run from the candidate repository root, once per fresh output path:
+
+```sh
+node scripts/offline-tests/run-offline.mjs /path/to/baseline tests/.task-tmp/baseline
+node scripts/offline-tests/run-offline.mjs . tests/.task-tmp/candidate
+node scripts/compare-test-results.mjs tests/.task-tmp/candidate/vitest.json tests/.task-tmp/baseline/vitest.json
+```
+
+Install both worktrees' dependencies first. The runner uses the same base Vitest
+config, four fork workers and zero retries; records commands/SHAs/versions, JSON
+results, failure identities and blocked attempts; and refuses to overwrite a run.
+Only worker-owned ephemeral loopback fixtures can use the network. Provider and
+proxy environment variables are not inherited. Shell children are blocked;
+guarded Node, read-only Git, and bundled esbuild remain available. Ungated live
+tests can therefore fail offline; compare those identities rather than calling
+providers or suppressing failures. This process guard is not an OS firewall or
+a sandbox for hostile code; use it only with reviewed sources. Keep generated
+reports/profile/data under ignored task directories and out of Git.
+
+Windows SQLite teardown can transiently return `ENOTEMPTY` after closing the
+database. The migration-chain fixture retries only its temporary-directory
+removal, with a bounded filesystem retry; assertions and Vitest retries remain
+unchanged. Keep cleanup failures distinguishable from migration failures.
+
+The inventory guard accepts Git checkout CRLF/LF differences but still rejects
+stale content and unregistered source paths. CRG setup is separate fork tooling
+([PR #33](https://github.com/azox-ai/azox-9router/pull/33)); preserve its pin and
+data exclusions through upgrades. See [CODE_REVIEW_GRAPH.md](CODE_REVIEW_GRAPH.md).
 
 ## Repository setup
 

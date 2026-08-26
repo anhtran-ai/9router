@@ -8,7 +8,7 @@ import {
 import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
 import { RESPONSES_ITEM } from "../translator/schema/index.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
-import { renderHostedToolForCodex } from "../translator/concerns/hostedToolPolicy.js";
+import { HOSTED_TOOL, renderHostedToolForCodex } from "../translator/concerns/hostedToolPolicy.js";
 import { getModelUpstreamId } from "../config/providerModels.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
@@ -97,9 +97,11 @@ function stripStoredItemReferences(body) {
 function normalizeCodexTools(body) {
   if (!Array.isArray(body.tools)) return;
   const validNames = new Set();
+  const customNames = new Set();
+  const mcpServerLabels = new Set();
   const hostedTypes = new Set();
-  body.tools = body.tools.filter((tool) => {
-    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return false;
+  body.tools = body.tools.map((tool) => {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return null;
     const type = typeof tool.type === "string" ? tool.type : "";
     if (type === "namespace") {
       if (Array.isArray(tool.tools)) {
@@ -108,43 +110,54 @@ function normalizeCodexTools(body) {
           if (n) validNames.add(n);
         }
       }
-      return true;
+      return tool;
     }
     if (type !== "function") {
-      if (CODEX_PASSTHROUGH_TOOL_TYPES.has(type)) return true;
-      if (!type || tool.function) return false;
+      if (CODEX_PASSTHROUGH_TOOL_TYPES.has(type)) {
+        if (typeof tool.name === "string" && tool.name.trim()) customNames.add(tool.name);
+        return tool;
+      }
+      if (!type || tool.function) return null;
       const hosted = renderHostedToolForCodex(tool);
-      if (!hosted) return false;
-      if (hostedTypes.has(hosted.type)) return false;
+      if (!hosted) return null;
+      // MCP declarations identify separate servers, not aliases of one capability.
+      if (hosted.type !== HOSTED_TOOL.MCP && hostedTypes.has(hosted.type)) return null;
       hostedTypes.add(hosted.type);
-      for (const k of Object.keys(tool)) delete tool[k];
-      Object.assign(tool, hosted);
-      return true;
+      if (hosted.type === HOSTED_TOOL.MCP && typeof hosted.server_label === "string" && hosted.server_label.trim()) {
+        mcpServerLabels.add(hosted.server_label);
+      }
+      // Combo legs may share declarations; never rewrite the caller's objects.
+      return hosted;
     }
     const fn = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function) ? tool.function : null;
     const rawName = typeof tool.name === "string" ? tool.name : (typeof fn?.name === "string" ? fn.name : "");
     const name = rawName.trim();
-    if (!name) return false;
+    if (!name) return null;
     const description = typeof tool.description === "string" ? tool.description : (typeof fn?.description === "string" ? fn.description : "");
     const parameters = (tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters))
       ? tool.parameters
       : (fn?.parameters && typeof fn.parameters === "object" && !Array.isArray(fn.parameters) ? fn.parameters : { type: "object", properties: {} });
-    for (const k of Object.keys(tool)) delete tool[k];
-    tool.type = "function";
-    tool.name = name.slice(0, 128);
-    if (description) tool.description = description;
-    tool.parameters = parameters;
     validNames.add(name);
-    return true;
-  });
+    return {
+      type: "function",
+      name: name.slice(0, 128),
+      ...(description ? { description } : {}),
+      parameters,
+    };
+  }).filter(Boolean);
   if (body.tool_choice && typeof body.tool_choice === "object" && !Array.isArray(body.tool_choice)) {
     if (body.tool_choice.type === "function") {
       const n = typeof body.tool_choice.name === "string" ? body.tool_choice.name.trim() : "";
       if (!n || !validNames.has(n)) delete body.tool_choice;
+    } else if (CODEX_PASSTHROUGH_TOOL_TYPES.has(body.tool_choice.type)) {
+      if (!customNames.has(body.tool_choice.name)) delete body.tool_choice;
     } else {
       const hosted = renderHostedToolForCodex(body.tool_choice);
       if (!hosted || !hostedTypes.has(hosted.type)) delete body.tool_choice;
-      else body.tool_choice = { type: hosted.type };
+      else if (hosted.type === HOSTED_TOOL.MCP) {
+        if (!mcpServerLabels.has(body.tool_choice.server_label)) delete body.tool_choice;
+        else body.tool_choice = { ...body.tool_choice, type: hosted.type };
+      } else body.tool_choice = { type: hosted.type };
     }
   }
 }

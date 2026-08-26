@@ -171,11 +171,9 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
     }
   }
 
-  // Convert tools format.
-  // Responses API supports "hosted" tools (e.g. { type: "request_user_input" }) that carry no
-  // explicit `name` field and cannot be represented as Chat Completions function declarations.
-  // Filter them out to avoid sending nameless functionDeclarations to downstream providers
-  // such as Gemini, which strictly validates function names.
+  // Preserve recognized hosted tools in the intermediate format for compatible
+  // targets. The final Chat boundary filters them; other translators render their
+  // native equivalents. Unknown nameless tools cannot become client functions.
   const responseTools = [
     ...(Array.isArray(body.tools) ? body.tools : []),
     ...additionalTools,
@@ -186,9 +184,10 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         // Already in Chat Completions format: { type: "function", function: { name, ... } }
         if (tool.function) return tool;
         // Responses API function/custom tool: { type, name, description, parameters|format }.
-        // Chat Completions has no freeform custom-tool declaration, so expose custom
-        // tools as functions with one raw `input` string while retaining their names
-        // in translator-only metadata for the response conversion.
+        // For the cross-provider pivot, expose Responses custom tools as functions
+        // with one raw `input` string, retaining names in translator-only metadata
+        // for response conversion. Native Chat custom declarations use a different
+        // nested shape and are preserved at the final Chat boundary.
         if (isHostedTool(tool)) return tool;
         const name = tool.name;
         if (!name || typeof name !== "string" || name.trim() === "") return null;

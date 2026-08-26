@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import "./registerAll.js";
+import { translateRequest } from "../../open-sse/translator/index.js";
+import { FORMATS } from "../../open-sse/translator/formats.js";
 import { openaiToClaudeRequest } from "../../open-sse/translator/request/openai-to-claude.js";
 
 function translate(tools, toolChoice) {
@@ -76,5 +79,42 @@ describe("OpenAI/Responses hosted tools to Claude", () => {
       { type: "function", function: { name: "echo", parameters: { type: "object" } } },
     ], { type: "function", function: { name: "missing" } });
     expect(invalid.tool_choice).toEqual({ type: "auto" });
+  });
+});
+
+describe("Responses custom tool names that overlap hosted aliases", () => {
+  it.each(["bash", "web_search", "echo"])("keeps custom %s as a function wrapper for Claude and Gemini", (name) => {
+    const input = {
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "probe" }] }],
+      tools: [{ type: "custom", name, format: { type: "text" } }],
+    };
+    const claude = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE,
+      "claude-opus-5", structuredClone(input), true, null, "claude");
+    const gemini = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI,
+      "gemini-2.5-pro", structuredClone(input), true, null, "gemini");
+
+    expect(claude.tools).toHaveLength(1);
+    expect(claude.tools[0]).toMatchObject({
+      name, input_schema: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
+    });
+    expect(claude.tools[0].type).toBeUndefined();
+    expect(gemini.tools[0].functionDeclarations).toHaveLength(1);
+    expect(gemini.tools[0].functionDeclarations[0]).toMatchObject({
+      name, parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
+    });
+  });
+
+  it("keeps same-named function tools separate from hosted declarations", () => {
+    const input = {
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "probe" }] }],
+      tools: [{ type: "function", name: "web_search", parameters: { type: "object", properties: {} } }],
+    };
+    const claude = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE,
+      "claude-opus-5", structuredClone(input), true, null, "claude");
+    const gemini = translateRequest(FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI,
+      "gemini-2.5-pro", structuredClone(input), true, null, "gemini");
+    expect(claude.tools[0]).toMatchObject({ name: "web_search", input_schema: { type: "object" } });
+    expect(claude.tools[0].type).toBeUndefined();
+    expect(gemini.tools[0].functionDeclarations[0].name).toBe("web_search");
   });
 });

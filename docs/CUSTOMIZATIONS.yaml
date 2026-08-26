@@ -12,26 +12,26 @@
     "additive_total": 34,
     "modified_total": 23,
     "modified_runtime": 14,
-    "note": "Baseline before FORK_DIFF_INVENTORY.md was added; current guarded set includes the inventory itself."
+    "note": "Historical snapshot before FORK_DIFF_INVENTORY.md; current counts and boundaries below include later reviewed fixes and tooling."
   },
   "inventory_path": "docs/FORK_DIFF_INVENTORY.md",
   "counts": {
-    "additive_total": 45,
-    "modified_total": 25,
-    "modified_runtime": 16,
+    "additive_total": 50,
+    "modified_total": 28,
+    "modified_runtime": 18,
     "modified_runtime_target_approx": 10,
-    "target_note": "Sixteen runtime source seams remain, above the approximate target of ten. codex.js and the two request translators are explicit provider-compatibility seams; combo.js is an explicit model-fallback seam; Header.js and Sidebar.js remain small registry hook exceptions."
+    "target_note": "Eighteen runtime seams remain, above the approximate target of ten. Final Chat tools filtering and its custom-tool discriminator are explicit protocol seams added for #31; existing Codex/Claude, combo, and navigation seams remain individually registered."
   },
   "runtime_policies": {
     "claude_assistant_prefill": {
       "classifier": "Target format is Claude/Anthropic Messages; model IDs and aliases are not capability classifiers.",
       "boundaries": ["open-sse/translator/formats/claude.js", "open-sse/handlers/chatCore.js"],
       "preserve_header": "x-9router-assistant-prefill: preserve",
-      "fallback_rule": "Only HTTP 400 containing exact text 'does not support assistant message prefill' advances a combo model without cooling down or rotating the account."
+      "fallback_rule": "HTTP 400 with the recognized prefill phrase or an unsupported-tool phrase in isModelCompatibilityError advances the combo model without account cooldown/rotation; ordinary HTTP 400 still stops."
     },
     "codex_responses": {
       "boundary": "open-sse/executors/codex.js",
-      "normalizations": ["Hoist Codex CLI developer instructions.", "Remove only content from additional_tools items while preserving items, order, tools, and metadata."],
+      "normalizations": ["Hoist Codex CLI developer instructions.", "Remove only content from additional_tools items while preserving items, order, tools, and metadata.", "Normalize hosted tools into new objects; preserve independent MCP servers and forced MCP/custom selectors.", "Retain native web-search access flags, client tool_search schema/execution, and MCP defer_loading."],
       "scope": "Provider compatibility for the Codex OAuth Responses backend; not a mandatory OpenAI Responses specification rule.",
       "upstream_reference_roles": {
         "instruction_hoisting": "decolua/9router#2508",
@@ -39,8 +39,86 @@
         "related_open_bugs": ["decolua/9router#2497", "decolua/9router#3390"]
       },
       "retirement": "Drop the fork seam after upstream ships an equivalent fix and direct cx/* Codex CLI regression passes."
+    },
+    "hosted_tools": {
+      "boundaries": ["open-sse/translator/concerns/hostedToolPolicy.js", "open-sse/translator/request/openai-responses.js", "open-sse/translator/request/openai-to-claude.js", "open-sse/translator/formats/openai.js"],
+      "classifier": "Explicit client function/custom identity wins over hosted aliases; named native custom tools are not built-ins.",
+      "pivot": "Keep recognized hosted declarations in the OpenAI intermediate representation for compatible target formats.",
+      "chat_boundary": "Final Chat output contains only client function/custom declarations and synchronized selectors. An empty selected subset or unavailable forced tool disables calls to unrelated retained tools; remove choices when no tools remain.",
+      "mutation": "Codex normalization must not alter shared tool objects used by later combo attempts."
+    },
+    "combo_exhaustion": {
+      "boundary": "open-sse/services/combo.js",
+      "selection": "Keep status/message together; choose the latest 429/5xx (including thrown errors as 500) if any, otherwise the latest failure. Ordinary terminal HTTP 400 and successful responses return immediately.",
+      "preserve": "Keep earliest retry-after aggregation and all-no-credentials normalization; do not change account cooldown classification."
     }
   },
+  "compatibility_fixes": [
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/25",
+      "provenance": "Regression introduced by fork PR #24 (31296537).",
+      "preserve": "Keep all MCP server declarations in order, even repeated labels with different configurations; retain valid server_label/name selectors.",
+      "boundaries": ["open-sse/executors/codex.js"],
+      "tests": ["tests/unit/codex-tool-normalization.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/26",
+      "provenance": "Regression introduced by fork PR #24 (31296537).",
+      "preserve": "Keep forced custom choices only when that custom name survives; a same-named function does not validate a custom selector.",
+      "boundaries": ["open-sse/executors/codex.js"],
+      "tests": ["tests/unit/codex-tool-normalization.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/27",
+      "provenance": "Regression introduced by fork PR #24 (31296537).",
+      "preserve": "Retain native external_web_access (including false), indexed_web_access, and filters in Codex web_search payloads.",
+      "boundaries": ["open-sse/translator/concerns/hostedToolPolicy.js"],
+      "tests": ["tests/unit/hosted-tool-policy.test.js", "tests/unit/codex-tool-normalization.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/28",
+      "provenance": "Regression introduced by fork PR #24 (31296537).",
+      "preserve": "Do not mutate source tool objects: after Codex fails, the next Claude attempt must retain the original dated type, allowed_domains, and max_uses.",
+      "boundaries": ["open-sse/executors/codex.js"],
+      "tests": ["tests/unit/codex-tool-normalization.test.js", "tests/unit/unsupported-tool-fallback.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/29",
+      "provenance": "Regression introduced by fork PR #24 (31296537).",
+      "preserve": "Keep tool_search execution/description/parameters and MCP defer_loading alongside existing MCP approval settings.",
+      "boundaries": ["open-sse/translator/concerns/hostedToolPolicy.js"],
+      "tests": ["tests/unit/hosted-tool-policy.test.js", "tests/unit/codex-tool-normalization.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/30",
+      "provenance": "Regression introduced by fork PR #24 (31296537).",
+      "preserve": "Explicit custom tools named bash/web_search remain client-tool wrappers through Claude/Gemini translation, never hosted built-ins.",
+      "boundaries": ["open-sse/translator/concerns/hostedToolPolicy.js", "open-sse/translator/request/openai-responses.js"],
+      "tests": ["tests/unit/hosted-tool-policy.test.js", "tests/translator/hosted-tools-to-claude.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/31",
+      "provenance": "Regression introduced by fork PR #24 (31296537).",
+      "preserve": "Filter hosted tools only at the final Chat boundary; keep function/native custom tools and synchronize forced/allowed selectors without breaking the Claude/Codex pivot.",
+      "boundaries": ["open-sse/translator/formats/openai.js", "open-sse/translator/schema/blocks.js"],
+      "tests": ["tests/translator/hosted-tools-matrix.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/32",
+      "provenance": "Inherited from upstream v0.5.55 (699edac3); not introduced by PR #24.",
+      "preserve": "An exhausted combo returns one coherent status/message pair, preferring retryable 429/5xx when a compatible route is temporarily unavailable.",
+      "boundaries": ["open-sse/services/combo.js"],
+      "tests": ["tests/unit/unsupported-tool-fallback.test.js", "tests/unit/account-fallback-prefill.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    }
+  ],
   "boundaries": {
     "additive": [
       { "path": ".code-review-graphignore", "reason": "Exclude restricted data and generated artifacts from local CRG indexing." },
@@ -59,6 +137,10 @@
       { "path": "scripts/check-customization-boundary.mjs", "reason": "Deterministic boundary guard." },
       { "path": "scripts/compare-test-results.mjs", "reason": "Fork regression baseline helper." },
       { "path": "scripts/crg.py", "reason": "Repository-root-aware launcher pinned to Code Review Graph v2.3.7." },
+      { "path": "scripts/offline-tests/network-guard.cjs", "reason": "Test-only process guard blocks unmocked provider/existing gateway traffic and preserves ephemeral fixture servers." },
+      { "path": "scripts/offline-tests/offline.config.mjs", "reason": "Reuse repository Vitest configuration with fixed offline/reporting overrides." },
+      { "path": "scripts/offline-tests/offline.setup.mjs", "reason": "Install the same network guard inside test workers before importing tests." },
+      { "path": "scripts/offline-tests/run-offline.mjs", "reason": "Reproducible same-environment baseline/candidate reports with isolated data/profile directories and no inherited provider environment." },
       { "path": "scripts/start-contributor-local.ps1", "reason": "Contributor local operations helper." },
       { "path": "scripts/stop-contributor-local.ps1", "reason": "Contributor local operations helper." },
       { "path": "src/app/(dashboard)/dashboard/contributors/page.js", "reason": "Contributor dashboard feature." },
@@ -86,6 +168,7 @@
       { "path": "tests/unit/hosted-tool-policy.test.js", "reason": "Hosted tool alias and rendering coverage." },
       { "path": "tests/unit/oauth-modal-api-base.test.js", "reason": "Generic OAuth apiBase seam coverage." },
       { "path": "tests/unit/oauth-register-session.test.js", "reason": "Contributor OAuth session coverage." },
+      { "path": "tests/unit/offline-test-runner.test.js", "reason": "Negative probes prevent wildcard fixture binding and shell dispatch in the reusable offline runner." },
       { "path": "tests/unit/unsupported-tool-fallback.test.js", "reason": "Unsupported hosted tool fallback coverage." },
       { "path": "tests/unit/upstream-v0555-preservation.test.js", "reason": "Upstream preservation coverage." }
     ],
@@ -101,8 +184,10 @@
       { "path": "open-sse/services/accountFallback.js", "category": "runtime", "reason": "Classify exact HTTP 400 model-compatibility errors without account cooldown." },
       { "path": "open-sse/services/combo.js", "category": "runtime", "reason": "Allow model-only fallback for exact model-compatibility HTTP 400 while stopping other HTTP 400 responses." },
       { "path": "open-sse/translator/formats/claude.js", "category": "runtime", "reason": "Apply Claude-target policy on translated requests." },
+      { "path": "open-sse/translator/formats/openai.js", "category": "runtime", "reason": "Remove hosted declarations at the final Chat boundary and synchronize retained function/custom tool selectors (#31)." },
       { "path": "open-sse/translator/request/openai-responses.js", "category": "runtime", "reason": "Preserve hosted tools across the OpenAI pivot." },
       { "path": "open-sse/translator/request/openai-to-claude.js", "category": "runtime", "reason": "Render hosted tools natively for Anthropic and keep tool_choice consistent." },
+      { "path": "open-sse/translator/schema/blocks.js", "category": "runtime", "reason": "Name the native Chat custom-tool discriminator used by final-boundary normalization (#31)." },
       { "path": "src/dashboardGuard.js", "category": "runtime", "reason": "Expose contributor session endpoint without widening admin routes." },
       { "path": "src/lib/db/index.js", "category": "runtime", "reason": "Register combo transfer repository seam." },
       { "path": "src/lib/db/repos/combosRepo.js", "category": "runtime", "reason": "Add combo import/export persistence operations." },
@@ -114,6 +199,7 @@
       { "path": "tests/translator/__snapshots__/golden-url-header.test.js.snap", "category": "tests", "reason": "Record intentional upstream-provider cleanup output." },
       { "path": "tests/translator/bugs-toClaude-context.test.js", "category": "tests", "reason": "Cover Claude-target prefill behavior in existing translator suite." },
       { "path": "tests/unit/capabilities.test.js", "category": "tests", "reason": "Cover removal of model-based assistant prefill capability." },
+      { "path": "tests/unit/db-migration-chain.test.js", "category": "tests", "reason": "Bounded Windows ENOTEMPTY teardown retry only; assertions and Vitest retry=0 remain unchanged." },
       { "path": "tests/unit/codex-tool-normalization.test.js", "category": "tests", "reason": "Cover Codex CLI Responses passthrough normalization, strict unsupported-content handling, and hosted tool rewrites." }
     ]
   }

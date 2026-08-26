@@ -19,6 +19,9 @@ vi.mock("@/sse/utils/logger.js", () => ({ debug: vi.fn(), info: vi.fn(), warn: v
 const { checkFallbackError, isUnsupportedToolTypeError } = await import("../../open-sse/services/accountFallback.js");
 const { handleComboChat } = await import("../../open-sse/services/combo.js");
 const { markAccountUnavailable } = await import("../../src/sse/services/auth.js");
+const { CodexExecutor } = await import("../../open-sse/executors/codex.js");
+const { translateRequest } = await import("../../open-sse/translator/index.js");
+const { FORMATS } = await import("../../open-sse/translator/formats.js");
 
 const UNSUPPORTED_TOOL_ERROR = JSON.stringify({
   error: { message: "[codex/gpt-5.6-sol] [400]: {\"detail\":\"Unsupported tool type: web_search_preview\"}" },
@@ -94,5 +97,131 @@ describe("unsupported hosted tool classification", () => {
 
     expect(response).toBe(response400);
     expect(handleSingleModel).toHaveBeenCalledTimes(1);
+  });
+});
+
+async function runComboOutcomes(outcomes) {
+  const handleSingleModel = vi.fn();
+  for (const outcome of outcomes) {
+    if (outcome instanceof Error) {
+      handleSingleModel.mockRejectedValueOnce(outcome);
+    } else if (outcome instanceof Response) {
+      handleSingleModel.mockResolvedValueOnce(outcome);
+    } else {
+      handleSingleModel.mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: outcome.message },
+        ...(outcome.retryAfter ? { retryAfter: outcome.retryAfter } : {}),
+      }), { status: outcome.status, headers: { "Content-Type": "application/json" } }));
+    }
+  }
+  const response = await handleComboChat({
+    body: { messages: [{ role: "user", content: "Start" }] },
+    models: outcomes.map((_, index) => `codex/fallback-${index}`),
+    handleSingleModel,
+    log: { info: vi.fn(), warn: vi.fn() },
+    autoSwitch: false,
+  });
+  return { response, handleSingleModel };
+}
+
+describe("exhausted combo error selection", () => {
+  const unsupported = { status: 400, message: "Unsupported tool type: web_search_preview" };
+  const rateLimited = { status: 429, message: "rate limit exceeded" };
+  const unavailable = { status: 503, message: "Service temporarily unavailable" };
+
+  it.each([
+    ["unsupported tool then 429", [unsupported, rateLimited], rateLimited],
+    ["429 then unsupported tool", [rateLimited, unsupported], rateLimited],
+    ["unsupported tool then 503", [unsupported, unavailable], unavailable],
+    ["503 then unsupported tool", [unavailable, unsupported], unavailable],
+    ["multiple retryable failures", [rateLimited, unavailable], unavailable],
+    ["only incompatible models", [unsupported, { status: 400, message: "Unknown tool type: file_search" }],
+      { status: 400, message: "Unknown tool type: file_search" }],
+    ["unsupported tool then exception", [unsupported, new Error("upstream connection closed")],
+      { status: 500, message: "upstream connection closed" }],
+    ["exception then unsupported tool", [new Error("upstream connection closed"), unsupported],
+      { status: 500, message: "upstream connection closed" }],
+    ["no credentials", [{ status: 404, message: "No credentials for provider A" },
+      { status: 404, message: "No credentials for provider B" }],
+      { status: 503, message: "No credentials for provider B" }],
+  ])("keeps a coherent status/message for %s", async (_label, outcomes, expected) => {
+    const { response, handleSingleModel } = await runComboOutcomes(outcomes);
+    expect(handleSingleModel).toHaveBeenCalledTimes(outcomes.length);
+    expect(response.status).toBe(expected.status);
+    expect(await response.json()).toEqual({ error: { message: expected.message } });
+  });
+
+  it("keeps the earliest retry time while selecting a retryable error pair", async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const { response } = await runComboOutcomes([
+        unsupported,
+        { ...rateLimited, retryAfter: new Date(now + 30_000).toISOString() },
+        { ...unavailable, retryAfter: new Date(now + 10_000).toISOString() },
+        { ...rateLimited, message: "second rate limit", retryAfter: new Date(now + 20_000).toISOString() },
+      ]);
+      expect(response.status).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe("10");
+      expect(await response.json()).toEqual({ error: { message: "second rate limit (reset after 10s)" } });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("returns success after retryable and compatibility failures", async () => {
+    const success = new Response(JSON.stringify({ ok: true }), { status: 200 });
+    const { response } = await runComboOutcomes([rateLimited, unsupported, success]);
+    expect(response).toBe(success);
+  });
+
+  it("still stops at an ordinary terminal 400 after a retryable failure", async () => {
+    const invalid = new Response(JSON.stringify({ error: { message: "max_tokens must be positive" } }), { status: 400 });
+    const { response, handleSingleModel } = await runComboOutcomes([rateLimited, invalid, unavailable]);
+    expect(response).toBe(invalid);
+    expect(handleSingleModel).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("hosted tool preservation across combo attempts", () => {
+  it("keeps the same request's native Claude tool restrictions after a Codex failure", async () => {
+    const hostedTool = {
+      type: "web_search_20250305", name: "web_search",
+      allowed_domains: ["example.org"], max_uses: 1,
+    };
+    const body = {
+      model: "combo", max_tokens: 256, stream: true,
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Search the allowed site" }] }],
+      tools: [hostedTool],
+    };
+    const originalTools = structuredClone(body.tools);
+    let claudeRequest;
+    const handleSingleModel = vi.fn(async (sameBody, model) => {
+      expect(sameBody).toBe(body);
+      if (model.startsWith("codex/")) {
+        // Match the handler/native-passthrough shallow envelopes; do not clone
+        // the tools per leg or this test would hide cross-attempt mutations.
+        const codexRequest = { ...sameBody, model: "gpt-5.6-sol" };
+        new CodexExecutor().transformRequest("gpt-5.6-sol", codexRequest, true, {
+          connectionId: "offline-combo-test", providerSpecificData: {},
+        });
+        return new Response(JSON.stringify({ error: { message: "rate limit exceeded" } }), { status: 429 });
+      }
+      claudeRequest = translateRequest(
+        FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE, "claude-opus-5",
+        { ...sameBody, model }, true, null, "claude",
+      );
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+
+    const response = await handleComboChat({
+      body, models: ["codex/gpt-5.6-sol", "claude/claude-opus-5"],
+      handleSingleModel, log: { info: vi.fn(), warn: vi.fn() }, autoSwitch: false,
+    });
+
+    expect(response.ok).toBe(true);
+    expect(handleSingleModel).toHaveBeenCalledTimes(2);
+    expect(body.tools).toEqual(originalTools);
+    expect(claudeRequest.tools[0]).toMatchObject(originalTools[0]);
   });
 });

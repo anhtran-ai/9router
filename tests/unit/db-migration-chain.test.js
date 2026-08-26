@@ -19,7 +19,9 @@ afterEach(() => {
   // Close adapter to release file handles before rm
   try { global._dbAdapter?.instance?.close?.(); } catch {}
   delete global._dbAdapter;
-  if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+  // Windows can briefly report ENOTEMPTY after closing SQLite. Retry only the
+  // filesystem cleanup, never a test assertion; persistent failures still fail.
+  if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
 });

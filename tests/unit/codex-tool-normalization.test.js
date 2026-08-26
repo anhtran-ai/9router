@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { CodexExecutor } from "../../open-sse/executors/codex.js";
 
-function normalizeTools(tools) {
+function normalizeRequest(tools, toolChoice) {
   const executor = new CodexExecutor();
   const body = {
     model: "gpt-5.5",
     input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "probe" }] }],
     tools,
+    ...(toolChoice === undefined ? {} : { tool_choice: toolChoice }),
     stream: true,
   };
 
@@ -16,7 +17,11 @@ function normalizeTools(tools) {
     providerSpecificData: {},
   });
 
-  return body.tools;
+  return body;
+}
+
+function normalizeTools(tools) {
+  return normalizeRequest(tools).tools;
 }
 
 describe("CodexExecutor tool normalization", () => {
@@ -183,12 +188,17 @@ describe("CodexExecutor tool normalization", () => {
   });
 
   it("preserves Responses-native tool_search tools", () => {
-    const tools = normalizeTools([
+    const inputTools = [
       {
         type: "tool_search",
-        execution: "sync",
+        execution: "client",
         description: "Discover deferred tools",
-        parameters: { type: "object", properties: {} },
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+          additionalProperties: false,
+        },
       },
       {
         type: "namespace",
@@ -210,13 +220,39 @@ describe("CodexExecutor tool normalization", () => {
         description: "plain",
         parameters: { type: "object", properties: {} },
       },
-    ]);
+    ];
+    expect(normalizeTools(structuredClone(inputTools))).toEqual(inputTools);
+  });
 
-    expect(tools.map((tool) => `${tool.type}:${tool.name || ""}`)).toEqual([
-      "tool_search:",
-      "namespace:codex_app",
-      "function:plain_fn",
-    ]);
+  it("preserves hosted tool search without client fields", () => {
+    expect(normalizeTools([{ type: "tool_search" }])).toEqual([{ type: "tool_search" }]);
+  });
+
+  it.each([true, false])("preserves cache-only web search with indexed_web_access=%s", (indexed) => {
+    const tool = {
+      type: "web_search",
+      external_web_access: false,
+      indexed_web_access: indexed,
+      filters: { allowed_domains: ["example.com"] },
+    };
+    expect(normalizeTools([structuredClone(tool)])).toEqual([tool]);
+  });
+
+  it("preserves deferred MCP discovery and approval configuration", () => {
+    const tool = {
+      type: "mcp", server_label: "docs", server_url: "https://example.com/mcp",
+      defer_loading: true, allowed_tools: ["search"], require_approval: "always",
+    };
+    expect(normalizeTools([structuredClone(tool)])).toEqual([tool]);
+  });
+
+  it("keeps distinct MCP configurations in order, including repeated labels", () => {
+    const tools = [
+      { type: "mcp", server_label: "docs", server_url: "https://example.com/docs", allowed_tools: ["search"], require_approval: "always" },
+      { type: "mcp", server_label: "issues", server_url: "https://example.com/issues", allowed_tools: ["list"], require_approval: "always" },
+      { type: "mcp", server_label: "docs", server_url: "https://example.com/other-docs", allowed_tools: ["read"], require_approval: "always" },
+    ];
+    expect(normalizeTools(structuredClone(tools))).toEqual(tools);
   });
 
   it("preserves hosted Responses tools", () => {
@@ -261,6 +297,23 @@ describe("CodexExecutor tool normalization", () => {
 });
 
 describe("CodexExecutor cross-provider hosted tools", () => {
+  it("does not mutate shared tool declarations when normalizing a combo leg", () => {
+    const tools = [
+      { type: "web_search_20250305", name: "web_search", allowed_domains: ["example.org"], max_uses: 1 },
+      { type: "function", function: { name: "echo", description: "Echo", parameters: { type: "object" } } },
+    ];
+    const original = structuredClone(tools);
+    const normalized = normalizeTools(tools);
+
+    expect(tools).toEqual(original);
+    expect(normalized).toEqual([
+      { type: "web_search" },
+      { type: "function", name: "echo", description: "Echo", parameters: { type: "object" } },
+    ]);
+    expect(normalized[0]).not.toBe(tools[0]);
+    expect(normalized[1]).not.toBe(tools[1]);
+  });
+
   it("normalizes Claude CLI and OpenAI Platform aliases for Codex OAuth", () => {
     const tools = normalizeTools([
       { type: "web_search_preview", search_context_size: "medium", max_uses: 5 },
@@ -304,6 +357,46 @@ describe("CodexExecutor cross-provider hosted tools", () => {
 });
 
 describe("CodexExecutor hosted tool choice", () => {
+  it.each([
+    { type: "mcp", server_label: "issues" },
+    { type: "mcp", server_label: "issues", name: "search" },
+  ])("preserves a retained MCP server selector %j", (choice) => {
+    const body = normalizeRequest([
+      { type: "mcp", server_label: "docs", server_url: "https://example.com/docs" },
+      { type: "mcp", server_label: "issues", server_url: "https://example.com/issues" },
+    ], choice);
+    expect(body.tool_choice).toEqual(choice);
+  });
+
+  it.each([
+    { type: "mcp", server_label: "missing", name: "search" },
+    { type: "mcp", name: "search" },
+  ])("drops an MCP selector without a retained server %j", (choice) => {
+    const body = normalizeRequest([
+      { type: "mcp", server_label: "docs", server_url: "https://example.com/docs" },
+    ], choice);
+    expect(body.tool_choice).toBeUndefined();
+  });
+
+  it.each(["apply_patch", "web_search"])("keeps forced custom choice for %s", (name) => {
+    const tool = {
+      type: "custom", name,
+      format: { type: "grammar", syntax: "lark", definition: "start: /.+/" },
+    };
+    const choice = { type: "custom", name };
+    const body = normalizeRequest([structuredClone(tool)], choice);
+    expect(body.tools).toEqual([tool]);
+    expect(body.tool_choice).toEqual(choice);
+  });
+
+  it.each([
+    { label: "no declarations", tools: [] },
+    { label: "a same-named function", tools: [{ type: "function", name: "apply_patch", parameters: { type: "object" } }] },
+    { label: "a different custom tool", tools: [{ type: "custom", name: "other_tool", format: { type: "text" } }] },
+  ])("does not validate a custom choice against $label", ({ tools }) => {
+    expect(normalizeRequest(tools, { type: "custom", name: "apply_patch" }).tool_choice).toBeUndefined();
+  });
+
   it("deduplicates aliases and rewrites a forced hosted tool choice", () => {
     const executor = new CodexExecutor();
     const body = {

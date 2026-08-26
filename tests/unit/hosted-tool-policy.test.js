@@ -1,12 +1,21 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isHostedTool,
   renderHostedToolForClaude,
   renderHostedToolForCodex,
   resolveHostedTool,
 } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 
 describe("hosted tool compatibility policy", () => {
+  it.each(["bash", "web_search", "echo"])("does not resolve explicit custom tool %s by its name", (name) => {
+    const tool = { type: "custom", name, format: { type: "text" } };
+    expect(resolveHostedTool(tool.type, name)).toBeNull();
+    expect(isHostedTool(tool)).toBe(false);
+    expect(renderHostedToolForClaude(tool)).toBeNull();
+    expect(renderHostedToolForCodex(tool)).toBeNull();
+  });
+
   it.each([
     ["web_search", "web_search"],
     ["web_search_preview", "web_search"],
