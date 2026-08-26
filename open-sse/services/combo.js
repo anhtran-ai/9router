@@ -5,7 +5,7 @@
 import {
   checkFallbackError,
   formatRetryAfter,
-  isAssistantPrefillUnsupportedError,
+  isModelCompatibilityError,
 } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
@@ -336,8 +336,8 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       }
 
       // Check if should fallback to next model
-      const isPrefillCompatibilityError = isAssistantPrefillUnsupportedError(result.status, errorText);
-      const fallbackDecision = isPrefillCompatibilityError
+      const isCompatibilityError = isModelCompatibilityError(result.status, errorText);
+      const fallbackDecision = isCompatibilityError
         ? { shouldFallback: true, cooldownMs: 0 }
         : result.status === 400
           ? { shouldFallback: false, cooldownMs: 0 }

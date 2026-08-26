@@ -16,11 +16,11 @@
   },
   "inventory_path": "docs/FORK_DIFF_INVENTORY.md",
   "counts": {
-    "additive_total": 35,
-    "modified_total": 23,
-    "modified_runtime": 14,
+    "additive_total": 40,
+    "modified_total": 25,
+    "modified_runtime": 16,
     "modified_runtime_target_approx": 10,
-    "target_note": "Fourteen runtime source seams remain, above the approximate target of ten. codex.js is an explicit Responses compatibility seam; combo.js is an explicit model-fallback seam; Header.js and Sidebar.js remain small registry hook exceptions."
+    "target_note": "Sixteen runtime source seams remain, above the approximate target of ten. codex.js and the two request translators are explicit provider-compatibility seams; combo.js is an explicit model-fallback seam; Header.js and Sidebar.js remain small registry hook exceptions."
   },
   "runtime_policies": {
     "claude_assistant_prefill": {
@@ -50,6 +50,7 @@
       { "path": "docs/FORK_DIFF_INVENTORY.md", "reason": "Generated human-readable map of every fork-vs-upstream path." },
       { "path": "docs/UPSTREAM_UPGRADE_HANDBOOK.md", "reason": "Fork upgrade procedure." },
       { "path": "open-sse/translator/concerns/assistantPrefillPolicy.js", "reason": "Claude-target prefill policy module." },
+      { "path": "open-sse/translator/concerns/hostedToolPolicy.js", "reason": "Cross-provider hosted tool compatibility policy." },
       { "path": "package-lock.json", "reason": "Reproducible fork dependency lock." },
       { "path": "scripts/check-customization-boundary.mjs", "reason": "Deterministic boundary guard." },
       { "path": "scripts/compare-test-results.mjs", "reason": "Fork regression baseline helper." },
@@ -69,14 +70,18 @@
       { "path": "src/shared/constants/customNavigation.js", "reason": "Downstream navigation registry." },
       { "path": "tests/fixtures/customization-boundary-outside-seam.diff", "reason": "Negative boundary fixture." },
       { "path": "tests/translator/assistant-prefill-policy.test.js", "reason": "Claude-target policy regression coverage." },
+      { "path": "tests/translator/hosted-tools-matrix.test.js", "reason": "CLI, model and combo hosted tool matrix coverage." },
+      { "path": "tests/translator/hosted-tools-to-claude.test.js", "reason": "Claude-target hosted tool translation coverage." },
       { "path": "tests/unit/account-fallback-prefill.test.js", "reason": "Prefill fallback regression coverage." },
       { "path": "tests/unit/combo-import-export.test.js", "reason": "Combo transfer regression coverage." },
       { "path": "tests/unit/contributor-oauth-guard.test.js", "reason": "Contributor OAuth guard coverage." },
       { "path": "tests/unit/contributor-store.test.js", "reason": "Contributor persistence coverage." },
       { "path": "tests/unit/custom-navigation.test.js", "reason": "Navigation registry coverage." },
       { "path": "tests/unit/customization-boundary.test.js", "reason": "Boundary guard positive and negative coverage." },
+      { "path": "tests/unit/hosted-tool-policy.test.js", "reason": "Hosted tool alias and rendering coverage." },
       { "path": "tests/unit/oauth-modal-api-base.test.js", "reason": "Generic OAuth apiBase seam coverage." },
       { "path": "tests/unit/oauth-register-session.test.js", "reason": "Contributor OAuth session coverage." },
+      { "path": "tests/unit/unsupported-tool-fallback.test.js", "reason": "Unsupported hosted tool fallback coverage." },
       { "path": "tests/unit/upstream-v0555-preservation.test.js", "reason": "Upstream preservation coverage." }
     ],
     "modified": [
@@ -85,12 +90,14 @@
       { "path": "Dockerfile", "category": "build", "reason": "Use committed lockfile for deterministic container builds." },
       { "path": "next.config.mjs", "category": "build", "reason": "Keep optional better-sqlite3 external so fallback builds remain reproducible." },
       { "path": "open-sse/config/errorConfig.js", "category": "runtime", "reason": "Classify unsupported Claude prefill as request-shape failure." },
-      { "path": "open-sse/executors/codex.js", "category": "runtime", "reason": "Normalize Codex CLI developer messages and additional_tools content for the OAuth Responses backend." },
+      { "path": "open-sse/executors/codex.js", "category": "runtime", "reason": "Normalize Codex CLI developer messages, additional_tools content, and hosted tool types for the OAuth Responses backend." },
       { "path": "open-sse/handlers/chatCore.js", "category": "runtime", "reason": "Apply Claude-target policy on native passthrough." },
       { "path": "open-sse/providers/capabilities.js", "category": "runtime", "reason": "Remove model-based assistant prefill capability." },
-      { "path": "open-sse/services/accountFallback.js", "category": "runtime", "reason": "Classify exact HTTP 400 assistant-prefill errors without account cooldown." },
-      { "path": "open-sse/services/combo.js", "category": "runtime", "reason": "Allow model-only fallback for exact assistant-prefill HTTP 400 while stopping other HTTP 400 responses." },
+      { "path": "open-sse/services/accountFallback.js", "category": "runtime", "reason": "Classify exact HTTP 400 model-compatibility errors without account cooldown." },
+      { "path": "open-sse/services/combo.js", "category": "runtime", "reason": "Allow model-only fallback for exact model-compatibility HTTP 400 while stopping other HTTP 400 responses." },
       { "path": "open-sse/translator/formats/claude.js", "category": "runtime", "reason": "Apply Claude-target policy on translated requests." },
+      { "path": "open-sse/translator/request/openai-responses.js", "category": "runtime", "reason": "Preserve hosted tools across the OpenAI pivot." },
+      { "path": "open-sse/translator/request/openai-to-claude.js", "category": "runtime", "reason": "Render hosted tools natively for Anthropic and keep tool_choice consistent." },
       { "path": "src/dashboardGuard.js", "category": "runtime", "reason": "Expose contributor session endpoint without widening admin routes." },
       { "path": "src/lib/db/index.js", "category": "runtime", "reason": "Register combo transfer repository seam." },
       { "path": "src/lib/db/repos/combosRepo.js", "category": "runtime", "reason": "Add combo import/export persistence operations." },
@@ -102,7 +109,7 @@
       { "path": "tests/translator/__snapshots__/golden-url-header.test.js.snap", "category": "tests", "reason": "Record intentional upstream-provider cleanup output." },
       { "path": "tests/translator/bugs-toClaude-context.test.js", "category": "tests", "reason": "Cover Claude-target prefill behavior in existing translator suite." },
       { "path": "tests/unit/capabilities.test.js", "category": "tests", "reason": "Cover removal of model-based assistant prefill capability." },
-      { "path": "tests/unit/codex-tool-normalization.test.js", "category": "tests", "reason": "Cover Codex CLI Responses passthrough normalization and strict unsupported-content handling." }
+      { "path": "tests/unit/codex-tool-normalization.test.js", "category": "tests", "reason": "Cover Codex CLI Responses passthrough normalization, strict unsupported-content handling, and hosted tool rewrites." }
     ]
   }
 }

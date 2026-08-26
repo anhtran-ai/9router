@@ -259,3 +259,89 @@ describe("CodexExecutor tool normalization", () => {
     ]);
   });
 });
+
+describe("CodexExecutor cross-provider hosted tools", () => {
+  it("normalizes Claude CLI and OpenAI Platform aliases for Codex OAuth", () => {
+    const tools = normalizeTools([
+      { type: "web_search_preview", search_context_size: "medium", max_uses: 5 },
+      { type: "computer_use_preview", display_width: 1024, display_height: 768 },
+      { type: "code_execution_20250522", name: "code_execution" },
+      { type: "tool_search_tool_regex_20251119", name: "tool_search" },
+    ]);
+
+    expect(tools).toEqual([
+      { type: "web_search", search_context_size: "medium" },
+      { type: "computer", display_width: 1024, display_height: 768 },
+      { type: "code_interpreter" },
+      { type: "tool_search" },
+    ]);
+  });
+
+  it("collapses aliases of one capability into a single Codex tool", () => {
+    const tools = normalizeTools([
+      { type: "web_search_preview", search_context_size: "medium" },
+      { type: "web_search_20260209", name: "web_search", allowed_domains: ["example.com"] },
+      { type: "web_search" },
+    ]);
+
+    expect(tools).toEqual([{ type: "web_search", search_context_size: "medium" }]);
+  });
+
+  it("drops Anthropic-only hosted tools instead of leaking invalid Codex types", () => {
+    const tools = normalizeTools([
+      { type: "web_fetch_20250910", name: "web_fetch" },
+      { type: "bash_20250124", name: "bash" },
+      { type: "text_editor_20250728", name: "str_replace_based_edit_tool" },
+      { type: "memory_20250818", name: "memory" },
+      { type: "mcp_toolset", name: "project_tools" },
+      { type: "function", name: "keep_me", parameters: { type: "object" } },
+    ]);
+
+    expect(tools).toEqual([
+      { type: "function", name: "keep_me", parameters: { type: "object" } },
+    ]);
+  });
+});
+
+describe("CodexExecutor hosted tool choice", () => {
+  it("deduplicates aliases and rewrites a forced hosted tool choice", () => {
+    const executor = new CodexExecutor();
+    const body = {
+      model: "gpt-5.6-sol",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "search" }] }],
+      tools: [
+        { type: "web_search_preview" },
+        { type: "web_search_20260209", name: "web_search" },
+      ],
+      tool_choice: { type: "web_search_preview" },
+      stream: true,
+    };
+
+    executor.transformRequest("gpt-5.6-sol", body, true, {
+      connectionId: "test-codex-hosted-tool-choice",
+      providerSpecificData: {},
+    });
+
+    expect(body.tools).toEqual([{ type: "web_search" }]);
+    expect(body.tool_choice).toEqual({ type: "web_search" });
+  });
+
+  it("drops a forced hosted tool choice when the tool has no Codex equivalent", () => {
+    const executor = new CodexExecutor();
+    const body = {
+      model: "gpt-5.6-sol",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "fetch" }] }],
+      tools: [{ type: "web_fetch_20250910", name: "web_fetch" }],
+      tool_choice: { type: "web_fetch_20250910" },
+      stream: true,
+    };
+
+    executor.transformRequest("gpt-5.6-sol", body, true, {
+      connectionId: "test-codex-unsupported-hosted-tool-choice",
+      providerSpecificData: {},
+    });
+
+    expect(body.tools).toEqual([]);
+    expect(body.tool_choice).toBeUndefined();
+  });
+});

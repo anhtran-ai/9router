@@ -2,10 +2,32 @@ import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/er
 
 const ASSISTANT_PREFILL_UNSUPPORTED = "does not support assistant message prefill";
 
+const UNSUPPORTED_TOOL_PATTERNS = [
+  "unsupported tool type",
+  "unknown tool type",
+  "tool type is not supported",
+  "unsupported tool",
+];
+
+function normalizeErrorText(errorText) {
+  if (!errorText) return "";
+  return (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase();
+}
+
 export function isAssistantPrefillUnsupportedError(status, errorText) {
   if (status !== 400 || !errorText) return false;
-  const normalized = typeof errorText === "string" ? errorText : JSON.stringify(errorText);
-  return normalized.toLowerCase().includes(ASSISTANT_PREFILL_UNSUPPORTED);
+  return normalizeErrorText(errorText).includes(ASSISTANT_PREFILL_UNSUPPORTED);
+}
+
+export function isUnsupportedToolTypeError(status, errorText) {
+  if (status !== 400 || !errorText) return false;
+  const normalized = normalizeErrorText(errorText);
+  return UNSUPPORTED_TOOL_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
+
+export function isModelCompatibilityError(status, errorText) {
+  return isAssistantPrefillUnsupportedError(status, errorText)
+    || isUnsupportedToolTypeError(status, errorText);
 }
 
 /**
@@ -29,7 +51,7 @@ export function getQuotaCooldown(backoffLevel = 0) {
  * @returns {{ shouldFallback: boolean, cooldownMs: number, newBackoffLevel?: number }}
  */
 export function checkFallbackError(status, errorText, backoffLevel = 0) {
-  if (isAssistantPrefillUnsupportedError(status, errorText)) {
+  if (isModelCompatibilityError(status, errorText)) {
     return { shouldFallback: false, cooldownMs: 0 };
   }
 

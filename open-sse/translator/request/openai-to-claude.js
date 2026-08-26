@@ -7,6 +7,7 @@ import { parseDataUri } from "../concerns/image.js";
 import { extractTextContent } from "../formats/gemini.js";
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
 import { getCapabilitiesForModel } from "../../providers/capabilities.js";
+import { renderHostedToolForClaude } from "../concerns/hostedToolPolicy.js";
 
 // Empty prefix matches real Claude Code behavior (no tool name prefix).
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
@@ -146,10 +147,10 @@ Respond ONLY with the JSON object, no other text.`);
   if (body.tools && Array.isArray(body.tools)) {
     result.tools = [];
     for (const tool of body.tools) {
-      // Pass-through built-in tools (e.g. web_search_20250305) without prefix or conversion
       const toolType = tool.type;
       if (toolType && toolType !== OPENAI_BLOCK.FUNCTION) {
-        result.tools.push(tool);
+        const hosted = renderHostedToolForClaude(tool);
+        if (hosted) result.tools.push(hosted);
         continue;
       }
 
@@ -179,12 +180,13 @@ Respond ONLY with the JSON object, no other text.`);
 
     if (result.tools.length > 0) {
       result.tools[result.tools.length - 1].cache_control = { type: "ephemeral", ttl: "1h" };
+    } else {
+      delete result.tools;
     }
   }
 
-  // Tool choice
-  if (body.tool_choice) {
-    result.tool_choice = convertOpenAIToolChoice(body.tool_choice);
+  if (body.tool_choice && result.tools?.length > 0) {
+    result.tool_choice = convertOpenAIToolChoice(body.tool_choice, result.tools);
   }
 
   // Thinking is normalized centrally by applyThinking (thinkingUnified.js) after translation.
@@ -298,8 +300,9 @@ function getContentBlocksFromMessage(msg, toolNameMap = new Map()) {
 // unrecognized type through.
 const CLAUDE_TOOL_CHOICE_TYPES = new Set(["auto", "any", "tool", "none"]);
 
-function convertOpenAIToolChoice(choice) {
+function convertOpenAIToolChoice(choice, tools = []) {
   if (!choice) return { type: "auto" };
+  const hasTool = (name) => tools.some((tool) => tool?.name === name);
 
   // OpenAI string forms: "auto" | "none" | "required"
   if (typeof choice === "string") {
@@ -312,11 +315,14 @@ function convertOpenAIToolChoice(choice) {
     // Checked before the native pass-through below, because the OpenAI shape
     // also carries a `.type` ("function") that Claude rejects.
     if (choice.function?.name) {
-      return { type: "tool", name: choice.function.name };
+      return hasTool(choice.function.name)
+        ? { type: "tool", name: choice.function.name }
+        : { type: "auto" };
     }
     // Already Claude-native — only pass through types Claude actually accepts,
     // so a malformed or unknown type can never leak into the upstream request.
     if (CLAUDE_TOOL_CHOICE_TYPES.has(choice.type)) {
+      if (choice.type === "tool" && !hasTool(choice.name)) return { type: "auto" };
       return choice;
     }
   }
@@ -380,4 +386,3 @@ export { openaiToClaudeRequestForAntigravity };
 
 // Register
 register(FORMATS.OPENAI, FORMATS.CLAUDE, openaiToClaudeRequest, null);
-

@@ -8,6 +8,7 @@ import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { normalizeResponsesInput } from "../formats/responsesApi.js";
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
+import { isHostedTool } from "../concerns/hostedToolPolicy.js";
 
 // Responses API enforces max 64 chars on call_id (#393)
 const MAX_CALL_ID_LEN = 64;
@@ -188,6 +189,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         // Chat Completions has no freeform custom-tool declaration, so expose custom
         // tools as functions with one raw `input` string while retaining their names
         // in translator-only metadata for the response conversion.
+        if (isHostedTool(tool)) return tool;
         const name = tool.name;
         if (!name || typeof name !== "string" || name.trim() === "") return null;
         if (tool.type === "custom") {

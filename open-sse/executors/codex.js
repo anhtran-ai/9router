@@ -8,6 +8,7 @@ import {
 import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
 import { RESPONSES_ITEM } from "../translator/schema/index.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
+import { renderHostedToolForCodex } from "../translator/concerns/hostedToolPolicy.js";
 import { getModelUpstreamId } from "../config/providerModels.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
@@ -28,13 +29,6 @@ const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try 
 
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
-
-// Hosted tool types that Codex/OpenAI Responses executes server-side
-const CODEX_HOSTED_TOOL_TYPES = new Set([
-  "image_generation", "web_search", "web_search_preview", "file_search",
-  "computer", "computer_use_preview", "code_interpreter", "mcp", "local_shell",
-  "tool_search"
-]);
 
 // Responses-native freeform tools carry a name plus format payload and must pass through intact.
 const CODEX_PASSTHROUGH_TOOL_TYPES = new Set(["custom"]);
@@ -103,6 +97,7 @@ function stripStoredItemReferences(body) {
 function normalizeCodexTools(body) {
   if (!Array.isArray(body.tools)) return;
   const validNames = new Set();
+  const hostedTypes = new Set();
   body.tools = body.tools.filter((tool) => {
     if (!tool || typeof tool !== "object" || Array.isArray(tool)) return false;
     const type = typeof tool.type === "string" ? tool.type : "";
@@ -117,8 +112,14 @@ function normalizeCodexTools(body) {
     }
     if (type !== "function") {
       if (CODEX_PASSTHROUGH_TOOL_TYPES.has(type)) return true;
-      if (!type || tool.function || typeof tool.name === "string") return false;
-      return CODEX_HOSTED_TOOL_TYPES.has(type);
+      if (!type || tool.function) return false;
+      const hosted = renderHostedToolForCodex(tool);
+      if (!hosted) return false;
+      if (hostedTypes.has(hosted.type)) return false;
+      hostedTypes.add(hosted.type);
+      for (const k of Object.keys(tool)) delete tool[k];
+      Object.assign(tool, hosted);
+      return true;
     }
     const fn = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function) ? tool.function : null;
     const rawName = typeof tool.name === "string" ? tool.name : (typeof fn?.name === "string" ? fn.name : "");
@@ -136,11 +137,14 @@ function normalizeCodexTools(body) {
     validNames.add(name);
     return true;
   });
-  // Drop tool_choice if it references an unknown function name
   if (body.tool_choice && typeof body.tool_choice === "object" && !Array.isArray(body.tool_choice)) {
     if (body.tool_choice.type === "function") {
       const n = typeof body.tool_choice.name === "string" ? body.tool_choice.name.trim() : "";
       if (!n || !validNames.has(n)) delete body.tool_choice;
+    } else {
+      const hosted = renderHostedToolForCodex(body.tool_choice);
+      if (!hosted || !hostedTypes.has(hosted.type)) delete body.tool_choice;
+      else body.tool_choice = { type: hosted.type };
     }
   }
 }
