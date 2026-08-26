@@ -16,6 +16,37 @@ Seven groups came from fork PR #24; #32 is inherited from upstream v0.5.55.
 upstream retirement condition; `docs/FORK_DIFF_INVENTORY.md` is generated from it.
 Follow the tool compatibility section of `docs/UPSTREAM_UPGRADE_HANDBOOK.md`.
 
+Follow-up self-review issue #35 tracks SR-01–SR-11 on
+`codex/fix-router-review-20260826`, based on merged main `c9a1c3af`.
+It preserves tool constraints/identity, Codex function/image fields, actual
+Retry-After metadata and credential-exhaustion status, and makes cancellation
+terminal through execution, refresh waits and stream completion. Native Chat
+custom tools remain supported only on Chat; incompatible target pipelines
+return typed `400 / unsupported_tool_constraint` so combo can try another model.
+The offline comparator now requires assertion JSON plus complete process and
+run-error evidence, including actual rejection/teardown/timeout controls.
+The registry links every SR ID to its paths, regressions, provenance and
+upstream retirement action. Final commands, exact SHAs, remaining baseline
+failures, independent review and delivery status belong in issue #35 / its PR;
+this paragraph does not claim merge, deployment or live-provider acceptance.
+The next source review extends this branch for issues #36 and #38–#41:
+shared final-client JSON conversion and custom-call identity, validated SSE
+termination/error handling, final Codex search/tool constraints, and independent
+concurrent usage accounting. Preserve native empty/incomplete responses,
+incremental stream delivery, cancellation and once-only completion. Reject
+tool item identity drift and malformed Gemini content/parts in both native and
+translated streams. Native Chat
+custom handling in SR-07 remains a separate guard. No DB schema change or
+historical usage reconstruction is included. The sql.js lightweight migration
+backup must produce a real reopenable file from current critical data while
+excluding requestDetails, preserving the source and retaining best-effort policy.
+Issue #39 has mixed upstream/fork origins; #40 is inherited from upstream
+`0d216689`; #41 is inherited from upstream `b25e1016`. The registry and generated
+inventory record each preservation gate.
+Final test/build/independent-review evidence and delivery status belong in PR #37
+and the linked issues. Source findings do not prove the live LiteLLM/Claude CLI
+incident cause, and this round does not change Cloudflare or deploy a gateway.
+
 CRG was added separately in PR #33, pinned to2.3.7 and local-only. The bug issues
 link implementation PRs and verification evidence. These source changes do not
 deploy or publish an image. All deployment details below are historical

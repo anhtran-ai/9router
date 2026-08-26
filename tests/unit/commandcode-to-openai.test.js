@@ -8,8 +8,37 @@
  *  - tool-call (final): { toolCallId, toolName, input }
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { commandCodeToOpenAIResponse } from "../../open-sse/translator/response/commandcode-to-openai.js";
+import { BaseExecutor } from "../../open-sse/executors/base.js";
+import { CommandCodeExecutor } from "../../open-sse/executors/commandcode.js";
+
+describe("CommandCode executor stream media type", () => {
+  it("labels converted NDJSON as SSE and removes stale body metadata", async () => {
+    const upstream = new Response('{"type":"text-delta","text":"fixture"}\n{"type":"finish","finishReason":"stop"}\n', {
+      headers: { "Content-Type": "application/x-ndjson", "Content-Length": "99", "Content-Encoding": "gzip", "X-Fixture": "retained" },
+    });
+    const execute = vi.spyOn(BaseExecutor.prototype, "execute").mockResolvedValueOnce({ response: upstream });
+    try {
+      const { response } = await new CommandCodeExecutor().execute({ model: "fixture" });
+      expect(response.headers.get("content-type")).toBe("text/event-stream");
+      expect(response.headers.has("content-length")).toBe(false);
+      expect(response.headers.has("content-encoding")).toBe(false);
+      expect(response.headers.get("x-fixture")).toBe("retained");
+      expect(await response.text()).toContain('data: {"id"');
+    } finally { execute.mockRestore(); }
+  });
+
+  it("does not relabel an unconverted non-OK JSON response", async () => {
+    const upstream = new Response('{"error":{"message":"fixture"}}', { status: 429, headers: { "Content-Type": "application/json" } });
+    const execute = vi.spyOn(BaseExecutor.prototype, "execute").mockResolvedValueOnce({ response: upstream });
+    try {
+      const { response } = await new CommandCodeExecutor().execute({ model: "fixture" });
+      expect(response).toBe(upstream);
+      expect(response.headers.get("content-type")).toBe("application/json");
+    } finally { execute.mockRestore(); }
+  });
+});
 
 function feed(events) {
   const state = {};

@@ -18,6 +18,22 @@ function errResponse(status = 500) {
 }
 
 describe("fusion combo", () => {
+  it("does not start a pre-aborted panel", async () => {
+    const client = new AbortController(); client.abort();
+    const handleSingleModel = vi.fn();
+    const result = await handleFusionChat({ body: {}, models: ["p/a", "p/b"], handleSingleModel, log, signal: client.signal });
+    expect(result.status).toBe(499);
+    expect(handleSingleModel).not.toHaveBeenCalled();
+  });
+
+  it("does not call the judge after client cancellation during the panel", async () => {
+    const client = new AbortController();
+    const handleSingleModel = vi.fn(async () => { await Promise.resolve(); client.abort(); return okResponse("fixture answer"); });
+    const result = await handleFusionChat({ body: {}, models: ["p/a", "p/b"], handleSingleModel, log, signal: client.signal });
+    expect(result.status).toBe(499);
+    expect(handleSingleModel).toHaveBeenCalledTimes(2);
+  });
+
   it("answers directly with a single-model panel (nothing to fuse)", async () => {
     const handleSingleModel = vi.fn(async () => okResponse("solo"));
     await handleFusionChat({

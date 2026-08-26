@@ -9,6 +9,7 @@ import { PROVIDERS } from "../../providers/index.js";
 import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { DEFAULT_MAX_TOKENS } from "../../config/runtimeConfig.js";
 import { applyAssistantPrefillPolicy } from "../concerns/assistantPrefillPolicy.js";
+import { ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
 
 const CACHE_CONTROL_5M = { type: "ephemeral" };
 const CACHE_CONTROL_1H = { type: "ephemeral", ttl: "1h" };
@@ -403,6 +404,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
   }
 
   // 3. Tools: filter built-in tools for non-Anthropic providers, then handle cache_control
+  const requestedToolChoice = body.tool_choice;
   if (body.tools && Array.isArray(body.tools)) {
     // Strip built-in tools (e.g. web_search_20250305) and normalize to Anthropic-native shape
     // (drop `type` field, fold `function.{name,description,parameters}`) for non-Anthropic providers
@@ -435,6 +437,13 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
       delete body.tools;
       delete body.tool_choice;
     }
+  }
+
+  // Provider-specific filtering is the last tool boundary. A forced/required
+  // choice cannot disappear with a hosted declaration or point to another tool.
+  if ((requestedToolChoice?.type === "tool" && !body.tools?.some(tool => tool.name === requestedToolChoice.name)) ||
+      (requestedToolChoice?.type === "any" && !body.tools?.length)) {
+    throw new ToolCompatibilityError("Claude target removed a required or selected tool");
   }
 
   // Apply cloaking for OAuth tokens (billing header + fake user ID)

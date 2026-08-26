@@ -4,6 +4,7 @@ import { adjustMaxTokens } from "../formats/maxTokens.js";
 import { encodeDataUri } from "../concerns/image.js";
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
 import { collapseTextParts } from "../concerns/message.js";
+import { isHostedTool, ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
 
 function stripAnthropicBillingHeader(text) {
   if (typeof text !== "string") return "";
@@ -65,7 +66,7 @@ export function claudeToOpenAIRequest(model, body, stream) {
 
   // Tools
   if (body.tools && Array.isArray(body.tools)) {
-    result.tools = body.tools.map(tool => ({
+    result.tools = body.tools.map(tool => tool.type && isHostedTool(tool) ? { ...tool } : ({
       type: OPENAI_BLOCK.FUNCTION,
       function: {
         name: tool.name,
@@ -77,7 +78,10 @@ export function claudeToOpenAIRequest(model, body, stream) {
 
   // Tool choice
   if (body.tool_choice) {
-    result.tool_choice = convertToolChoice(body.tool_choice);
+    result.tool_choice = convertToolChoice(body.tool_choice, body.tools);
+    if (body.tool_choice.disable_parallel_tool_use !== undefined) {
+      result.parallel_tool_calls = !body.tool_choice.disable_parallel_tool_use;
+    }
   }
 
   if (body.reasoning_effort !== undefined) {
@@ -247,15 +251,21 @@ function convertClaudeMessage(msg) {
 }
 
 // Convert tool choice
-function convertToolChoice(choice) {
+function convertToolChoice(choice, tools = []) {
   if (!choice) return "auto";
   if (typeof choice === "string") return choice;
   
   switch (choice.type) {
     case "auto": return "auto";
+    case "none": return "none";
     case "any": return "required";
-    case "tool": return { type: OPENAI_BLOCK.FUNCTION, function: { name: choice.name } };
-    default: return "auto";
+    case "tool": {
+      const selected = tools.find(tool => tool.name === choice.name);
+      return selected?.type && isHostedTool(selected)
+        ? { type: selected.type }
+        : { type: OPENAI_BLOCK.FUNCTION, function: { name: choice.name } };
+    }
+    default: throw new ToolCompatibilityError("unrecognized Claude tool selection mode");
   }
 }
 

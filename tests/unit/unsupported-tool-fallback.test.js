@@ -22,6 +22,7 @@ const { markAccountUnavailable } = await import("../../src/sse/services/auth.js"
 const { CodexExecutor } = await import("../../open-sse/executors/codex.js");
 const { translateRequest } = await import("../../open-sse/translator/index.js");
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
+const { ToolCompatibilityError } = await import("../../open-sse/translator/concerns/hostedToolPolicy.js");
 
 const UNSUPPORTED_TOOL_ERROR = JSON.stringify({
   error: { message: "[codex/gpt-5.6-sol] [400]: {\"detail\":\"Unsupported tool type: web_search_preview\"}" },
@@ -111,7 +112,7 @@ async function runComboOutcomes(outcomes) {
       handleSingleModel.mockResolvedValueOnce(new Response(JSON.stringify({
         error: { message: outcome.message },
         ...(outcome.retryAfter ? { retryAfter: outcome.retryAfter } : {}),
-      }), { status: outcome.status, headers: { "Content-Type": "application/json" } }));
+      }), { status: outcome.status, headers: { "Content-Type": "application/json", ...outcome.headers } }));
     }
   }
   const response = await handleComboChat({
@@ -181,6 +182,67 @@ describe("exhausted combo error selection", () => {
     expect(response).toBe(invalid);
     expect(handleSingleModel).toHaveBeenCalledTimes(2);
   });
+
+  it.each([
+    ["actual app diagnostic", [{ status: 404, message: "No active credentials for provider: alpha" },
+      { status: 404, message: "No active credentials for provider: beta" }],
+      { status: 503, message: "No active credentials for provider: beta" }],
+    ["real model 404 then missing credentials", [{ status: 404, message: "Model not found" },
+      { status: 404, message: "No active credentials for provider: beta" }],
+      { status: 404, message: "No active credentials for provider: beta" }],
+    ["missing credentials then real model 404", [{ status: 404, message: "No active credentials for provider: alpha" },
+      { status: 404, message: "Model not found" }], { status: 404, message: "Model not found" }],
+    ["429 then missing credentials", [rateLimited, { status: 404, message: "No active credentials for provider: beta" }], rateLimited],
+    ["503 then missing credentials", [unavailable, { status: 404, message: "No active credentials for provider: beta" }], unavailable],
+    ["quoted diagnostic is not route unavailability", [{ status: 404, message: "Unknown model: no credentials for provider X" }],
+      { status: 404, message: "Unknown model: no credentials for provider X" }],
+  ])("only normalizes genuinely unavailable combos: %s", async (_label, outcomes, expected) => {
+    const { response } = await runComboOutcomes(outcomes);
+    expect(response.status).toBe(expected.status);
+    expect((await response.json()).error.message).toBe(expected.message);
+  });
+
+  it("aggregates header seconds, HTTP dates, and legacy JSON as valid deadlines", async () => {
+    const now = Date.parse("2026-08-26T03:30:00Z");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const { response } = await runComboOutcomes([
+        { ...rateLimited, retryAfter: "not-a-date" },
+        { ...rateLimited, headers: { "Retry-After": "30" } },
+        { ...unavailable, headers: { "Retry-After": new Date(now + 10_000).toUTCString() } },
+        { ...rateLimited, retryAfter: new Date(now + 20_000).toISOString() },
+      ]);
+      expect(response.status).toBe(429);
+      expect(response.headers.get("Retry-After")).toBe("10");
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(["-1", "1.5", "Infinity", "invalid", "9999999999999999999999999"])(
+    "ignores invalid HTTP Retry-After %s and retains legacy JSON timing", async (value) => {
+      const now = Date.parse("2026-08-26T03:30:00Z");
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      try {
+        const { response } = await runComboOutcomes([
+          { ...rateLimited, headers: { "Retry-After": value }, retryAfter: new Date(now + 15_000).toISOString() },
+        ]);
+        expect(response.headers.get("Retry-After")).toBe("15");
+      } finally { clock.mockRestore(); }
+    },
+  );
+
+  it("does not emit NaN retry timing for invalid JSON dates", async () => {
+    const { response } = await runComboOutcomes([{ ...rateLimited, retryAfter: "not-a-date" }]);
+    expect(response.headers.get("Retry-After")).toBeNull();
+    expect((await response.json()).error.message).toBe(rateLimited.message);
+  });
+
+  it.each(["0", "Tue, 25 Aug 2026 03:30:00 GMT"])("handles an already-due Retry-After %s without invalid timing", async (value) => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-08-26T03:30:00Z"));
+    try {
+      const { response } = await runComboOutcomes([{ ...rateLimited, headers: { "Retry-After": value } }]);
+      expect(response.headers.get("Retry-After")).toBe("1");
+    } finally { clock.mockRestore(); }
+  });
 });
 
 describe("hosted tool preservation across combo attempts", () => {
@@ -195,17 +257,19 @@ describe("hosted tool preservation across combo attempts", () => {
       tools: [hostedTool],
     };
     const originalTools = structuredClone(body.tools);
-    let claudeRequest;
+    let claudeRequest, compatibilityError;
     const handleSingleModel = vi.fn(async (sameBody, model) => {
       expect(sameBody).toBe(body);
       if (model.startsWith("codex/")) {
         // Match the handler/native-passthrough shallow envelopes; do not clone
         // the tools per leg or this test would hide cross-attempt mutations.
         const codexRequest = { ...sameBody, model: "gpt-5.6-sol" };
-        new CodexExecutor().transformRequest("gpt-5.6-sol", codexRequest, true, {
-          connectionId: "offline-combo-test", providerSpecificData: {},
-        });
-        return new Response(JSON.stringify({ error: { message: "rate limit exceeded" } }), { status: 429 });
+        try {
+          new CodexExecutor().transformRequest("gpt-5.6-sol", codexRequest, true, {
+            connectionId: "offline-combo-test", providerSpecificData: {},
+          });
+        } catch (error) { compatibilityError = error; }
+        return new Response(JSON.stringify({ error: { message: compatibilityError?.message || "fixture constraint was not rejected", code: compatibilityError?.code } }), { status: 400 });
       }
       claudeRequest = translateRequest(
         FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE, "claude-opus-5",
@@ -220,6 +284,7 @@ describe("hosted tool preservation across combo attempts", () => {
     });
 
     expect(response.ok).toBe(true);
+    expect(compatibilityError).toBeInstanceOf(ToolCompatibilityError);
     expect(handleSingleModel).toHaveBeenCalledTimes(2);
     expect(body.tools).toEqual(originalTools);
     expect(claudeRequest.tools[0]).toMatchObject(originalTools[0]);

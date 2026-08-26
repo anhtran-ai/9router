@@ -124,9 +124,37 @@ function describeInventoryEntry(status, entry) {
   const codexResponses = boundaryPath.endsWith("/codex.js")
     || boundaryPath.includes("codex-tool-normalization");
   const hostedTools = boundaryPath.includes("hostedToolPolicy") || boundaryPath.includes("hosted-tool")
+    || boundaryPath.endsWith("/concerns/toolChoice.js") || boundaryPath.includes("openai-responses-custom-tools")
+    || boundaryPath.includes("github-responses-routing")
+    || boundaryPath === "open-sse/translator/index.js"
     || boundaryPath.endsWith("/request/openai-responses.js")
     || boundaryPath.endsWith("/request/openai-to-claude.js")
+    || boundaryPath.endsWith("/request/openai-to-gemini.js")
+    || boundaryPath.endsWith("/request/gemini-to-openai.js")
+    || boundaryPath.endsWith("/request/antigravity-to-openai.js")
+    || boundaryPath.endsWith("/request/claude-to-openai.js")
     || boundaryPath.endsWith("/formats/openai.js") || boundaryPath.endsWith("/schema/blocks.js");
+  const cancellation = ["open-sse/handlers/chatCore.js", "open-sse/handlers/chatCore/streamingHandler.js",
+    "open-sse/utils/abort.js", "open-sse/utils/streamHandler.js", "open-sse/utils/stream.js",
+    "open-sse/services/tokenRefresh.js", "open-sse/utils/error.js", "open-sse/config/runtimeConfig.js",
+    "src/sse/handlers/chat.js", "src/sse/services/auth.js"].includes(boundaryPath)
+    || boundaryPath.includes("responses-abort-terminal") || boundaryPath.includes("combo-routing.test") || boundaryPath.includes("combo-fusion.test");
+  const responseContract = ["open-sse/handlers/chatCore/nonStreamingHandler.js",
+    "open-sse/handlers/chatCore/sseToJsonHandler.js", "open-sse/handlers/chatCore/streamingHandler.js",
+    "open-sse/handlers/responsesHandler.js", "open-sse/transformer/streamToJsonConverter.js",
+    "open-sse/translator/concerns/responseContract.js", "open-sse/utils/streamContract.js",
+    "open-sse/utils/stream.js", "open-sse/utils/streamHandler.js", "open-sse/utils/responsesStreamHelpers.js",
+    "open-sse/utils/usageTracking.js", "open-sse/translator/response/openai-responses.js",
+    "open-sse/translator/response/gemini-to-openai.js",
+    "open-sse/executors/commandcode.js"].includes(boundaryPath)
+    || boundaryPath.includes("openai-responses-nonstream") || boundaryPath.includes("streaming-response-contract")
+    || boundaryPath.includes("commandcode-to-openai") || boundaryPath.includes("kiro-nonstream-error");
+  const usageAccounting = boundaryPath === "src/lib/db/repos/usageRepo.js"
+    || boundaryPath.includes("db-concurrent.test.js");
+  const migrationBackup = ["src/lib/db/backup.js", "src/lib/db/adapters/sqljsAdapter.js",
+    "tests/unit/request-details-tab.test.js"].includes(boundaryPath);
+  const offlineEvidence = boundaryPath.startsWith("scripts/offline-tests/")
+    || boundaryPath === "scripts/compare-test-results.mjs" || boundaryPath.includes("offline-test-runner.test");
   const modelFallback = boundaryPath.endsWith("/combo.js") || boundaryPath.endsWith("/accountFallback.js")
     || boundaryPath.endsWith("/errorConfig.js") || boundaryPath.includes("unsupported-tool-fallback")
     || boundaryPath.includes("account-fallback-prefill");
@@ -161,29 +189,54 @@ function describeInventoryEntry(status, entry) {
     tests = "`tests/unit/custom-navigation.test.js`; customization boundary guard";
   } else if (modelFallback) {
     group = "Model compatibility and combo fallback";
-    behavior = "Advance only recognized prefill/unsupported-tool HTTP 400 errors without account cooldown; retain a coherent exhausted error and prefer retryable failures.";
+    behavior = "Advance recognized compatibility errors without account cooldown; preserve coherent failure/retry timing, classify true credential exhaustion, and stop on cancellation.";
     action = "drop-if-upstream";
-    tests = "`tests/unit/unsupported-tool-fallback.test.js`; `tests/unit/account-fallback-prefill.test.js`";
-  } else if (claudePrefill || boundaryPath.endsWith("/chatCore.js")) {
+    tests = "`tests/unit/unsupported-tool-fallback.test.js`; `tests/unit/account-fallback-prefill.test.js`; `tests/unit/combo-routing.test.js`";
+  } else if (responseContract) {
+    group = "Response protocol and stream completion";
+    behavior = "Validate JSON/SSE before success, preserve the client format and custom identity, and distinguish valid terminal/incomplete responses from truncation without buffering the entire stream or duplicating usage completion.";
+    action = "drop-if-upstream";
+    tests = "`tests/unit/openai-responses-nonstream.test.js`; `tests/unit/streaming-response-contract.test.js`; `tests/unit/responses-abort-terminal.test.js`; `tests/unit/combo-routing.test.js`; `tests/unit/commandcode-to-openai.test.js`; `tests/unit/kiro-nonstream-error.test.js`";
+  } else if (usageAccounting) {
+    group = "Concurrent usage accounting";
+    behavior = "Count independent requests even when timestamp, account and tokens coincide; keep history/daily/lifetime updates atomic and avoid mutating caller entries. The request lifecycle owns once-only recording.";
+    action = "drop-if-upstream";
+    tests = "`tests/unit/db-concurrent.test.js`; `tests/unit/db-migration-chain.test.js`; `tests/unit/cached-token-e2e.test.js`; `tests/unit/embedding-usage-persistence.test.js`";
+  } else if (migrationBackup) {
+    group = "Migration backup persistence";
+    behavior = "Persist a reopenable lightweight sql.js backup with current critical data, excluding requestDetails and preserving the source; retain native adapters and best-effort migration error handling.";
+    action = "drop-if-upstream";
+    tests = "`tests/unit/request-details-tab.test.js`; `tests/unit/db-migration-chain.test.js`; `tests/unit/db-sqlite-vs-lowdb.test.js`";
+  } else if (cancellation) {
+    group = "Request cancellation and compatibility boundaries";
+    behavior = "Propagate client cancellation through account/model routing, execution, response bodies and retry waits; preserve typed constraint errors and existing provider failure handling.";
+    action = "drop-if-upstream";
+    tests = "`tests/unit/combo-routing.test.js`; `tests/unit/responses-abort-terminal.test.js`; `tests/unit/unsupported-tool-fallback.test.js`; Claude prefill gates";
+  } else if (claudePrefill) {
     group = "Claude prefill and exact combo fallback";
-    behavior = "Preserve Claude-target final-boundary prefill normalization, separate from model/account fallback classification.";
+    behavior = "Preserve Claude-target prefill normalization and required/selected-tool validation after final provider filtering, separate from account fallback classification.";
     action = boundaryPath.includes("assistantPrefillPolicy") ? "keep" : "drop-if-upstream";
-    tests = "`tests/translator/assistant-prefill-policy.test.js`; `tests/unit/account-fallback-prefill.test.js`; `tests/translator/bugs-toClaude-context.test.js`; `tests/unit/capabilities.test.js`";
+    tests = "`tests/translator/assistant-prefill-policy.test.js`; `tests/translator/hosted-tools-matrix.test.js`; `tests/unit/account-fallback-prefill.test.js`; `tests/translator/bugs-toClaude-context.test.js`; `tests/unit/capabilities.test.js`";
   } else if (codexResponses) {
     group = "Codex Responses compatibility";
-    behavior = "Preserve instruction hoisting, additional_tools.content cleanup, independent MCP servers/selectors, custom choices and native constraints without mutating fallback input.";
+    behavior = "Preserve instruction hoisting, additional_tools.content cleanup, MCP/custom selectors, representable Claude domain constraints and disabled parallel calls; reject constraints or forced/required choices lost by final Codex filtering without mutating fallback input.";
     action = "drop-if-upstream";
-    tests = "`tests/unit/codex-tool-normalization.test.js`; direct `cx/*` Codex CLI Responses regression";
+    tests = "`tests/unit/codex-tool-normalization.test.js`; `tests/unit/hosted-tool-policy.test.js`; `tests/unit/unsupported-tool-fallback.test.js`; `tests/unit/combo-routing.test.js`; direct `cx/*` Codex CLI Responses regression";
   } else if (hostedTools) {
     group = "Hosted and client tool translation";
-    behavior = "Keep native search/discovery constraints and explicit custom identity; retain hosted tools in the pivot but remove them with dangling choices at the final Chat boundary.";
+    behavior = "Keep native constraints, tool selection and custom identity through real format boundaries; reject unsupported semantics explicitly and never reinterpret hosted tools as client functions.";
     action = "drop-if-upstream";
-    tests = "`tests/unit/hosted-tool-policy.test.js`; `tests/translator/hosted-tools-to-claude.test.js`; `tests/translator/hosted-tools-matrix.test.js`";
+    tests = "`tests/unit/hosted-tool-policy.test.js`; `tests/translator/hosted-tools-to-claude.test.js`; `tests/translator/hosted-tools-matrix.test.js`; `tests/unit/openai-responses-custom-tools.test.js`; `tests/unit/github-responses-routing.test.js`";
   } else if (crg) {
     group = "Local Code Review Graph tooling";
     behavior = "Keep pinned local source navigation, excluded data paths, and ignored derived graph; no external embeddings.";
     action = "keep";
     tests = "`python scripts/crg.py build`; `python scripts/crg.py search normalizeCodexTools`; customization boundary guard";
+  } else if (offlineEvidence) {
+    group = "Offline regression evidence";
+    behavior = "Capture assertion, suite, unhandled and late lifecycle errors with process completion; reject incomplete evidence and preserve isolated no-provider test execution.";
+    action = "keep";
+    tests = "`tests/unit/offline-test-runner.test.js`; same-environment full baseline comparison; actual Vitest rejection/teardown/timeout controls";
   } else if (buildLocal) {
     group = "Build, dependency, and local scripts";
     behavior = "Preserve deterministic installs/builds, isolated offline regression reports, and safe local Contributor start/stop workflows.";

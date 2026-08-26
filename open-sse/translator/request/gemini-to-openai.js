@@ -4,9 +4,11 @@ import { adjustMaxTokens } from "../formats/maxTokens.js";
 import { encodeDataUri } from "../concerns/image.js";
 import { collapseTextParts } from "../concerns/message.js";
 import { ROLE, GEMINI_ROLE, OPENAI_BLOCK } from "../schema/index.js";
+import { geminiToolChoiceToChat } from "../concerns/toolChoice.js";
 
 // Convert Gemini request to OpenAI format
 export function geminiToOpenAIRequest(model, body, stream) {
+  if (body.request?.contents) body = body.request;
   const result = {
     model: model,
     messages: [],
@@ -68,6 +70,8 @@ export function geminiToOpenAIRequest(model, body, stream) {
     }
   }
 
+  const choice = geminiToolChoiceToChat(body.toolConfig?.functionCallingConfig, result.tools);
+  if (choice !== undefined) result.tool_choice = choice;
   return result;
 }
 

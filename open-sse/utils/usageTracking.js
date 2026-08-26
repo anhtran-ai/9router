@@ -259,8 +259,8 @@ export function extractUsage(chunk) {
     });
   }
 
-  // OpenAI Responses API format (response.completed or response.done)
-  if ((chunk.type === "response.completed" || chunk.type === "response.done") && chunk.response?.usage && typeof chunk.response.usage === "object") {
+  // Completed and token/content-limited Responses terminals carry final usage.
+  if ((chunk.type === "response.completed" || chunk.type === "response.done" || chunk.type === "response.incomplete") && chunk.response?.usage && typeof chunk.response.usage === "object") {
     const usage = chunk.response.usage;
     const cachedTokens = usage.input_tokens_details?.cached_tokens;
     return normalizeUsage({

@@ -1,6 +1,6 @@
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
-import { ROLE, OPENAI_BLOCK, OPENAI_FINISH, DEFAULT_IMAGE_MIME } from "../schema/index.js";
+import { ROLE, OPENAI_BLOCK, OPENAI_FINISH, GEMINI_FINISH, DEFAULT_IMAGE_MIME } from "../schema/index.js";
 import { buildChunk } from "../concerns/chunk.js";
 import { toOpenAIUsage } from "../concerns/usage.js";
 import { reasoningDelta } from "../concerns/reasoning.js";
@@ -38,10 +38,10 @@ export function geminiToOpenAIResponse(chunk, state) {
   
   // Handle Antigravity wrapper
   const response = chunk.response || chunk;
-  if (!response || !response.candidates?.[0]) return null;
+  if (!response || (!response.candidates?.[0] && !response.promptFeedback?.blockReason)) return null;
 
   const results = [];
-  const candidate = response.candidates[0];
+  const candidate = response.candidates?.[0] || { finishReason: GEMINI_FINISH.SAFETY };
   const content = candidate.content;
 
   // Initialize state

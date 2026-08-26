@@ -8,7 +8,7 @@ import {
 import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
 import { RESPONSES_ITEM } from "../translator/schema/index.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
-import { HOSTED_TOOL, renderHostedToolForCodex } from "../translator/concerns/hostedToolPolicy.js";
+import { HOSTED_TOOL, renderHostedToolForCodex, ToolCompatibilityError } from "../translator/concerns/hostedToolPolicy.js";
 import { getModelUpstreamId } from "../config/providerModels.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
@@ -37,7 +37,7 @@ const CODEX_PASSTHROUGH_TOOL_TYPES = new Set(["custom"]);
 const RESPONSES_API_ALLOWLIST = new Set([
   "model", "input", "instructions", "tools", "tool_choice", "stream", "store",
   "reasoning", "service_tier", "include", "prompt_cache_key", "client_metadata",
-  "text"
+  "text", "parallel_tool_calls"
 ]);
 
 function extractInstructionText(item) {
@@ -93,39 +93,110 @@ function stripStoredItemReferences(body) {
   });
 }
 
+function normalizeAllowedToolsChoice(choice, tools) {
+  if (!["auto", "required"].includes(choice.mode) || !Array.isArray(choice.tools) || choice.tools.length === 0
+    || Object.keys(choice).some((key) => !["type", "mode", "tools"].includes(key))) {
+    throw new ToolCompatibilityError("Codex allowed_tools requires a valid mode and a nonempty tool subset");
+  }
+  const selectors = choice.tools.map((selector) => {
+    if (!selector || typeof selector !== "object" || Array.isArray(selector)) {
+      throw new ToolCompatibilityError("Codex allowed_tools contains an invalid selector");
+    }
+    const type = selector.type;
+    if (type === "function" || CODEX_PASSTHROUGH_TOOL_TYPES.has(type)) {
+      const { name, namespace } = selector;
+      const candidates = namespace === undefined
+        ? tools
+        : tools.filter((tool) => tool.type === "namespace" && tool.name === namespace).flatMap((tool) => tool.tools || []);
+      if (typeof name !== "string" || !name.trim()
+        || (namespace !== undefined && (typeof namespace !== "string" || !namespace.trim()))
+        || Object.keys(selector).some((key) => !["type", "name", "namespace"].includes(key))
+        || !candidates.some((tool) => tool?.type === type && tool.name === name)) {
+        throw new ToolCompatibilityError("Codex allowed_tools must select a retained tool of the requested kind");
+      }
+      return { type, name, ...(namespace === undefined ? {} : { namespace }) };
+    }
+    // A selector's type identifies a hosted capability; a client name alone must
+    // never turn an unknown selector into a hosted tool.
+    const hosted = renderHostedToolForCodex({ type });
+    if (!hosted || !tools.some((tool) => tool.type === hosted.type)) {
+      throw new ToolCompatibilityError("Codex allowed_tools selects an unavailable hosted tool");
+    }
+    if (hosted.type === HOSTED_TOOL.MCP) {
+      const { server_label, name } = selector;
+      if (typeof server_label !== "string" || !server_label.trim()
+        || (name !== undefined && (typeof name !== "string" || !name.trim()))
+        || Object.keys(selector).some((key) => !["type", "server_label", "name"].includes(key))
+        || !tools.some((tool) => tool.type === HOSTED_TOOL.MCP && tool.server_label === server_label)) {
+        throw new ToolCompatibilityError("Codex allowed_tools must identify a retained MCP server");
+      }
+      return { type: hosted.type, server_label, ...(name === undefined ? {} : { name }) };
+    }
+    if (Object.keys(selector).some((key) => key !== "type")) {
+      throw new ToolCompatibilityError("Codex allowed_tools contains an unsupported hosted selector constraint");
+    }
+    return { type: hosted.type };
+  });
+  return { type: choice.type, mode: choice.mode, tools: selectors };
+}
+
+function normalizeCodexToolChoice(choice, tools) {
+  const hasCallableTool = (tool) => tool?.type === "namespace"
+    ? Array.isArray(tool.tools) && tool.tools.some(hasCallableTool)
+    : (tool?.type === "function" || tool?.type === "custom")
+      ? typeof tool.name === "string" && !!tool.name.trim()
+      : !!tool?.type;
+  if (choice === "required" && !tools.some(hasCallableTool)) {
+    throw new ToolCompatibilityError("Codex required tool choice has no retained callable tools");
+  }
+  if (!choice || typeof choice !== "object" || Array.isArray(choice)) return choice;
+  if (choice.type === "allowed_tools") return normalizeAllowedToolsChoice(choice, tools);
+  // A forced selector has the same identity rules as one required subset item.
+  // Never turn a missing selected tool into an unrestricted model choice.
+  return normalizeAllowedToolsChoice({ type: "allowed_tools", mode: "required", tools: [choice] }, tools).tools[0];
+}
+
+function webSearchConstraints(tool) {
+  return JSON.stringify({
+    filters: tool.filters,
+    external_web_access: tool.external_web_access,
+    indexed_web_access: tool.indexed_web_access,
+  }, (key, value) => {
+    if (["allowed_domains", "blocked_domains"].includes(key) && Array.isArray(value)) return [...new Set(value)].sort();
+    if (value && typeof value === "object" && !Array.isArray(value)) return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+    return value;
+  });
+}
+
 // Flatten Chat-Completions tool shape into Responses flat format + filter unsupported tools
 function normalizeCodexTools(body) {
-  if (!Array.isArray(body.tools)) return;
-  const validNames = new Set();
-  const customNames = new Set();
-  const mcpServerLabels = new Set();
-  const hostedTypes = new Set();
+  if (!Array.isArray(body.tools)) {
+    if (body.tool_choice !== undefined) body.tool_choice = normalizeCodexToolChoice(body.tool_choice, []);
+    return;
+  }
+  const hostedTypes = new Map();
   body.tools = body.tools.map((tool) => {
     if (!tool || typeof tool !== "object" || Array.isArray(tool)) return null;
     const type = typeof tool.type === "string" ? tool.type : "";
     if (type === "namespace") {
-      if (Array.isArray(tool.tools)) {
-        for (const st of tool.tools) {
-          const n = typeof st?.name === "string" ? st.name.trim().slice(0, 128) : "";
-          if (n) validNames.add(n);
-        }
-      }
       return tool;
     }
     if (type !== "function") {
       if (CODEX_PASSTHROUGH_TOOL_TYPES.has(type)) {
-        if (typeof tool.name === "string" && tool.name.trim()) customNames.add(tool.name);
         return tool;
       }
       if (!type || tool.function) return null;
       const hosted = renderHostedToolForCodex(tool);
       if (!hosted) return null;
       // MCP declarations identify separate servers, not aliases of one capability.
-      if (hosted.type !== HOSTED_TOOL.MCP && hostedTypes.has(hosted.type)) return null;
-      hostedTypes.add(hosted.type);
-      if (hosted.type === HOSTED_TOOL.MCP && typeof hosted.server_label === "string" && hosted.server_label.trim()) {
-        mcpServerLabels.add(hosted.server_label);
+      if (hosted.type !== HOSTED_TOOL.MCP && hostedTypes.has(hosted.type)) {
+        if (hosted.type === HOSTED_TOOL.WEB_SEARCH
+          && webSearchConstraints(hosted) !== webSearchConstraints(hostedTypes.get(hosted.type))) {
+          throw new ToolCompatibilityError("Codex cannot combine conflicting web search declarations");
+        }
+        return null;
       }
+      hostedTypes.set(hosted.type, hosted);
       // Combo legs may share declarations; never rewrite the caller's objects.
       return hosted;
     }
@@ -137,29 +208,19 @@ function normalizeCodexTools(body) {
     const parameters = (tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters))
       ? tool.parameters
       : (fn?.parameters && typeof fn.parameters === "object" && !Array.isArray(fn.parameters) ? fn.parameters : { type: "object", properties: {} });
-    validNames.add(name);
-    return {
+    const normalized = {
       type: "function",
       name: name.slice(0, 128),
       ...(description ? { description } : {}),
       parameters,
     };
-  }).filter(Boolean);
-  if (body.tool_choice && typeof body.tool_choice === "object" && !Array.isArray(body.tool_choice)) {
-    if (body.tool_choice.type === "function") {
-      const n = typeof body.tool_choice.name === "string" ? body.tool_choice.name.trim() : "";
-      if (!n || !validNames.has(n)) delete body.tool_choice;
-    } else if (CODEX_PASSTHROUGH_TOOL_TYPES.has(body.tool_choice.type)) {
-      if (!customNames.has(body.tool_choice.name)) delete body.tool_choice;
-    } else {
-      const hosted = renderHostedToolForCodex(body.tool_choice);
-      if (!hosted || !hostedTypes.has(hosted.type)) delete body.tool_choice;
-      else if (hosted.type === HOSTED_TOOL.MCP) {
-        if (!mcpServerLabels.has(body.tool_choice.server_label)) delete body.tool_choice;
-        else body.tool_choice = { ...body.tool_choice, type: hosted.type };
-      } else body.tool_choice = { type: hosted.type };
+    for (const field of ["strict", "defer_loading"]) {
+      if (tool[field] !== undefined) normalized[field] = tool[field];
+      else if (fn?.[field] !== undefined) normalized[field] = fn[field];
     }
-  }
+    return normalized;
+  }).filter(Boolean);
+  if (body.tool_choice !== undefined) body.tool_choice = normalizeCodexToolChoice(body.tool_choice, body.tools);
 }
 
 // Resolve prompt-cache session id: client session → assistant-text-hash → workspaceId → connection

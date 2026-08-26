@@ -33,21 +33,28 @@ export function backupFile(srcPath, destDir, destName = null) {
   return dest;
 }
 
-// Lightweight DB backup via ATTACH: create an empty sqlite file, copy every
+// Lightweight DB backup: create an empty sqlite file, copy every
 // table EXCEPT the excluded ones into it. Avoids duplicating the huge
 // observability log, so the backup stays small regardless of DB size.
 export function backupDbLite(adapter, destDir, destName = "data.sqlite") {
   const dest = path.join(destDir, destName);
+  const excluded = new Set(BACKUP_EXCLUDE_TABLES);
+  const tables = adapter
+    .all(`SELECT name, sql FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+    .filter((t) => !excluded.has(t.name));
+
+  // SQL.js ATTACH writes into its virtual filesystem, not the host filesystem.
+  // Its adapter copies the selected live tables into a separately exported DB.
+  if (typeof adapter.backupToFile === "function") {
+    adapter.backupToFile(dest, tables);
+    return dest;
+  }
+
   try { fs.rmSync(dest, { force: true }); } catch {}
   const escaped = dest.replace(/'/g, "''");
 
   adapter.exec(`ATTACH DATABASE '${escaped}' AS bak`);
   try {
-    const excluded = new Set(BACKUP_EXCLUDE_TABLES);
-    const tables = adapter
-      .all(`SELECT name, sql FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
-      .filter((t) => !excluded.has(t.name));
-
     adapter.transaction(() => {
       for (const t of tables) {
         // Recreate table structure in backup DB, then copy rows.

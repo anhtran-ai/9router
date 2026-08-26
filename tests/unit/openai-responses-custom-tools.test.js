@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import "../translator/registerAll.js";
 import {
   openaiResponsesToOpenAIRequest,
+  openaiToOpenAIResponsesRequest,
 } from "../../open-sse/translator/request/openai-responses.js";
 import { openaiToOpenAIResponsesResponse } from "../../open-sse/translator/response/openai-responses.js";
-import { initState } from "../../open-sse/translator/index.js";
+import { initState, translateRequest } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
+import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 
 const EXEC_TOOL = {
   type: "custom",
@@ -16,6 +19,55 @@ const EXEC_TOOL = {
     definition: "start: /(.|\\n)+/",
   },
 };
+
+describe("native Chat custom tools at the shared Responses request boundary", () => {
+  // Executors may call this converter after Chat-to-Chat translation. It must
+  // reject here too until their response paths can return native custom calls.
+  it.each([
+    { type: "text" },
+    { type: "grammar", grammar: { syntax: "lark", definition: EXEC_TOOL.format.definition } },
+    { type: "grammar", grammar: { syntax: "regex", definition: "[a-z]+" } },
+  ])("rejects Responses conversion but preserves Chat custom format %j", (format) => {
+    const rawInput = "const value = `raw`;\nreturn value;";
+    const body = {
+      messages: [
+        { role: "user", content: "run" },
+        { role: "assistant", content: null, tool_calls: [{ id: "call_custom", type: "custom", custom: { name: "exec", input: rawInput } }] },
+        { role: "tool", tool_call_id: "call_custom", content: "raw" },
+        { role: "user", content: "continue" },
+      ],
+      tools: [{ type: "custom", custom: { name: "exec", description: "raw input", format } }],
+      tool_choice: { type: "custom", custom: { name: "exec" } },
+      parallel_tool_calls: false,
+    };
+    expect(() => openaiToOpenAIResponsesRequest("test-model", structuredClone(body), false, null))
+      .toThrow(ToolCompatibilityError);
+    const chat = translateRequest(FORMATS.OPENAI, FORMATS.OPENAI, "test-model", structuredClone(body), false, null, "openai");
+    expect(chat.tools).toEqual(body.tools);
+    expect(chat.tool_choice).toEqual(body.tool_choice);
+    expect(chat.messages[1].tool_calls).toEqual(body.messages[1].tool_calls);
+  });
+
+  it("rejects native Chat custom history even without a current declaration", () => {
+    expect(() => openaiToOpenAIResponsesRequest("test-model", {
+      messages: [
+        { role: "assistant", content: null, tool_calls: [{ id: "call_custom", type: "custom", custom: { name: "exec", input: "raw\ninput" } }] },
+        { role: "tool", tool_call_id: "call_custom", content: "result" },
+        { role: "user", content: "continue" },
+      ],
+    }, false)).toThrow(ToolCompatibilityError);
+  });
+
+  it("leaves an already-native Responses request on its existing passthrough path", () => {
+    const body = {
+      input: [{ type: "message", role: "user", content: "run" }],
+      tools: [EXEC_TOOL],
+      tool_choice: { type: "custom", name: "exec" },
+    };
+    expect(openaiToOpenAIResponsesRequest("test-model", body, true, null))
+      .toEqual({ ...body, model: "test-model", stream: true });
+  });
+});
 
 describe("Codex Responses Lite custom tools → OpenAI Chat", () => {
   it("promotes additional_tools custom declarations into Chat tools", () => {

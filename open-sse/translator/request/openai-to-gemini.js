@@ -18,6 +18,8 @@ import {
 } from "../formats/gemini.js";
 import { deriveSessionId, toNumericSessionId } from "../../utils/sessionManager.js";
 import { ROLE, GEMINI_ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
+import { isHostedTool, ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
+import { rejectNativeCustomTools, translateToolChoice } from "../concerns/toolChoice.js";
 
 // Sanitize function names for Gemini API.
 // Gemini requires: starts with [a-zA-Z_], followed by [a-zA-Z0-9_.:\-], max 64 chars.
@@ -47,6 +49,10 @@ function normalizeGeminiContents(contents) {
 
 // Core: Convert OpenAI request to Gemini format (base for all variants)
 function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG_SIGNATURE) {
+  rejectNativeCustomTools(body);
+  if (body.parallel_tool_calls === false && body.tools?.length && body.tool_choice !== "none" && body.tool_choice?.type !== "none") {
+    throw new ToolCompatibilityError("Gemini cannot enforce disabled parallel tool calling");
+  }
   const result = {
     model: model,
     contents: [],
@@ -198,34 +204,45 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
   }
 
   // Convert tools
+  const toolBindings = [];
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
     const functionDeclarations = [];
     for (const t of body.tools) {
+      if (isHostedTool(t) && !(!t.type && t.name && t.input_schema)) {
+        toolBindings.push({ source: t, target: null });
+        continue;
+      }
+      let target;
       // Check if already in Anthropic/Claude format (no type field, direct name/description/input_schema)
       if (t.name && t.input_schema) {
         const cleanedSchema = cleanJSONSchemaForAntigravity(structuredClone(t.input_schema || { type: "object", properties: {} }));
-        functionDeclarations.push({
+        target = {
           name: sanitizeGeminiFunctionName(t.name),
           description: t.description || "",
           parameters: cleanedSchema
-        });
+        };
       }
       // OpenAI format
-      else if (t.type === OPENAI_BLOCK.FUNCTION && t.function) {
-        const fn = t.function;
+      else if (t.type === OPENAI_BLOCK.FUNCTION || t.function) {
+        const fn = t.function || t;
         const cleanedSchema = cleanJSONSchemaForAntigravity(structuredClone(fn.parameters || { type: "object", properties: {} }));
-        functionDeclarations.push({
+        target = {
           name: sanitizeGeminiFunctionName(fn.name),
           description: fn.description || "",
           parameters: cleanedSchema
-        });
+        };
       }
+      if (target) functionDeclarations.push(target);
+      toolBindings.push({ source: t, target });
     }
 
     if (functionDeclarations.length > 0) {
       result.tools = [{ functionDeclarations }];
     }
   }
+  const selection = translateToolChoice(body.tool_choice, toolBindings, "gemini");
+  if (selection.choice !== undefined) result.toolConfig = selection.choice;
+  if (body._customToolNames) result._customToolNames = body._customToolNames;
 
   result.contents = normalizeGeminiContents(result.contents);
   return result;
@@ -286,11 +303,14 @@ function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigra
     envelope.request.safetySettings = geminiCLI.safetySettings;
   }
 
-  if (geminiCLI.tools?.length > 0) {
+  if (geminiCLI.toolConfig) {
+    envelope.request.toolConfig = geminiCLI.toolConfig;
+  } else if (geminiCLI.tools?.length > 0) {
     envelope.request.toolConfig = {
       functionCallingConfig: { mode: "VALIDATED" }
     };
   }
+  if (geminiCLI._customToolNames) envelope._customToolNames = geminiCLI._customToolNames;
 
   return envelope;
 }
@@ -379,17 +399,21 @@ function wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials = nu
   }
 
   // Convert Claude tools to Gemini functionDeclarations
+  const toolBindings = [];
   if (claudeRequest.tools && Array.isArray(claudeRequest.tools)) {
     const functionDeclarations = [];
     for (const tool of claudeRequest.tools) {
+      let target;
       if (tool.name && tool.input_schema) {
         const cleanedSchema = cleanJSONSchemaForAntigravity(tool.input_schema);
-        functionDeclarations.push({
+        target = {
           name: sanitizeGeminiFunctionName(tool.name),
           description: tool.description || "",
           parameters: cleanedSchema
-        });
+        };
+        functionDeclarations.push(target);
       }
+      toolBindings.push({ source: tool, target });
     }
     if (functionDeclarations.length > 0) {
       envelope.request.tools = [{ functionDeclarations }];
@@ -398,6 +422,9 @@ function wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials = nu
       };
     }
   }
+  const selection = translateToolChoice(claudeRequest.tool_choice, toolBindings, "gemini");
+  if (selection.choice !== undefined) envelope.request.toolConfig = selection.choice;
+  if (claudeRequest._customToolNames) envelope._customToolNames = claudeRequest._customToolNames;
 
   const systemParts = [];
   // Merge user system prompt from claudeRequest

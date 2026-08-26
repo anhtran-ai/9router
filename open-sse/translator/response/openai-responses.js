@@ -9,6 +9,7 @@ import { buildUsage } from "../concerns/usage.js";
 import { fallbackToolCallId } from "../concerns/toolCall.js";
 import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
+import { InvalidResponseError, normalizeNonStreamingResponse } from "../concerns/responseContract.js";
 
 /**
  * Translate OpenAI chunk to Responses API events
@@ -25,6 +26,7 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
   const nextSeq = () => ++state.seq;
   
   const emit = (eventType, data) => {
+    collectOutputItem(state, eventType, data);
     data.sequence_number = nextSeq();
     events.push({ event: eventType, data });
   };
@@ -32,6 +34,7 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
   const choice = chunk.choices[0];
   const idx = choice.index || 0;
   const delta = choice.delta || {};
+  if (chunk.usage && typeof chunk.usage === "object") state.usage = { ...state.usage, ...chunk.usage };
 
   // Emit initial events
   if (!state.started) {
@@ -109,6 +112,7 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
 
   // Handle finish_reason
   if (choice.finish_reason) {
+    state.finishReason = choice.finish_reason;
     for (const i in state.msgItemAdded) closeMessage(state, emit, i);
     closeReasoning(state, emit);
     for (const i in state.funcCallIds) closeToolCall(state, emit, i);
@@ -116,6 +120,15 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
   }
 
   return events;
+}
+
+// Retain the same item identities emitted in incremental events for the final
+// Response envelope. Different item kinds may share an upstream choice index.
+function collectOutputItem(state, event, data) {
+  if ((event === "response.output_item.added" || event === "response.output_item.done") && data.item?.id) {
+    state.responseOutputItems ||= new Map();
+    state.responseOutputItems.set(data.item.id, data.item);
+  }
 }
 
 // Helper functions
@@ -368,13 +381,29 @@ function closeToolCall(state, emit, idx) {
 function sendCompleted(state, emit) {
   if (!state.completedSent) {
     state.completedSent = true;
-    emit("response.completed", {
-      type: "response.completed",
+    const incompleteReason = state.finishReason === OPENAI_FINISH.LENGTH ? "max_output_tokens"
+      : state.finishReason === OPENAI_FINISH.CONTENT_FILTER ? "content_filter" : null;
+    const event = incompleteReason ? "response.incomplete" : "response.completed";
+    const usage = state.usage;
+    const inputTokens = usage?.prompt_tokens ?? usage?.input_tokens ?? 0;
+    const outputTokens = usage?.completion_tokens ?? usage?.output_tokens ?? 0;
+    const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? usage?.cached_tokens;
+    const reasoningTokens = usage?.completion_tokens_details?.reasoning_tokens ?? usage?.reasoning_tokens;
+    emit(event, {
+      type: event,
       response: {
         id: state.responseId,
         object: "response",
         created_at: state.created,
-        status: "completed",
+        model: state.model,
+        output: [...(state.responseOutputItems?.values() || [])],
+        status: incompleteReason ? "incomplete" : "completed",
+        ...(incompleteReason ? { incomplete_details: { reason: incompleteReason } } : {}),
+        ...(usage ? { usage: {
+          input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens,
+          ...(cachedTokens !== undefined ? { input_tokens_details: { cached_tokens: cachedTokens } } : {}),
+          ...(reasoningTokens !== undefined ? { output_tokens_details: { reasoning_tokens: reasoningTokens } } : {}),
+        } } : {}),
         background: false,
         error: null
       }
@@ -388,6 +417,7 @@ function flushEvents(state) {
   const events = [];
   const nextSeq = () => ++state.seq;
   const emit = (eventType, data) => {
+    collectOutputItem(state, eventType, data);
     data.sequence_number = nextSeq();
     events.push({ event: eventType, data });
   };
@@ -406,6 +436,45 @@ function computeFinishReason(state) {
    return state.toolCallIndex > 0 || state.currentToolCallId
     ? OPENAI_FINISH.TOOL_CALLS
     : OPENAI_FINISH.STOP;
+}
+
+function remainingTerminalValue(value, sent) {
+  if (typeof value !== "string" || !value) return "";
+  if (!value.startsWith(sent || "")) throw new InvalidResponseError("terminal output conflicts with streamed deltas");
+  return value.slice((sent || "").length);
+}
+
+function responseDelta(state, delta) {
+  return buildChunk({ id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK }, delta);
+}
+
+// A provider may send only the authoritative terminal output, or omit a final
+// delta. Recover exactly the fields/suffixes not already emitted; never replay
+// an already-delivered tool invocation or response text.
+function recoverTerminalOutput(response, state) {
+  if (!Array.isArray(response?.output) || !response.output.length) return [];
+  const message = normalizeNonStreamingResponse(response, FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI).choices[0].message;
+  const delta = {};
+  const text = remainingTerminalValue(message.content, state.responsesTextSent);
+  const thinking = remainingTerminalValue(message.reasoning_content, state.responsesReasoningSent);
+  if (text) { delta.content = text; state.responsesTextSent = message.content; }
+  if (thinking) { delta.reasoning_content = thinking; state.responsesReasoningSent = message.reasoning_content; }
+  state.responsesTools ||= new Map();
+  for (const call of message.tool_calls || []) {
+    let progress = state.responsesTools.get(call.id);
+    if (!progress) {
+      progress = { index: state.responsesTools.size, argsSent: "" };
+      state.responsesTools.set(call.id, progress);
+      (delta.tool_calls ||= []).push({ ...call, index: progress.index });
+    } else {
+      const missing = remainingTerminalValue(call.function.arguments, progress.argsSent);
+      if (missing) (delta.tool_calls ||= []).push({ index: progress.index, function: { arguments: missing } });
+    }
+    progress.argsSent = call.function.arguments;
+    state.currentToolCallId = call.id;
+    state.toolCallIndex = Math.max(state.toolCallIndex, progress.index + 1);
+  }
+  return Object.keys(delta).length ? [responseDelta(state, delta)] : [];
 }
 
 /**
@@ -452,6 +521,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   if (eventType === "response.output_text.delta") {
     const delta = data.delta || "";
     if (!delta) return null;
+    state.responsesTextSent = (state.responsesTextSent || "") + delta;
 
     return buildChunk(
       { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
@@ -468,12 +538,18 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   if (eventType === "response.output_item.added" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
     const item = data.item;
     state.currentToolCallId = item.call_id || fallbackToolCallId();
+    state.responsesTools ||= new Map();
+    state.responsesItemCalls ||= new Map();
+    if (item.id) state.responsesItemCalls.set(item.id, state.currentToolCallId);
+    if (state.responsesTools.has(state.currentToolCallId)) return null;
+    const progress = { index: state.responsesTools.size, argsSent: "", rawInput: "", custom: item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL };
+    state.responsesTools.set(state.currentToolCallId, progress);
 
     return buildChunk(
       { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
       {
         tool_calls: [{
-          index: state.toolCallIndex,
+          index: progress.index,
           id: state.currentToolCallId,
           type: OPENAI_BLOCK.FUNCTION,
           function: { name: item.name || "", arguments: "" }
@@ -486,21 +562,37 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   if (eventType === "response.function_call_arguments.delta" || eventType === "response.custom_tool_call_input.delta") {
     const argsDelta = data.delta || "";
     if (!argsDelta) return null;
+    const callId = state.responsesItemCalls?.get(data.item_id) || state.currentToolCallId;
+    const progress = state.responsesTools?.get(callId);
+    if (progress?.custom) {
+      progress.rawInput += argsDelta;
+      return null; // Freeform input must be wrapped as a Chat function argument object.
+    }
+    if (progress) progress.argsSent += argsDelta;
 
     return buildChunk(
       { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
-      { tool_calls: [{ index: state.toolCallIndex, function: { arguments: argsDelta } }] }
+      { tool_calls: [{ index: progress?.index ?? state.toolCallIndex, function: { arguments: argsDelta } }] }
     );
   }
 
   // Function call done (standard or custom_tool_call variant)
   if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
-    state.toolCallIndex++;
+    const item = data.item;
+    const callId = item.call_id || state.responsesItemCalls?.get(item.id) || state.currentToolCallId;
+    const progress = state.responsesTools?.get(callId);
+    state.toolCallIndex = Math.max(state.toolCallIndex + 1, (progress?.index ?? -1) + 1);
+    if (progress) {
+      const args = progress.custom ? JSON.stringify({ input: item.input ?? progress.rawInput }) : item.arguments;
+      const missing = remainingTerminalValue(args, progress.argsSent);
+      if (typeof args === "string") progress.argsSent = args;
+      if (missing) return responseDelta(state, { tool_calls: [{ index: progress.index, function: { arguments: missing } }] });
+    }
     return null;
   }
 
   // Response completed
-  if (eventType === "response.completed" || eventType === "response.done") {
+  if (eventType === "response.completed" || eventType === "response.done" || eventType === "response.incomplete") {
     // Extract usage from response.completed event
     const responseUsage = data.response?.usage;
     if (responseUsage && typeof responseUsage === "object") {
@@ -514,7 +606,11 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     }
     
     if (!state.finishReasonSent) {
-      const finishReason = computeFinishReason(state);
+      const recovered = recoverTerminalOutput(data.response, state);
+      const incomplete = eventType === "response.incomplete" || data.response?.status === "incomplete";
+      const finishReason = incomplete
+        ? (data.response?.incomplete_details?.reason === "content_filter" ? OPENAI_FINISH.CONTENT_FILTER : OPENAI_FINISH.LENGTH)
+        : computeFinishReason(state);
 
       state.finishReasonSent = true;
       state.finishReason = finishReason; // Mark for usage injection in stream.js
@@ -530,7 +626,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
         finalChunk.usage = state.usage;
       }
       
-      return finalChunk;
+      return recovered.length ? [...recovered, finalChunk] : finalChunk;
     }
     return null;
   }
@@ -559,6 +655,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   if (eventType === "response.reasoning_summary_text.delta") {
     const delta = data.delta || "";
     if (!delta) return null;
+    state.responsesReasoningSent = (state.responsesReasoningSent || "") + delta;
     return buildChunk(
       { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
       reasoningDelta(delta)

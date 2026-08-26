@@ -58,7 +58,12 @@ describe("Kiro non-streaming error propagation", () => {
 
     expect(result.success).toBe(false);
     expect(result.response.status).toBe(502);
-    expect(json.error.message).toContain("Kiro stream ended incompletely");
+    // The parser retains upstream diagnostics internally, but a provider's
+    // HTTP200 error payload must not be reflected into the public response.
+    expect(json.error).toMatchObject({
+      message: "Invalid upstream response: upstream SSE reported an error",
+      code: "invalid_upstream_response"
+    });
     expect(json).not.toHaveProperty("choices");
   });
 });

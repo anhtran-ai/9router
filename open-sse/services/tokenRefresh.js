@@ -1,4 +1,5 @@
 import { PROVIDERS } from "../config/providers.js";
+import { isAbortError, throwIfAborted, waitWithSignal, awaitWithSignal } from "../utils/abort.js";
 import { OAUTH_ENDPOINTS, REFRESH_LEAD_MS } from "../config/appConstants.js";
 import {
   refreshXaiToken,
@@ -249,18 +250,21 @@ export async function getAllAccessTokens(userInfo, log) {
   return results;
 }
 
-export async function refreshWithRetry(refreshFn, maxRetries = 3, log = null) {
+export async function refreshWithRetry(refreshFn, maxRetries = 3, log = null, signal = null) {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
+    throwIfAborted(signal);
     if (attempt > 0) {
       const delay = attempt * 1000;
       log?.debug?.("TOKEN_REFRESH", `Retry ${attempt}/${maxRetries} after ${delay}ms`);
-      await new Promise(r => setTimeout(r, delay));
+      await waitWithSignal(delay, signal);
     }
 
     try {
-      const result = await refreshFn();
+      const result = await awaitWithSignal(refreshFn(), signal);
+      throwIfAborted(signal);
       if (result) return result;
     } catch (error) {
+      if (isAbortError(error, signal)) throw error;
       log?.warn?.("TOKEN_REFRESH", `Attempt ${attempt + 1}/${maxRetries} failed: ${error.message}`);
     }
   }

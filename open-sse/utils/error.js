@@ -4,9 +4,10 @@ import { ERROR_TYPES, DEFAULT_ERROR_MESSAGES } from "../config/errorConfig.js";
  * Build OpenAI-compatible error response body
  * @param {number} statusCode - HTTP status code
  * @param {string} message - Error message
+ * @param {string} [errorCode] - Optional specific client-facing error code
  * @returns {object} Error response object
  */
-export function buildErrorBody(statusCode, message) {
+export function buildErrorBody(statusCode, message, errorCode) {
   const errorInfo = ERROR_TYPES[statusCode] || 
     (statusCode >= 500 
       ? { type: "server_error", code: "internal_server_error" }
@@ -16,7 +17,7 @@ export function buildErrorBody(statusCode, message) {
     error: {
       message: message || DEFAULT_ERROR_MESSAGES[statusCode] || "An error occurred",
       type: errorInfo.type,
-      code: errorInfo.code
+      code: errorCode ?? errorInfo.code
     }
   };
 }
@@ -25,10 +26,11 @@ export function buildErrorBody(statusCode, message) {
  * Create error Response object (for non-streaming)
  * @param {number} statusCode - HTTP status code
  * @param {string} message - Error message
+ * @param {string} [errorCode] - Optional specific client-facing error code
  * @returns {Response} HTTP Response object
  */
-export function errorResponse(statusCode, message) {
-  return new Response(JSON.stringify(buildErrorBody(statusCode, message)), {
+export function errorResponse(statusCode, message, errorCode) {
+  return new Response(JSON.stringify(buildErrorBody(statusCode, message, errorCode)), {
     status: statusCode,
     headers: {
       "Content-Type": "application/json",
@@ -93,15 +95,16 @@ export async function parseUpstreamError(response, executor = null) {
  * @param {number} statusCode - HTTP status code
  * @param {string} message - Error message
  * @param {number} [resetsAtMs] - Optional precise cooldown expiry (ms epoch) for provider-specific quota errors
+ * @param {string} [errorCode] - Optional specific client-facing error code
  * @returns {{ success: false, status: number, error: string, response: Response, resetsAtMs?: number }}
  */
-export function createErrorResult(statusCode, message, resetsAtMs) {
+export function createErrorResult(statusCode, message, resetsAtMs, errorCode) {
   return {
     success: false,
     status: statusCode,
     error: message,
     resetsAtMs,
-    response: errorResponse(statusCode, message)
+    response: errorResponse(statusCode, message, errorCode)
   };
 }
 
@@ -115,7 +118,8 @@ export function createErrorResult(statusCode, message, resetsAtMs) {
  */
 export function unavailableResponse(statusCode, message, retryAfter, retryAfterHuman) {
   const retryAfterSec = Math.max(Math.ceil((new Date(retryAfter).getTime() - Date.now()) / 1000), 1);
-  const msg = `${message} (${retryAfterHuman})`;
+  const suffix = `(${retryAfterHuman})`;
+  const msg = typeof message === "string" && message.endsWith(suffix) ? message : `${message} ${suffix}`;
   return new Response(
     JSON.stringify({ error: { message: msg } }),
     {

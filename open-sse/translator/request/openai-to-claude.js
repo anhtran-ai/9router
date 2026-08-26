@@ -8,6 +8,7 @@ import { extractTextContent } from "../formats/gemini.js";
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
 import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { renderHostedToolForClaude } from "../concerns/hostedToolPolicy.js";
+import { rejectNativeCustomTools, translateToolChoice } from "../concerns/toolChoice.js";
 
 // Empty prefix matches real Claude Code behavior (no tool name prefix).
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
@@ -15,6 +16,7 @@ const CLAUDE_OAUTH_TOOL_PREFIX = "";
 
 // Convert OpenAI request to Claude format
 export function openaiToClaudeRequest(model, body, stream) {
+  rejectNativeCustomTools(body);
   // Tool name mapping for Claude OAuth (capitalizedName → originalName)
   const toolNameMap = new Map();
   // Cap max_tokens at the model's real output ceiling (e.g. Opus 4.8 = 128000),
@@ -144,6 +146,7 @@ Respond ONLY with the JSON object, no other text.`);
   }
 
   // Tools - convert from OpenAI format to Claude format with prefix for OAuth
+  const toolBindings = [];
   if (body.tools && Array.isArray(body.tools)) {
     result.tools = [];
     for (const tool of body.tools) {
@@ -151,6 +154,7 @@ Respond ONLY with the JSON object, no other text.`);
       if (toolType && toolType !== OPENAI_BLOCK.FUNCTION) {
         const hosted = renderHostedToolForClaude(tool);
         if (hosted) result.tools.push(hosted);
+        toolBindings.push({ source: tool, target: hosted });
         continue;
       }
 
@@ -171,23 +175,27 @@ Respond ONLY with the JSON object, no other text.`);
       // Store mapping for response translation (prefixed → original)
       toolNameMap.set(toolName, originalName);
 
-      result.tools.push({
+      const target = {
         name: toolName,
         description: toolData.description || "",
         input_schema: toolData.parameters || toolData.input_schema || { type: "object", properties: {}, required: [] }
-      });
-    }
-
-    if (result.tools.length > 0) {
-      result.tools[result.tools.length - 1].cache_control = { type: "ephemeral", ttl: "1h" };
-    } else {
-      delete result.tools;
+      };
+      result.tools.push(target);
+      toolBindings.push({ source: tool, target });
     }
   }
-
-  if (body.tool_choice && result.tools?.length > 0) {
-    result.tool_choice = convertOpenAIToolChoice(body.tool_choice, result.tools);
+  const selection = translateToolChoice(body.tool_choice, toolBindings, "claude");
+  if (selection.tools.length > 0) {
+    result.tools = selection.tools;
+    result.tools[result.tools.length - 1].cache_control = { type: "ephemeral", ttl: "1h" };
+  } else {
+    delete result.tools;
   }
+  if (selection.choice !== undefined) result.tool_choice = selection.choice;
+  if (body.parallel_tool_calls !== undefined && result.tools?.length) {
+    result.tool_choice = { ...(result.tool_choice || { type: "auto" }), disable_parallel_tool_use: !body.parallel_tool_calls };
+  }
+  if (body._customToolNames) result._customToolNames = body._customToolNames;
 
   // Thinking is normalized centrally by applyThinking (thinkingUnified.js) after translation.
 
@@ -298,38 +306,6 @@ function getContentBlocksFromMessage(msg, toolNameMap = new Map()) {
 // Claude only accepts tool_choice.type of "auto" | "any" | "tool" | "none";
 // anything else (e.g. OpenAI's "function") triggers a 400, so we never pass an
 // unrecognized type through.
-const CLAUDE_TOOL_CHOICE_TYPES = new Set(["auto", "any", "tool", "none"]);
-
-function convertOpenAIToolChoice(choice, tools = []) {
-  if (!choice) return { type: "auto" };
-  const hasTool = (name) => tools.some((tool) => tool?.name === name);
-
-  // OpenAI string forms: "auto" | "none" | "required"
-  if (typeof choice === "string") {
-    if (choice === "required") return { type: "any" };
-    return { type: "auto" }; // "auto", "none", or anything unexpected
-  }
-
-  if (typeof choice === "object") {
-    // OpenAI forced tool: { type: "function", function: { name } }.
-    // Checked before the native pass-through below, because the OpenAI shape
-    // also carries a `.type` ("function") that Claude rejects.
-    if (choice.function?.name) {
-      return hasTool(choice.function.name)
-        ? { type: "tool", name: choice.function.name }
-        : { type: "auto" };
-    }
-    // Already Claude-native — only pass through types Claude actually accepts,
-    // so a malformed or unknown type can never leak into the upstream request.
-    if (CLAUDE_TOOL_CHOICE_TYPES.has(choice.type)) {
-      if (choice.type === "tool" && !hasTool(choice.name)) return { type: "auto" };
-      return choice;
-    }
-  }
-
-  return { type: "auto" };
-}
-
 // OpenAI -> Claude format for Antigravity (without system prompt modifications)
 function openaiToClaudeRequestForAntigravity(model, body, stream) {
   const result = openaiToClaudeRequest(model, body, stream);

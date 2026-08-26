@@ -34,6 +34,7 @@ const STREAM_MODE = {
  * @param {string} options.connectionId - Connection ID for usage tracking
  * @param {object} options.body - Request body (for input token estimation)
  * @param {function} options.onStreamComplete - Callback when stream completes (content, usage)
+ * @param {function} options.onPendingDone - Optional per-request completion guard shared with cancellation
  * @param {string} options.apiKey - API key for usage tracking
  */
 export function createSSEStream(options = {}) {
@@ -49,6 +50,7 @@ export function createSSEStream(options = {}) {
     connectionId = null,
     body = null,
     onStreamComplete = null,
+    onPendingDone = null,
     apiKey = null
   } = options;
 
@@ -105,6 +107,11 @@ export function createSSEStream(options = {}) {
         if (mode === STREAM_MODE.PASSTHROUGH) {
           let output;
           let injectedUsage = false;
+
+          if (trimmed === "data: [DONE]") {
+            if (streamDoneSent) continue;
+            streamDoneSent = true;
+          }
 
           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() !== "[DONE]") {
             try {
@@ -340,7 +347,8 @@ export function createSSEStream(options = {}) {
     flush(controller) {
       const evtSummary = Object.entries(eventTypeCounts).map(([k, v]) => `${k}=${v}`).join(",") || "none";
       dbg("SSE", `flush | provider=${provider} | model=${model} | recvLines=${sseLineCount} | emitted=${sseEmittedCount} | events=[${evtSummary}]`);
-      trackPendingRequest(model, provider, connectionId, false);
+      if (onPendingDone) onPendingDone();
+      else trackPendingRequest(model, provider, connectionId, false);
       try {
         const remaining = decoder.decode();
         if (remaining) buffer += remaining;
@@ -370,8 +378,9 @@ export function createSSEStream(options = {}) {
           //   data: [DONE]\n\n
           // Without it they can hang until timeout and trigger failover.
           // Gemini-family clients (Antigravity, Vertex, Gemini) reject this sentinel with 400 syntax errors.
-          const isGeminiFamily = provider === "antigravity" || provider === "gemini" || provider === "vertex";
-          if (!streamDoneSent && !isGeminiFamily) {
+          const isGeminiFamily = [FORMATS.ANTIGRAVITY, FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX].includes(targetFormat)
+            || provider === "antigravity" || provider === "gemini" || provider === "vertex";
+          if (!streamDoneSent && !isGeminiFamily && targetFormat !== FORMATS.CLAUDE) {
             const doneOutput = "data: [DONE]\n\n";
             reqLogger?.appendConvertedChunk?.(doneOutput);
             controller.enqueue(sharedEncoder.encode(doneOutput));
@@ -461,13 +470,13 @@ export function createSSEStream(options = {}) {
           }, state?.usage, ttftAt);
         }
       } catch (error) {
-        console.log("Error in flush:", error);
+        controller.error(error);
       }
     }
   });
 }
 
-export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null) {
+export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, onPendingDone = null) {
   return createSSEStream({
     mode: STREAM_MODE.TRANSLATE,
     targetFormat,
@@ -476,6 +485,7 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
     reqLogger,
     toolNameMap,
     customToolNames,
+    onPendingDone,
     model,
     connectionId,
     body,
@@ -484,9 +494,11 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, onPendingDone = null, targetFormat = FORMATS.OPENAI) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
+    targetFormat,
+    onPendingDone,
     provider,
     reqLogger,
     model,

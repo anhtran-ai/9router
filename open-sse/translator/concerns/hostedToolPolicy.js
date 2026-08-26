@@ -1,3 +1,15 @@
+import { HTTP_STATUS } from "../../config/runtimeConfig.js";
+
+// Reasons must describe the unsupported capability, never include request data.
+export class ToolCompatibilityError extends Error {
+  constructor(reason) {
+    super(`Unsupported tool constraint: ${reason}`);
+    this.name = "ToolCompatibilityError";
+    this.status = HTTP_STATUS.BAD_REQUEST;
+    this.code = "unsupported_tool_constraint";
+  }
+}
+
 export const HOSTED_TOOL = {
   WEB_SEARCH: "web_search",
   WEB_FETCH: "web_fetch",
@@ -78,7 +90,7 @@ export function resolveHostedTool(type, name = "") {
 const CODEX_FIELDS = {
   [HOSTED_TOOL.WEB_SEARCH]: ["search_context_size", "user_location", "filters", "external_web_access", "indexed_web_access"],
   [HOSTED_TOOL.FILE_SEARCH]: ["vector_store_ids", "max_num_results", "ranking_options", "filters"],
-  [HOSTED_TOOL.IMAGE_GENERATION]: ["background", "input_fidelity", "model", "moderation", "output_compression", "output_format", "partial_images", "quality", "size"],
+  [HOSTED_TOOL.IMAGE_GENERATION]: ["action", "background", "input_fidelity", "input_image_mask", "model", "moderation", "output_compression", "output_format", "partial_images", "quality", "size"],
   [HOSTED_TOOL.CODE_EXECUTION]: ["container"],
   [HOSTED_TOOL.COMPUTER]: ["display_width", "display_height", "environment"],
   [HOSTED_TOOL.LOCAL_SHELL]: [],
@@ -146,7 +158,80 @@ export function renderHostedToolForCodex(tool) {
   const type = CODEX_TYPES[canonical];
   if (!type) return null;
   if (canonical === HOSTED_TOOL.MCP && normalizeKey(tool?.type) === "mcp_toolset") return null;
-  return { type, ...pickFields(tool, CODEX_FIELDS[canonical] || []) };
+  const rendered = { type, ...pickFields(tool, CODEX_FIELDS[canonical] || []) };
+  return canonical === HOSTED_TOOL.WEB_SEARCH ? preserveCodexWebSearchConstraints(tool, rendered) : rendered;
+}
+
+function preserveCodexWebSearchConstraints(tool, rendered) {
+  // Codex's documented wire filter supports allowed_domains. Do not infer
+  // backend support from the wider OpenAI Responses API or silently drop limits.
+  if (tool.max_uses != null || tool.blocked_domains != null) {
+    throw new ToolCompatibilityError("Codex cannot preserve these Claude web search limits");
+  }
+  if (tool.allowed_domains != null) {
+    const domains = tool.allowed_domains;
+    // Claude also accepts path/wildcard restrictions; mapping them to plain
+    // domains would broaden access. Keep those requests on a capable target.
+    if (!Array.isArray(domains) || domains.length === 0 || domains.length > 100
+      || domains.some((domain) => typeof domain !== "string"
+        || !/^[a-z\d](?:[a-z\d-]*[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]*[a-z\d])?)*$/i.test(domain))) {
+      throw new ToolCompatibilityError("Codex requires a nonempty plain-domain web search filter");
+    }
+    if (tool.filters !== undefined) {
+      const filters = tool.filters;
+      if (!filters || typeof filters !== "object" || Array.isArray(filters)
+        || Object.keys(filters).some((key) => key !== "allowed_domains")
+        || (filters.allowed_domains !== undefined
+          && (!Array.isArray(filters.allowed_domains)
+            || domains.some((domain) => !filters.allowed_domains.includes(domain))
+            || filters.allowed_domains.some((domain) => !domains.includes(domain))))) {
+        throw new ToolCompatibilityError("Codex cannot preserve conflicting web search domain filters");
+      }
+    }
+    rendered.filters = { allowed_domains: [...domains] };
+  }
+  return rendered;
+}
+
+function preserveClaudeWebSearchConstraints(tool, rendered) {
+  for (const field of ["external_web_access", "indexed_web_access"]) {
+    if (tool[field] !== undefined && typeof tool[field] !== "boolean") {
+      throw new ToolCompatibilityError("Claude cannot preserve an invalid web search access constraint");
+    }
+  }
+  if (tool.external_web_access === false) {
+    throw new ToolCompatibilityError("Claude cannot preserve cache-only web search");
+  }
+  if (tool.indexed_web_access !== undefined) {
+    throw new ToolCompatibilityError("Claude cannot preserve indexed web access constraint");
+  }
+  if (tool.filters !== undefined) {
+    const filters = tool.filters;
+    if (!filters || typeof filters !== "object" || Array.isArray(filters)
+      || Object.keys(filters).some((key) => key !== "allowed_domains")) {
+      throw new ToolCompatibilityError("Claude cannot preserve these web search filters");
+    }
+    const domains = filters.allowed_domains;
+    if (domains !== undefined) {
+      if (!Array.isArray(domains) || domains.length === 0
+        || domains.some((domain) => typeof domain !== "string" || !domain.trim())) {
+        throw new ToolCompatibilityError("Claude requires a nonempty web search domain filter");
+      }
+      // Do not guess intersections between domain/subdomain patterns. Only the
+      // same restriction may appear in both the native and Responses shapes.
+      if (tool.blocked_domains !== undefined || (tool.allowed_domains !== undefined
+        && (!Array.isArray(tool.allowed_domains)
+          || domains.some((domain) => !tool.allowed_domains.includes(domain))
+          || tool.allowed_domains.some((domain) => !domains.includes(domain))))) {
+        throw new ToolCompatibilityError("Claude cannot preserve conflicting web search domain filters");
+      }
+      rendered.allowed_domains = [...domains];
+    }
+  }
+  delete rendered.filters;
+  delete rendered.external_web_access;
+  delete rendered.indexed_web_access;
+  return rendered;
 }
 
 export function renderHostedToolForClaude(tool) {
@@ -156,7 +241,11 @@ export function renderHostedToolForClaude(tool) {
   const nativePrefixes = CLAUDE_NATIVE_PREFIXES[canonical] || [];
   const isNativeAnthropicType = requested === "mcp_toolset"
     || nativePrefixes.some((prefix) => requested.startsWith(prefix) && /_\d{8}$/.test(requested));
-  if (isNativeAnthropicType) return { ...tool };
+  if (isNativeAnthropicType) {
+    return canonical === HOSTED_TOOL.WEB_SEARCH
+      ? preserveClaudeWebSearchConstraints(tool, { ...tool })
+      : { ...tool };
+  }
 
   const fallbackType = CLAUDE_TYPES[canonical];
   if (!fallbackType) return null;
@@ -171,7 +260,7 @@ export function renderHostedToolForClaude(tool) {
     if (tool.display_height !== undefined) rendered.display_height_px = tool.display_height;
     if (rendered.display_number === undefined) rendered.display_number = 1;
   }
-  return rendered;
+  return canonical === HOSTED_TOOL.WEB_SEARCH ? preserveClaudeWebSearchConstraints(tool, rendered) : rendered;
 }
 
 export function isHostedTool(tool) {

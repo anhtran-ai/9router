@@ -67,6 +67,10 @@ if (!existsSync(reportPath)) {
   process.exitCode = exit.code || 1;
 } else {
   const report = JSON.parse(readFileSync(reportPath, 'utf8'));
+  const runErrorsPath = resolve(output, 'run-errors.json');
+  const runErrors = existsSync(runErrorsPath) ? JSON.parse(readFileSync(runErrorsPath, 'utf8')) : null;
+  const complete = runErrors?.schemaVersion === 1 && runErrors.completed === true
+    && ['passed', 'failed'].includes(runErrors.reason) && Array.isArray(runErrors.errors);
   const failedAssertions = [];
   const collectionErrors = [];
   const suiteErrors = [];
@@ -88,6 +92,7 @@ if (!existsSync(reportPath)) {
     pendingTests: report.numPendingTests, todoTests: report.numTodoTests,
     files: report.testResults?.length, failedAssertions: failedAssertions.length, collectionErrors: collectionErrors.length,
     failedTestSuites: report.numFailedTestSuites, suiteErrors: suiteErrors.length,
+    runErrors: runErrors?.errors?.length ?? null, runEvidenceComplete: complete,
     blockedNetworkOrProcessAttempts: blocked.length,
     blockedDestinations: [...new Set(blocked.map(event => `${event.operation} ${event.host}:${event.port}`))].sort(),
   };
@@ -97,5 +102,5 @@ if (!existsSync(reportPath)) {
   writeFileSync(resolve(output, 'collection-errors.json'), JSON.stringify(collectionErrors, null, 2) + '\n');
   writeFileSync(resolve(output, 'suite-errors.json'), JSON.stringify(suiteErrors, null, 2) + '\n');
   console.log(JSON.stringify({ event: 'complete', summary, output }));
-  process.exitCode = exit.code ?? 1;
+  process.exitCode = complete ? (exit.code ?? 1) : 2;
 }

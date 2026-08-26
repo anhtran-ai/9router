@@ -8,6 +8,7 @@ import { applyThinking, captureThinking } from "./concerns/thinkingUnified.js";
 import { captureSessionId } from "../utils/sessionManager.js";
 import { AntigravityExecutor } from "../executors/antigravity.js";
 import { PROVIDERS } from "../providers/index.js";
+import { rejectNativeCustomTools } from "./concerns/toolChoice.js";
 
 // Registry for translators. Lazy-init guards against circular-import order:
 // translator modules call register() (side-effect) before this module's body runs.
@@ -52,6 +53,12 @@ function stripContentTypes(body, stripList = []) {
 export function translateRequest(sourceFormat, targetFormat, model, body, stream = true, credentials = null, provider = null, reqLogger = null, stripList = [], connectionId = null, clientTool = null) {
   ensureInitialized();
   let result = body;
+
+  // Cross-format response paths cannot yet return native Chat custom calls,
+  // including Responses SSE→JSON. Reject before losing declaration/history intent.
+  if (sourceFormat === FORMATS.OPENAI && targetFormat !== FORMATS.OPENAI) {
+    rejectNativeCustomTools(result);
+  }
 
   // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS entry)
   stripContentTypes(result, stripList);

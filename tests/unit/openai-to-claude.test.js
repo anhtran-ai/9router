@@ -143,7 +143,7 @@ describe("openaiToClaudeRequest", () => {
 
     it("maps string tool_choice values", () => {
       expect(choiceOf("auto")).toEqual({ type: "auto" });
-      expect(choiceOf("none")).toEqual({ type: "auto" });
+      expect(choiceOf("none")).toEqual({ type: "none" });
       expect(choiceOf("required")).toEqual({ type: "any" });
     });
 
@@ -153,12 +153,12 @@ describe("openaiToClaudeRequest", () => {
       expect(choiceOf({ type: "none" })).toEqual({ type: "none" });
     });
 
-    it("never leaks an invalid type (falls back to auto)", () => {
+    it("rejects invalid constraints instead of falling back to auto", () => {
       // Malformed forced choice with no tool name, and unknown types, must not
       // pass an invalid `type` through to Claude.
-      expect(choiceOf({ type: "function", function: {} })).toEqual({ type: "auto" });
-      expect(choiceOf({ type: "function" })).toEqual({ type: "auto" });
-      expect(choiceOf({ type: "bogus" })).toEqual({ type: "auto" });
+      expect(() => choiceOf({ type: "function", function: {} })).toThrow("Unsupported tool constraint:");
+      expect(() => choiceOf({ type: "function" })).toThrow("Unsupported tool constraint:");
+      expect(() => choiceOf({ type: "bogus" })).toThrow("Unsupported tool constraint:");
     });
 
     it("omits tool_choice entirely when the request has none", () => {

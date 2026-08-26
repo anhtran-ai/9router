@@ -1,5 +1,6 @@
 import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import RunErrorsReporter from './run-errors-reporter.mjs';
 
 const repo = process.env.AZOX_AUDIT_REPO;
 const output = process.env.AZOX_AUDIT_OUTPUT;
@@ -18,7 +19,7 @@ export default {
     pool: 'forks',
     maxWorkers: 4,
     retry: 0,
-    reporters: ['default', 'json'],
+    reporters: ['default', 'json', new RunErrorsReporter(output)],
     outputFile: { json: resolve(output, 'vitest.json') },
   },
 };

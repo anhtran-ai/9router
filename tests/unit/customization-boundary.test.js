@@ -70,6 +70,29 @@ describe("customization boundary guard", () => {
     );
   });
 
+  it("maps cancellation and run-level evidence seams to their actual regression gates", () => {
+    const inventory = renderForkDiffInventory(loadCustomizationManifest(manifestPath));
+    const rows = inventory.split("\n").filter(row => row.startsWith("| M |") || row.startsWith("| A |"));
+    expect(rows.find(row => row.includes("`open-sse/handlers/chatCore.js`"))).toContain("responses-abort-terminal.test.js");
+    expect(rows.find(row => row.includes("`scripts/compare-test-results.mjs`"))).toContain("offline-test-runner.test.js");
+  });
+
+  it("maps response, usage and backup repairs without losing stream cancellation coverage", () => {
+    const inventory = renderForkDiffInventory(loadCustomizationManifest(manifestPath));
+    const rows = inventory.split("\n").filter(row => row.startsWith("| M |") || row.startsWith("| A |"));
+    const response = rows.find(row => row.includes("`open-sse/translator/concerns/responseContract.js`"));
+    const stream = rows.find(row => row.includes("`open-sse/utils/stream.js`"));
+    const usage = rows.find(row => row.includes("`src/lib/db/repos/usageRepo.js`"));
+    const backup = rows.find(row => row.includes("`src/lib/db/adapters/sqljsAdapter.js`"));
+    expect(response).toContain("openai-responses-nonstream.test.js");
+    expect(stream).toContain("streaming-response-contract.test.js");
+    expect(stream).toContain("responses-abort-terminal.test.js");
+    expect(usage).toContain("db-concurrent.test.js");
+    expect(usage).toContain("db-migration-chain.test.js");
+    expect(backup).toContain("request-details-tab.test.js");
+    expect(backup).toContain("db-migration-chain.test.js");
+  });
+
   it("rejects a fixture that modifies a file outside an approved seam", () => {
     const manifest = loadCustomizationManifest(manifestPath);
     const fixture = readFileSync(

@@ -4,6 +4,7 @@ import "./registerAll.js";
 import { translateRequest } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
 import { openaiToClaudeRequest } from "../../open-sse/translator/request/openai-to-claude.js";
+import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 
 function translate(tools, toolChoice) {
   return openaiToClaudeRequest("claude-opus-5", {
@@ -58,14 +59,11 @@ describe("OpenAI/Responses hosted tools to Claude", () => {
     expect(result.tools.at(-1).cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
   });
 
-  it("drops incompatible hosted tools and their forced tool choice", () => {
-    const result = translate([
+  it("rejects an incompatible forced hosted choice instead of removing the constraint", () => {
+    expect(() => translate([
       { type: "file_search", vector_store_ids: ["vs_1"] },
       { type: "image_generation" },
-    ], { type: "tool", name: "file_search" });
-
-    expect(result.tools).toBeUndefined();
-    expect(result.tool_choice).toBeUndefined();
+    ], { type: "file_search" })).toThrow(ToolCompatibilityError);
   });
 
   it("keeps function tools and validates forced function choice", () => {
@@ -75,10 +73,9 @@ describe("OpenAI/Responses hosted tools to Claude", () => {
     expect(valid.tools[0].name).toBe("echo");
     expect(valid.tool_choice).toEqual({ type: "tool", name: "echo" });
 
-    const invalid = translate([
+    expect(() => translate([
       { type: "function", function: { name: "echo", parameters: { type: "object" } } },
-    ], { type: "function", function: { name: "missing" } });
-    expect(invalid.tool_choice).toEqual({ type: "auto" });
+    ], { type: "function", function: { name: "missing" } })).toThrow(ToolCompatibilityError);
   });
 });
 

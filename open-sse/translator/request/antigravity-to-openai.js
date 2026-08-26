@@ -5,6 +5,7 @@ import { encodeDataUri } from "../concerns/image.js";
 import { ROLE, GEMINI_ROLE, OPENAI_BLOCK } from "../schema/index.js";
 import { budgetToEffort } from "../concerns/thinking.js";
 import { collapseTextParts } from "../concerns/message.js";
+import { geminiToolChoiceToChat } from "../concerns/toolChoice.js";
 
 // Convert Antigravity request to OpenAI format
 // Antigravity body: { project, model, userAgent, requestType, requestId, request: { contents, systemInstruction, tools, toolConfig, generationConfig, sessionId } }
@@ -81,6 +82,8 @@ export function antigravityToOpenAIRequest(model, body, stream) {
     }
   }
 
+  const choice = geminiToolChoiceToChat(req.toolConfig?.functionCallingConfig, result.tools);
+  if (choice !== undefined) result.tool_choice = choice;
   return result;
 }
 

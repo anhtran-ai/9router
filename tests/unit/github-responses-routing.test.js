@@ -5,8 +5,23 @@
  * fail with a misleading 400 "does not support Responses API".
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import "../translator/registerAll.js";
 import { GithubExecutor } from "../../open-sse/executors/github.js";
+import { translateRequest } from "../../open-sse/translator/index.js";
+import { FORMATS } from "../../open-sse/translator/formats.js";
+import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
+
+const mocked = vi.hoisted(() => ({ fetch: vi.fn() }));
+vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
+  proxyAwareFetch: mocked.fetch,
+  default: mocked.fetch,
+}));
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  mocked.fetch.mockReset();
+});
 
 describe("GithubExecutor.supportsResponsesEndpoint", () => {
   const exec = new GithubExecutor();
@@ -52,5 +67,22 @@ describe("GithubExecutor.execute cached-route guard (#1062)", () => {
     expect(respSpy).not.toHaveBeenCalled();
     expect(baseSpy).toHaveBeenCalled();
     expect(result.via).toBe("chat");
+  });
+
+  it("rejects native Chat custom tools before a cached Responses route dispatches (#35 / SR-07)", async () => {
+    const model = "gpt-5.5-codex";
+    const body = translateRequest(FORMATS.OPENAI, FORMATS.OPENAI, model, {
+      messages: [{ role: "user", content: "offline custom tool probe" }],
+      tools: [{ type: "custom", custom: { name: "exec", format: { type: "text" } } }],
+      tool_choice: { type: "custom", custom: { name: "exec" } },
+    }, true, null, "github");
+    const exec = new GithubExecutor();
+    exec.knownCodexModels.add(model);
+    mocked.fetch.mockResolvedValue(new Response(null, { status: 200 }));
+
+    await expect(exec.execute({
+      model, body, stream: true, credentials: {}, signal: new AbortController().signal,
+    })).rejects.toBeInstanceOf(ToolCompatibilityError);
+    expect(mocked.fetch).not.toHaveBeenCalled();
   });
 });

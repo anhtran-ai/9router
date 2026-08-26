@@ -45,6 +45,55 @@ describe("DB Concurrency — atomic safety", () => {
     expect(hist.length).toBe(N);
   });
 
+  it("retains independent same-millisecond requests in history, recent views and aggregates", async () => {
+    const timestamp = new Date().toISOString();
+    const provider = "same-millisecond-usage";
+    const before = await db.getUsageStats("all");
+    const entries = ["first-request", "second-request"].map((requestId) => ({
+      requestId, timestamp, provider, model: "fixture-model", connectionId: "fixture-account",
+      endpoint: "/v1/messages", tokens: { prompt_tokens: 10, completion_tokens: 5 }, status: "ok",
+    }));
+
+    await Promise.all(entries.map((entry) => db.saveRequestUsage(entry)));
+
+    expect(await db.getUsageHistory({ provider })).toHaveLength(2);
+    const stats = await db.getUsageStats("all");
+    expect(stats.totalRequests).toBe(before.totalRequests + 2);
+    expect(stats.byProvider[provider]).toMatchObject({ requests: 2, promptTokens: 20, completionTokens: 10 });
+    expect(stats.recentRequests.filter((entry) => entry.provider === provider)).toHaveLength(2);
+    const active = await db.getActiveRequests();
+    expect(active.recentRequests.filter((entry) => entry.provider === provider)).toHaveLength(2);
+  });
+
+  it("does not treat matching request content as identity when no request ID is supplied", async () => {
+    const provider = "same-content-usage";
+    const entry = {
+      timestamp: new Date().toISOString(), provider, model: "fixture-model",
+      tokens: { prompt_tokens: 8, completion_tokens: 3 }, status: "ok",
+    };
+
+    await Promise.all([db.saveRequestUsage({ ...entry }), db.saveRequestUsage({ ...entry })]);
+
+    expect(await db.getUsageHistory({ provider })).toHaveLength(2);
+  });
+
+  it("keeps timestamp and cost enrichment local to the usage record", async () => {
+    const provider = "immutable-usage";
+    const entry = Object.freeze({
+      provider, model: "fixture-model", tokens: Object.freeze({ prompt_tokens: 7, completion_tokens: 2 }),
+      endpoint: "/v1/messages", status: "ok",
+    });
+
+    await db.saveRequestUsage(entry);
+
+    const history = await db.getUsageHistory({ provider });
+    expect(history).toHaveLength(1);
+    expect(history[0].timestamp).toEqual(expect.any(String));
+    expect(history[0].cost).toBe(0);
+    expect(entry).not.toHaveProperty("timestamp");
+    expect(entry).not.toHaveProperty("cost");
+  });
+
   it("200 parallel saveRequestDetail → all flushed", async () => {
     await db.updateSettings({ enableObservability: true, observabilityBatchSize: 10 });
 

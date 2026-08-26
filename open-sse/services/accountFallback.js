@@ -1,4 +1,5 @@
 import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/errorConfig.js";
+import { HTTP_STATUS } from "../config/runtimeConfig.js";
 
 const ASSISTANT_PREFILL_UNSUPPORTED = "does not support assistant message prefill";
 
@@ -51,7 +52,7 @@ export function getQuotaCooldown(backoffLevel = 0) {
  * @returns {{ shouldFallback: boolean, cooldownMs: number, newBackoffLevel?: number }}
  */
 export function checkFallbackError(status, errorText, backoffLevel = 0) {
-  if (isModelCompatibilityError(status, errorText)) {
+  if (status === HTTP_STATUS.CLIENT_CLOSED_REQUEST || isModelCompatibilityError(status, errorText)) {
     return { shouldFallback: false, cooldownMs: 0 };
   }
 

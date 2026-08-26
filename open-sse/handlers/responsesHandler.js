@@ -5,9 +5,8 @@
 
 import { handleChatCore } from "./chatCore.js";
 import { convertResponsesApiFormat } from "../translator/formats/responsesApi.js";
-import { createResponsesApiTransformStream } from "../transformer/responsesTransformer.js";
 import { convertResponsesStreamToJson } from "../transformer/streamToJsonConverter.js";
-import { SSE_HEADERS_CORS } from "../utils/sseConstants.js";
+import { InvalidResponseError } from "../translator/concerns/responseContract.js";
 
 /**
  * Handle /v1/responses request
@@ -70,30 +69,20 @@ export async function handleResponsesCore({ body, modelInfo, credentials, log, o
         })
       };
     } catch (error) {
-      console.error("[Responses API] Stream-to-JSON conversion failed:", error);
+      // A malformed/truncated provider body is an upstream protocol failure,
+      // including when this fallback is the caller that collects the stream.
       return {
         success: false,
-        status: 500,
-        error: "Failed to convert streaming response to JSON"
+        status: 502,
+        code: "invalid_upstream_response",
+        error: error instanceof InvalidResponseError ? error.message : "Invalid upstream response: failed to collect Responses SSE"
       };
     }
   }
 
-  // Case 2: Client wants streaming, got SSE - transform it
-  if (clientRequestedStreaming && contentType.includes("text/event-stream")) {
-    const transformStream = createResponsesApiTransformStream(null);
-    const transformedBody = response.body.pipeThrough(transformStream);
-
-    return {
-      success: true,
-      response: new Response(transformedBody, {
-        status: 200,
-        headers: { ...SSE_HEADERS_CORS }
-      })
-    };
-  }
-
-  // Case 3: Non-SSE response (error or non-streaming from provider) - return as-is
+  // Core already encodes this client's Responses SSE via sourceFormatOverride.
+  // A second Chat-only transform would discard native events/errors and flush
+  // an invented empty completed response. Preserve the stream and its terminal.
   return result;
 }
 

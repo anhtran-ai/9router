@@ -16,11 +16,11 @@
   },
   "inventory_path": "docs/FORK_DIFF_INVENTORY.md",
   "counts": {
-    "additive_total": 50,
-    "modified_total": 28,
-    "modified_runtime": 18,
+    "additive_total": 56,
+    "modified_total": 65,
+    "modified_runtime": 43,
     "modified_runtime_target_approx": 10,
-    "target_note": "Eighteen runtime seams remain, above the approximate target of ten. Final Chat tools filtering and its custom-tool discriminator are explicit protocol seams added for #31; existing Codex/Claude, combo, and navigation seams remain individually registered."
+    "target_note": "43 modified runtime seams exceed the approximate target of ten. Issues #35–#41 cover protocol selection, final-client response validation, cancellation, atomic usage and persistent migration-backup boundaries. Keep additive policy helpers shared; retire each seam only when equivalent upstream behavior passes its linked regression gates."
   },
   "runtime_policies": {
     "claude_assistant_prefill": {
@@ -31,7 +31,7 @@
     },
     "codex_responses": {
       "boundary": "open-sse/executors/codex.js",
-      "normalizations": ["Hoist Codex CLI developer instructions.", "Remove only content from additional_tools items while preserving items, order, tools, and metadata.", "Normalize hosted tools into new objects; preserve independent MCP servers and forced MCP/custom selectors.", "Retain native web-search access flags, client tool_search schema/execution, and MCP defer_loading."],
+      "normalizations": ["Hoist Codex CLI developer instructions.", "Remove only content from additional_tools items while preserving items, order, tools, and metadata.", "Normalize hosted tools into new objects; preserve independent MCP servers and forced MCP/custom/allowed_tools selectors.", "Retain native web-search access flags, client tool_search schema/execution, function strict/defer_loading, MCP defer_loading, and image action/input_image_mask.", "Preserve representable Claude allowed_domains and parallel_tool_calls:false; reject unrepresentable search restrictions and forced/required tools removed by final Codex filtering (#39)."],
       "scope": "Provider compatibility for the Codex OAuth Responses backend; not a mandatory OpenAI Responses specification rule.",
       "upstream_reference_roles": {
         "instruction_hoisting": "decolua/9router#2508",
@@ -41,16 +41,38 @@
       "retirement": "Drop the fork seam after upstream ships an equivalent fix and direct cx/* Codex CLI regression passes."
     },
     "hosted_tools": {
-      "boundaries": ["open-sse/translator/concerns/hostedToolPolicy.js", "open-sse/translator/request/openai-responses.js", "open-sse/translator/request/openai-to-claude.js", "open-sse/translator/formats/openai.js"],
+      "boundaries": ["open-sse/translator/concerns/hostedToolPolicy.js", "open-sse/translator/concerns/toolChoice.js", "open-sse/translator/index.js", "open-sse/translator/request/openai-responses.js", "open-sse/translator/request/openai-to-claude.js", "open-sse/translator/formats/openai.js", "open-sse/translator/formats/claude.js"],
       "classifier": "Explicit client function/custom identity wins over hosted aliases; named native custom tools are not built-ins.",
       "pivot": "Keep recognized hosted declarations in the OpenAI intermediate representation for compatible target formats.",
       "chat_boundary": "Final Chat output contains only client function/custom declarations and synchronized selectors. An empty selected subset or unavailable forced tool disables calls to unrelated retained tools; remove choices when no tools remain.",
-      "mutation": "Codex normalization must not alter shared tool objects used by later combo attempts."
+      "mutation": "Codex normalization must not alter shared tool objects used by later combo attempts.",
+      "constraints": "Preserve none/forced/required/subset through supported targets; reject unavailable or ambiguous selections with typed unsupported_tool_constraint (400), allowing model fallback without account cooldown.",
+      "web_search": "Map allowed domains into Claude native fields. Reject cache-only external_web_access:false and any explicit indexed_web_access on Claude because equivalent enforcement is unavailable.",
+      "native_chat_custom": "Keep native Chat custom declarations/history only on the Chat target. Reject other actual request pipelines, including dynamic GitHub/Zed Responses routing at the shared converter entry, until their return paths preserve custom identity/raw input. Native Responses passthrough and existing Responses-to-Chat raw-input wrappers remain separate paths."
     },
     "combo_exhaustion": {
       "boundary": "open-sse/services/combo.js",
       "selection": "Keep status/message together; choose the latest 429/5xx (including thrown errors as 500) if any, otherwise the latest failure. Ordinary terminal HTTP 400 and successful responses return immediately.",
-      "preserve": "Keep earliest retry-after aggregation and all-no-credentials normalization; do not change account cooldown classification."
+      "preserve": "Keep earliest valid retry-after aggregation from real HTTP headers (seconds or dates) and legacy body timestamps; normalize actual No active credentials exhaustion to 503. Cancellation is terminal 499 without account cooldown, rotation, or model retry."
+    },
+    "cancellation": {
+      "boundaries": ["src/sse/handlers/chat.js", "open-sse/handlers/chatCore.js", "open-sse/utils/streamHandler.js", "open-sse/utils/abort.js", "open-sse/services/tokenRefresh.js"],
+      "preserve": "Forward the actual Request signal through execution, body reads and retry waits; keep the abort listener until stream completion and complete pending usage once per request."
+    },
+    "response_contract": {
+      "boundaries": ["open-sse/translator/concerns/responseContract.js", "open-sse/utils/streamContract.js", "open-sse/handlers/chatCore/nonStreamingHandler.js", "open-sse/handlers/chatCore/sseToJsonHandler.js", "open-sse/handlers/chatCore/streamingHandler.js"],
+      "preserve": "Return the requested client envelope, preserve native payloads/custom raw input and explicitly requested native background responses, and normalize only identified Claude max_tokens/content:null results to empty array content. Never classify arbitrary/error JSON or truncated/ping-only SSE as success.",
+      "failure": "Before streaming headers return 502 / invalid_upstream_response; after headers emit a safe client-protocol error without upstream diagnostics. Keep incremental delivery, request cancellation and once-only completion; a valid global semantic terminal ends the stream without waiting for transport EOF or inspecting unused trailing bytes."
+    },
+    "usage_accounting": {
+      "boundary": "src/lib/db/repos/usageRepo.js",
+      "preserve": "Each persistence call records an independent usage event even if timestamp and content match another event. History, daily and lifetime counters stay atomic; caller input is not mutated. The request lifecycle owns once-only recording.",
+      "migration": "No schema migration or reconstruction/deletion of historical usage."
+    },
+    "migration_backup": {
+      "boundaries": ["src/lib/db/backup.js", "src/lib/db/adapters/sqljsAdapter.js"],
+      "preserve": "Produce a persistent reopenable lightweight SQLite file with current critical rows and schema, excluding requestDetails, without mutating source data. Backup failures propagate from the helper; migration keeps its existing best-effort policy.",
+      "scope": "Source repair only: no schema version change, live migration, restore, or historical data operation."
     }
   },
   "compatibility_fixes": [
@@ -97,7 +119,7 @@
     {
       "issue": "https://github.com/azox-ai/azox-9router/issues/30",
       "provenance": "Regression introduced by fork PR #24 (31296537).",
-      "preserve": "Explicit custom tools named bash/web_search remain client-tool wrappers through Claude/Gemini translation, never hosted built-ins.",
+      "preserve": "Explicit Responses custom tools named bash/web_search remain client-tool wrappers through Claude/Gemini translation, never hosted built-ins. Native Chat custom has a separate unsupported-target guard under SR-07.",
       "boundaries": ["open-sse/translator/concerns/hostedToolPolicy.js", "open-sse/translator/request/openai-responses.js"],
       "tests": ["tests/unit/hosted-tool-policy.test.js", "tests/translator/hosted-tools-to-claude.test.js"],
       "upgrade_action": "drop-if-upstream"
@@ -117,6 +139,145 @@
       "boundaries": ["open-sse/services/combo.js"],
       "tests": ["tests/unit/unsupported-tool-fallback.test.js", "tests/unit/account-fallback-prefill.test.js"],
       "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-01",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-01: introduced by fork PR #24.",
+      "preserve": "Codex allowed_tools keeps mode and exact function/custom/hosted/MCP identities; reject empty, invalid, unavailable or ambiguous subsets instead of widening tool access.",
+      "boundaries": ["open-sse/executors/codex.js"],
+      "tests": ["tests/unit/codex-tool-normalization.test.js", "tests/unit/unsupported-tool-fallback.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-02",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-02: introduced by fork PR #24.",
+      "preserve": "Translate allowed domains into native Claude search; reject cache-only access, explicit indexed access, and conflicting/unrepresentable domain constraints. Keep original input for a compatible Codex fallback.",
+      "boundaries": ["open-sse/translator/concerns/hostedToolPolicy.js", "open-sse/handlers/chatCore.js"],
+      "tests": ["tests/unit/hosted-tool-policy.test.js", "tests/translator/hosted-tools-matrix.test.js", "tests/unit/unsupported-tool-fallback.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-03",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-03: inherited from upstream v0.5.55.",
+      "preserve": "Preserve none, forced, required and allowed-subset choices across supported Claude/Gemini/Responses pivots; validate declaration identity, renamed functions, final provider filtering and disabled parallel calls. Reject constraints that cannot be enforced.",
+      "boundaries": ["open-sse/translator/concerns/toolChoice.js", "open-sse/translator/formats/claude.js", "open-sse/translator/formats/openai.js", "open-sse/translator/request/openai-to-claude.js", "open-sse/translator/request/openai-to-gemini.js", "open-sse/translator/request/openai-responses.js", "open-sse/translator/request/claude-to-openai.js", "open-sse/translator/request/gemini-to-openai.js", "open-sse/translator/request/antigravity-to-openai.js"],
+      "tests": ["tests/translator/hosted-tools-matrix.test.js", "tests/translator/bugs-toClaude-context.test.js", "tests/unit/openai-to-claude.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-04",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-04: introduced by fork PR #24.",
+      "preserve": "Retain image_generation action and input_image_mask while normalizing Codex hosted tools.",
+      "boundaries": ["open-sse/translator/concerns/hostedToolPolicy.js"],
+      "tests": ["tests/unit/hosted-tool-policy.test.js", "tests/unit/codex-tool-normalization.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-05",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-05: predates PR #24; exact upstream origin not established.",
+      "preserve": "Keep strict and defer_loading on flat and nested Codex function tools, including explicit false/null values.",
+      "boundaries": ["open-sse/executors/codex.js"],
+      "tests": ["tests/unit/codex-tool-normalization.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-06",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-06: inherited from upstream v0.5.55.",
+      "preserve": "Native Claude hosted declarations remain hosted in the pivot and are filtered at the final Chat boundary; never invent client functions for server tools. Explicit client names that resemble hosted aliases remain functions.",
+      "boundaries": ["open-sse/translator/request/claude-to-openai.js", "open-sse/translator/formats/openai.js"],
+      "tests": ["tests/translator/hosted-tools-matrix.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-07",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-07: inherited from upstream; PR #24 changed the Claude failure mode, not its origin.",
+      "preserve": "Keep native Chat custom identity/history at Chat. Reject non-Chat pipelines both at the translator and the low-level Responses converter used by dynamic GitHub/Zed routes. Preserve already-native Responses passthrough and existing custom raw-input wrappers; declaration identity stays separate from functions.",
+      "boundaries": ["open-sse/translator/index.js", "open-sse/translator/concerns/toolChoice.js", "open-sse/translator/request/openai-responses.js", "open-sse/translator/request/openai-to-claude.js", "open-sse/translator/request/openai-to-gemini.js"],
+      "tests": ["tests/unit/openai-responses-custom-tools.test.js", "tests/translator/hosted-tools-matrix.test.js", "tests/unit/github-responses-routing.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-08",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-08: inherited from upstream v0.5.55.",
+      "preserve": "Read actual Retry-After headers (seconds/date), retain body fallback and earliest valid retry aggregation through combo exhaustion.",
+      "boundaries": ["open-sse/services/combo.js"],
+      "tests": ["tests/unit/combo-routing.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-09",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-09: inherited from upstream v0.5.55.",
+      "preserve": "Classify the real account-routing No active credentials message at the combo boundary; all exhausted credential routes return 503 instead of 404.",
+      "boundaries": ["open-sse/services/combo.js"],
+      "tests": ["tests/unit/combo-routing.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-10",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-10: inherited from upstream v0.5.55.",
+      "preserve": "Propagate real request cancellation to execution/body reads/retry waits and token-refresh control flow. Terminal 499 must not cool accounts or continue routing. Keep stream lifetime listeners and idempotent pending-usage completion.",
+      "boundaries": ["src/sse/handlers/chat.js", "src/sse/services/auth.js", "open-sse/handlers/chatCore.js", "open-sse/handlers/chatCore/streamingHandler.js", "open-sse/services/combo.js", "open-sse/services/accountFallback.js", "open-sse/services/tokenRefresh.js", "open-sse/utils/abort.js", "open-sse/utils/streamHandler.js", "open-sse/utils/stream.js", "open-sse/utils/error.js", "open-sse/config/runtimeConfig.js"],
+      "tests": ["tests/unit/responses-abort-terminal.test.js", "tests/unit/unsupported-tool-fallback.test.js", "tests/unit/account-fallback-prefill.test.js", "tests/unit/combo-routing.test.js", "tests/unit/combo-fusion.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "id": "SR-11",
+      "issue": "https://github.com/azox-ai/azox-9router/issues/35",
+      "provenance": "SR-11: comparator gap predates PR #34; verification tooling, not a runtime regression.",
+      "preserve": "Compare assertion/suite/run error identities and process evidence. Capture real global rejection, late teardown and leaked-handle timeout; reject missing, incomplete or abnormal evidence instead of claiming no regression.",
+      "boundaries": ["scripts/compare-test-results.mjs", "scripts/offline-tests/run-errors-reporter.mjs", "scripts/offline-tests/offline.config.mjs", "scripts/offline-tests/run-offline.mjs"],
+      "tests": ["tests/unit/offline-test-runner.test.js"],
+      "upgrade_action": "keep"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/36",
+      "provenance": "Predates this review round; the same core custom-return failures reproduced on main c9a1c3af and prior candidate 23feb40b.",
+      "preserve": "Normalize Array/Set custom metadata and complete Chat/Claude/Gemini JSON return conversion into Responses custom_tool_call with exact raw input; retain ordinary function calls, call IDs, text/reasoning, usage and native Responses passthrough.",
+      "boundaries": ["open-sse/translator/concerns/responseContract.js", "open-sse/handlers/chatCore/nonStreamingHandler.js", "open-sse/handlers/chatCore/sseToJsonHandler.js", "open-sse/transformer/streamToJsonConverter.js"],
+      "tests": ["tests/unit/openai-responses-nonstream.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/38",
+      "provenance": "JSON/SSE contract gaps reproduced on main c9a1c3af and candidate 23feb40b; this source evidence does not establish the LiteLLM/Claude CLI incident cause.",
+      "preserve": "Validate native envelopes and streaming media/events before success, complete final-client conversion and recover output-only terminals without replay. Reject Responses tool item identity drift and malformed Gemini content/parts before success for native and translated clients. Preserve valid empty/incomplete/background results and usage; reject malformed/error/truncated responses safely. Global semantic terminals end the stream promptly without waiting for EOF or inspecting unused trailing bytes.",
+      "boundaries": ["open-sse/translator/concerns/responseContract.js", "open-sse/utils/streamContract.js", "open-sse/handlers/chatCore/nonStreamingHandler.js", "open-sse/handlers/chatCore/sseToJsonHandler.js", "open-sse/handlers/chatCore/streamingHandler.js", "open-sse/handlers/responsesHandler.js", "open-sse/transformer/streamToJsonConverter.js", "open-sse/utils/stream.js", "open-sse/utils/streamHandler.js", "open-sse/utils/responsesStreamHelpers.js", "open-sse/utils/usageTracking.js", "open-sse/translator/response/openai-responses.js", "open-sse/translator/response/gemini-to-openai.js", "open-sse/executors/commandcode.js"],
+      "tests": ["tests/unit/openai-responses-nonstream.test.js", "tests/unit/streaming-response-contract.test.js", "tests/unit/responses-abort-terminal.test.js", "tests/unit/combo-routing.test.js", "tests/unit/commandcode-to-openai.test.js", "tests/unit/kiro-nonstream-error.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/39",
+      "provenance": "Mixed origin: upstream a648a42bd/e544bfcea omitted parallel calls and deleted unavailable function choices; fork PR #24 (312965378) dropped hosted restrictions/choices; PR #34 (c9a1c3af) deleted custom/MCP choices. PR #37 (513cf8a9f) exposed native Claude paths through this final normalizer.",
+      "preserve": "Retain representable Claude search domain restrictions and disabled parallel calls. Reject unrepresentable restrictions, conflicting duplicate web-search declarations, and forced/required tools absent after final filtering; preserve caller objects and compatible combo fallback without account cooldown.",
+      "boundaries": ["open-sse/executors/codex.js", "open-sse/translator/concerns/hostedToolPolicy.js"],
+      "tests": ["tests/unit/codex-tool-normalization.test.js", "tests/unit/hosted-tool-policy.test.js", "tests/translator/hosted-tools-matrix.test.js", "tests/unit/unsupported-tool-fallback.test.js", "tests/unit/combo-routing.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/40",
+      "provenance": "Inherited from upstream commit 0d21668917b6d5ad5bb095f75aaa474cc97ae7e1, an ancestor of pinned v0.5.55.",
+      "preserve": "Do not collapse independent requests by timestamp/provider/account/token coincidence in history or recent views. Keep history/daily/lifetime writes atomic and enrich a local copy rather than the caller entry; completion callbacks remain responsible for exactly one record per request.",
+      "boundaries": ["src/lib/db/repos/usageRepo.js"],
+      "tests": ["tests/unit/db-concurrent.test.js", "tests/unit/db-migration-chain.test.js"],
+      "upgrade_action": "drop-if-upstream"
+    },
+    {
+      "issue": "https://github.com/azox-ai/azox-9router/issues/41",
+      "provenance": "Inherited from upstream b25e10160ddf42407968dddc99ad5ac4c6c6095b, which added ATTACH-based backupDbLite without persisting the sql.js virtual database. Both runtime files are unchanged from pinned v0.5.55 before this repair.",
+      "preserve": "Make lightweight sql.js backups real and reopenable, include current unflushed critical data, exclude requestDetails, preserve source data and native adapters, and propagate backup errors without changing best-effort migration policy.",
+      "boundaries": ["src/lib/db/backup.js", "src/lib/db/adapters/sqljsAdapter.js"],
+      "tests": ["tests/unit/request-details-tab.test.js", "tests/unit/db-migration-chain.test.js"],
+      "upgrade_action": "drop-if-upstream"
     }
   ],
   "boundaries": {
@@ -133,6 +294,8 @@
       { "path": "docs/UPSTREAM_UPGRADE_HANDBOOK.md", "reason": "Fork upgrade procedure." },
       { "path": "open-sse/translator/concerns/assistantPrefillPolicy.js", "reason": "Claude-target prefill policy module." },
       { "path": "open-sse/translator/concerns/hostedToolPolicy.js", "reason": "Cross-provider hosted tool compatibility policy." },
+      { "path": "open-sse/translator/concerns/toolChoice.js", "reason": "Preserve declaration identity and enforce cross-format tool constraints with explicit compatibility errors (#35)." },
+      { "path": "open-sse/utils/abort.js", "reason": "Share cancellation classification and abortable retry waits without provider-specific policy (#35)." },
       { "path": "package-lock.json", "reason": "Reproducible fork dependency lock." },
       { "path": "scripts/check-customization-boundary.mjs", "reason": "Deterministic boundary guard." },
       { "path": "scripts/compare-test-results.mjs", "reason": "Fork regression baseline helper." },
@@ -140,6 +303,7 @@
       { "path": "scripts/offline-tests/network-guard.cjs", "reason": "Test-only process guard blocks unmocked provider/existing gateway traffic and preserves ephemeral fixture servers." },
       { "path": "scripts/offline-tests/offline.config.mjs", "reason": "Reuse repository Vitest configuration with fixed offline/reporting overrides." },
       { "path": "scripts/offline-tests/offline.setup.mjs", "reason": "Install the same network guard inside test workers before importing tests." },
+      { "path": "scripts/offline-tests/run-errors-reporter.mjs", "reason": "Capture global errors, late teardown failures and process timeouts omitted by assertion JSON (#35)." },
       { "path": "scripts/offline-tests/run-offline.mjs", "reason": "Reproducible same-environment baseline/candidate reports with isolated data/profile directories and no inherited provider environment." },
       { "path": "scripts/start-contributor-local.ps1", "reason": "Contributor local operations helper." },
       { "path": "scripts/stop-contributor-local.ps1", "reason": "Contributor local operations helper." },
@@ -168,9 +332,12 @@
       { "path": "tests/unit/hosted-tool-policy.test.js", "reason": "Hosted tool alias and rendering coverage." },
       { "path": "tests/unit/oauth-modal-api-base.test.js", "reason": "Generic OAuth apiBase seam coverage." },
       { "path": "tests/unit/oauth-register-session.test.js", "reason": "Contributor OAuth session coverage." },
-      { "path": "tests/unit/offline-test-runner.test.js", "reason": "Negative probes prevent wildcard fixture binding and shell dispatch in the reusable offline runner." },
+      { "path": "tests/unit/offline-test-runner.test.js", "reason": "Negative guard probes and actual Vitest rejection/teardown/timeout cases prevent false no-regression results." },
       { "path": "tests/unit/unsupported-tool-fallback.test.js", "reason": "Unsupported hosted tool fallback coverage." },
-      { "path": "tests/unit/upstream-v0555-preservation.test.js", "reason": "Upstream preservation coverage." }
+      { "path": "tests/unit/upstream-v0555-preservation.test.js", "reason": "Upstream preservation coverage." },
+      { "path": "open-sse/translator/concerns/responseContract.js", "reason": "Shared safe JSON envelope validation and final-client conversion, including Responses custom wrappers (#36, #38)." },
+      { "path": "open-sse/utils/streamContract.js", "reason": "Incremental upstream SSE/NDJSON validation before translators can synthesize completion (#38)." },
+      { "path": "tests/unit/streaming-response-contract.test.js", "reason": "Cross-format stream envelope, termination, early delivery and malformed/error regression coverage (#38)." }
     ],
     "modified": [
       { "path": ".gitignore", "category": "tooling", "reason": "Ignore fork test/build artifacts while retaining upgrade documentation." },
@@ -178,16 +345,27 @@
       { "path": "Dockerfile", "category": "build", "reason": "Use committed lockfile for deterministic container builds." },
       { "path": "next.config.mjs", "category": "build", "reason": "Keep optional better-sqlite3 external so fallback builds remain reproducible." },
       { "path": "open-sse/config/errorConfig.js", "category": "runtime", "reason": "Classify unsupported Claude prefill as request-shape failure." },
+      { "path": "open-sse/config/runtimeConfig.js", "category": "runtime", "reason": "Give terminal client cancellation a shared HTTP 499 constant (#35)." },
       { "path": "open-sse/executors/codex.js", "category": "runtime", "reason": "Normalize Codex CLI developer messages, additional_tools content, and hosted tool types for the OAuth Responses backend." },
-      { "path": "open-sse/handlers/chatCore.js", "category": "runtime", "reason": "Apply Claude-target policy on native passthrough." },
+      { "path": "open-sse/handlers/chatCore.js", "category": "runtime", "reason": "Apply Claude-target policy, preserve typed tool errors and propagate client cancellation through execution, refresh and body lifetime (#35)." },
+      { "path": "open-sse/handlers/chatCore/streamingHandler.js", "category": "runtime", "reason": "Validate streaming media/events before completion, report protocol failure safely, and preserve once-only pending/usage handling (#35, #38)." },
       { "path": "open-sse/providers/capabilities.js", "category": "runtime", "reason": "Remove model-based assistant prefill capability." },
-      { "path": "open-sse/services/accountFallback.js", "category": "runtime", "reason": "Classify exact HTTP 400 model-compatibility errors without account cooldown." },
-      { "path": "open-sse/services/combo.js", "category": "runtime", "reason": "Allow model-only fallback for exact model-compatibility HTTP 400 while stopping other HTTP 400 responses." },
-      { "path": "open-sse/translator/formats/claude.js", "category": "runtime", "reason": "Apply Claude-target policy on translated requests." },
+      { "path": "open-sse/services/accountFallback.js", "category": "runtime", "reason": "Classify exact compatibility errors without account cooldown and make client cancellation terminal (#35)." },
+      { "path": "open-sse/services/combo.js", "category": "runtime", "reason": "Keep coherent model fallback, actual Retry-After metadata and true credential-exhaustion status; stop model/panel progression on cancellation (#35)." },
+      { "path": "open-sse/services/tokenRefresh.js", "category": "runtime", "reason": "Stop refresh retries and waits when the caller cancels while preserving existing callers (#35)." },
+      { "path": "open-sse/translator/formats/claude.js", "category": "runtime", "reason": "Apply Claude-target prefill policy and reject forced/required tools removed by final provider filtering (#35)." },
       { "path": "open-sse/translator/formats/openai.js", "category": "runtime", "reason": "Remove hosted declarations at the final Chat boundary and synchronize retained function/custom tool selectors (#31)." },
-      { "path": "open-sse/translator/request/openai-responses.js", "category": "runtime", "reason": "Preserve hosted tools across the OpenAI pivot." },
+      { "path": "open-sse/translator/index.js", "category": "runtime", "reason": "Reject native Chat custom tools before unsupported request/response pipelines erase their identity (#35)." },
+      { "path": "open-sse/translator/request/antigravity-to-openai.js", "category": "runtime", "reason": "Preserve Gemini-family tool selection when unwrapping Antigravity requests (#35)." },
+      { "path": "open-sse/translator/request/claude-to-openai.js", "category": "runtime", "reason": "Keep Claude hosted declarations distinct from client functions and preserve selection/parallel constraints (#35)." },
+      { "path": "open-sse/translator/request/gemini-to-openai.js", "category": "runtime", "reason": "Preserve Gemini mode and allowed-function names through the Chat pivot (#35)." },
+      { "path": "open-sse/translator/request/openai-responses.js", "category": "runtime", "reason": "Preserve hosted/custom declaration identity and selection across the Responses pivot; reject native Chat custom on dynamic non-Chat transports before dispatch (#35)." },
       { "path": "open-sse/translator/request/openai-to-claude.js", "category": "runtime", "reason": "Render hosted tools natively for Anthropic and keep tool_choice consistent." },
+      { "path": "open-sse/translator/request/openai-to-gemini.js", "category": "runtime", "reason": "Translate none/required/forced/subset choices with sanitized names and explicit rejection of unsupported constraints (#35)." },
       { "path": "open-sse/translator/schema/blocks.js", "category": "runtime", "reason": "Name the native Chat custom-tool discriminator used by final-boundary normalization (#31)." },
+      { "path": "open-sse/utils/error.js", "category": "runtime", "reason": "Preserve typed compatibility codes and avoid duplicating retry text (#35)." },
+      { "path": "open-sse/utils/stream.js", "category": "runtime", "reason": "Preserve valid terminal usage and protocol framing after validation, with once-only completion (#35, #38)." },
+      { "path": "open-sse/utils/streamHandler.js", "category": "runtime", "reason": "Keep cancellation terminal and surface upstream read/stall failures instead of treating them as successful EOF (#35, #38)." },
       { "path": "src/dashboardGuard.js", "category": "runtime", "reason": "Expose contributor session endpoint without widening admin routes." },
       { "path": "src/lib/db/index.js", "category": "runtime", "reason": "Register combo transfer repository seam." },
       { "path": "src/lib/db/repos/combosRepo.js", "category": "runtime", "reason": "Add combo import/export persistence operations." },
@@ -195,12 +373,38 @@
       { "path": "src/shared/components/Header.js", "category": "runtime", "reason": "Small generic hook into additive navigation registry; exception above approximate runtime target." },
       { "path": "src/shared/components/OAuthModal.js", "category": "runtime", "reason": "Generic apiBase prop seam used by contributor OAuth." },
       { "path": "src/shared/components/Sidebar.js", "category": "runtime", "reason": "Small generic hook into additive navigation registry; exception above approximate runtime target." },
+      { "path": "src/sse/handlers/chat.js", "category": "runtime", "reason": "Carry Request.signal through single/combo/fusion routing and stop account rotation after cancellation (#35)." },
+      { "path": "src/sse/services/auth.js", "category": "runtime", "reason": "Return early for HTTP 499 without writing account failure/cooldown state (#35)." },
       { "path": "tests/__baseline__/verify-no-regression.mjs", "category": "tests", "reason": "Run boundary guard as part of existing local regression gate." },
+      { "path": "tests/translator/AGENTS.md", "category": "documentation", "reason": "Remove the resolved none-to-auto case from the historical known-bug table; test policy is unchanged (#35)." },
       { "path": "tests/translator/__snapshots__/golden-url-header.test.js.snap", "category": "tests", "reason": "Record intentional upstream-provider cleanup output." },
       { "path": "tests/translator/bugs-toClaude-context.test.js", "category": "tests", "reason": "Cover Claude-target prefill behavior in existing translator suite." },
       { "path": "tests/unit/capabilities.test.js", "category": "tests", "reason": "Cover removal of model-based assistant prefill capability." },
       { "path": "tests/unit/db-migration-chain.test.js", "category": "tests", "reason": "Bounded Windows ENOTEMPTY teardown retry only; assertions and Vitest retry=0 remain unchanged." },
-      { "path": "tests/unit/codex-tool-normalization.test.js", "category": "tests", "reason": "Cover Codex CLI Responses passthrough normalization, strict unsupported-content handling, and hosted tool rewrites." }
+      { "path": "tests/unit/combo-fusion.test.js", "category": "tests", "reason": "Cover pre-abort and cancellation before fusion judge execution (#35)." },
+      { "path": "tests/unit/combo-routing.test.js", "category": "tests", "reason": "Causal cancellation, protocol fallback, once-only completion and final Codex tool-constraint controls (#35, #38, #39)." },
+      { "path": "tests/unit/github-responses-routing.test.js", "category": "tests", "reason": "Exercise cached dynamic Responses routing to prove native Chat custom requests reject before provider dispatch (#35)." },
+      { "path": "tests/unit/openai-responses-custom-tools.test.js", "category": "tests", "reason": "Reject unsupported native Chat custom at the direct converter while preserving already-native Responses passthrough and existing raw-input wrappers (#35)." },
+      { "path": "tests/unit/openai-to-claude.test.js", "category": "tests", "reason": "Verify forced unavailable tools reject explicitly rather than becoming unrestricted auto (#35)." },
+      { "path": "tests/unit/responses-abort-terminal.test.js", "category": "tests", "reason": "Verify actual abort propagation, completion listener cleanup and existing Responses terminal stream behavior (#35)." },
+      { "path": "tests/unit/codex-tool-normalization.test.js", "category": "tests", "reason": "Cover Codex CLI Responses passthrough normalization, strict unsupported-content handling, and hosted tool rewrites." },
+      { "path": "open-sse/handlers/chatCore/nonStreamingHandler.js", "category": "runtime", "reason": "Validate non-streaming envelopes and finish conversion into the client format before success/usage (#36, #38)." },
+      { "path": "open-sse/handlers/chatCore/sseToJsonHandler.js", "category": "runtime", "reason": "Share final-client conversion and validation for forced SSE/JSON backends (#36, #38)." },
+      { "path": "open-sse/handlers/responsesHandler.js", "category": "runtime", "reason": "Map typed Responses collector failures to 502 at its standalone caller (#38)." },
+      { "path": "open-sse/transformer/streamToJsonConverter.js", "category": "runtime", "reason": "Retain authoritative Responses terminal metadata/output and distinguish incomplete from truncation (#36, #38)." },
+      { "path": "open-sse/utils/responsesStreamHelpers.js", "category": "runtime", "reason": "Preserve terminal usage in converted Responses streams (#38)." },
+      { "path": "open-sse/utils/usageTracking.js", "category": "runtime", "reason": "Extract usage from legitimate response.incomplete terminals (#38)." },
+      { "path": "open-sse/translator/response/openai-responses.js", "category": "runtime", "reason": "Carry validated finish/trailer usage into translated Responses terminal events (#38)." },
+      { "path": "open-sse/executors/commandcode.js", "category": "runtime", "reason": "Advertise SSE after the executor converts the upstream body to SSE (#38)." },
+      { "path": "tests/unit/openai-responses-nonstream.test.js", "category": "tests", "reason": "Actual core JSON/forced-SSE response contracts, custom calls, invalid envelopes and terminal collector controls (#36, #38)." },
+      { "path": "tests/unit/commandcode-to-openai.test.js", "category": "tests", "reason": "Check the executor converted body and advertised streaming content type agree (#38)." },
+      { "path": "src/lib/db/repos/usageRepo.js", "category": "runtime", "reason": "Count independent concurrent usage events without timestamp/token coincidence deduplication; preserve atomic writes and caller input (#40)." },
+      { "path": "tests/unit/db-concurrent.test.js", "category": "tests", "reason": "Deterministic timestamp-collision, immutable-entry and concurrent history/daily/lifetime accounting regressions (#40)." },
+      { "path": "open-sse/translator/response/gemini-to-openai.js", "category": "runtime", "reason": "Preserve legitimate prompt-blocked Gemini stream terminals as content-filter completion (#38)." },
+      { "path": "tests/unit/kiro-nonstream-error.test.js", "category": "tests", "reason": "Verify invalid upstream SSE returns a safe public error while retaining internal parser diagnostics (#38)." },
+      { "path": "src/lib/db/backup.js", "category": "runtime", "reason": "Use the sql.js adapter persistent lightweight backup capability; retain native ATTACH backup and existing best-effort migration policy (#41)." },
+      { "path": "src/lib/db/adapters/sqljsAdapter.js", "category": "runtime", "reason": "Write a real reopenable lightweight SQLite backup from current in-memory data without mutating the source or copying excluded requestDetails (#41)." },
+      { "path": "tests/unit/request-details-tab.test.js", "category": "tests", "reason": "Exercise real persistent backup/reopen/exclusion/error handling and current observability fixture settings without weakening the existing assertions (#41)." }
     ]
   }
 }

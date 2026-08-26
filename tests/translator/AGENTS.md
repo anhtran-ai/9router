@@ -87,8 +87,10 @@ Grouped per CLI/provider test file. Each row is an `it.fails` case.
 |---|---|
 | Always injects "You are Claude Code" system prompt | `request/openai-to-claude.js:124-134` |
 | `reasoning_content` not mapped to a thinking block | `request/openai-to-claude.js:268-273` |
-| `tool_choice:"none"` → `auto` | `request/openai-to-claude.js:298` |
 | `input_audio` dropped | `request/openai-to-claude.js` (no audio branch) |
+
+`tool_choice:"none"` is preserved by the #35 / SR-03 repair and now has a
+regular passing regression in `bugs-toClaude-context.test.js`.
 
 **Codex Responses (`bugs-codexCli-responses.test.js`)**
 | Bug | Source |

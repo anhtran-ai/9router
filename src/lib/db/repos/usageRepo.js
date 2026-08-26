@@ -212,7 +212,6 @@ export async function getActiveRequests() {
   }
 
   await ensureRingInitialized();
-  const seen = new Set();
   const recentRequests = [...recentRing.items]
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
     .map((e) => {
@@ -224,14 +223,7 @@ export async function getActiveRequests() {
         status: e.status || "ok",
       };
     })
-    .filter((e) => {
-      if (e.promptTokens === 0 && e.completionTokens === 0) return false;
-      const minute = e.timestamp ? e.timestamp.slice(0, 16) : "";
-      const key = `${e.model}|${e.provider}|${e.promptTokens}|${e.completionTokens}|${minute}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
+    .filter((e) => e.promptTokens !== 0 || e.completionTokens !== 0)
     .slice(0, 20);
 
   const errorProvider = (Date.now() - lastErrorProvider.ts < 10000) ? lastErrorProvider.provider : "";
@@ -242,72 +234,48 @@ export async function saveRequestUsage(entry) {
   try {
     const db = await getAdapter();
 
-    if (!entry.timestamp) entry.timestamp = new Date().toISOString();
-    entry.cost = await calculateCost(entry.provider, entry.model, entry.tokens);
+    const usageEntry = {
+      ...entry,
+      timestamp: entry.timestamp || new Date().toISOString(),
+      cost: await calculateCost(entry.provider, entry.model, entry.tokens),
+    };
 
-    const tokens = entry.tokens || {};
+    const tokens = usageEntry.tokens || {};
     const promptTokens = tokens.prompt_tokens || tokens.input_tokens || 0;
     const completionTokens = tokens.completion_tokens || tokens.output_tokens || 0;
 
-    let inserted = false;
-
     // All 3 writes (history insert, daily upsert, lifetime counter) in ONE transaction.
     // better-sqlite3 is sync → no JS yield mid-transaction → no race in same process.
+    // Each call records an independent usage event. Equal timestamps and token
+    // counts are not request identity; callers own once-only completion logging.
     db.transaction(() => {
-      const existing = db.get(
-        `SELECT id, endpoint FROM usageHistory
-         WHERE timestamp = ?
-           AND COALESCE(provider, '') = COALESCE(?, '')
-           AND COALESCE(model, '') = COALESCE(?, '')
-           AND COALESCE(connectionId, '') = COALESCE(?, '')
-           AND COALESCE(apiKey, '') = COALESCE(?, '')
-           AND promptTokens = ?
-           AND completionTokens = ?
-         ORDER BY id DESC LIMIT 1`,
-        [
-          entry.timestamp, entry.provider || null, entry.model || null,
-          entry.connectionId || null, entry.apiKey || null,
-          promptTokens, completionTokens,
-        ]
-      );
-
-      if (existing) {
-        if (!existing.endpoint && entry.endpoint) {
-          db.run(`UPDATE usageHistory SET endpoint = ? WHERE id = ?`, [entry.endpoint, existing.id]);
-        }
-        return;
-      }
-
       db.run(
         `INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          entry.timestamp, entry.provider || null, entry.model || null,
-          entry.connectionId || null, entry.apiKey || null, entry.endpoint || null,
-          promptTokens, completionTokens, entry.cost || 0, entry.status || "ok",
+          usageEntry.timestamp, usageEntry.provider || null, usageEntry.model || null,
+          usageEntry.connectionId || null, usageEntry.apiKey || null, usageEntry.endpoint || null,
+          promptTokens, completionTokens, usageEntry.cost || 0, usageEntry.status || "ok",
           stringifyJson(tokens), stringifyJson({}),
         ]
       );
 
-      const dateKey = getLocalDateKey(entry.timestamp);
+      const dateKey = getLocalDateKey(usageEntry.timestamp);
       const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
       const day = row ? parseJson(row.data, {}) : {
         requests: 0, promptTokens: 0, completionTokens: 0, cost: 0,
         byProvider: {}, byModel: {}, byAccount: {}, byApiKey: {}, byEndpoint: {},
       };
-      aggregateEntryToDay(day, entry);
+      aggregateEntryToDay(day, usageEntry);
       db.run(`INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data`, [dateKey, stringifyJson(day)]);
 
       // Atomic counter increment in same transaction
       const cur = db.get(`SELECT value FROM _meta WHERE key = 'totalRequestsLifetime'`);
       const next = (cur ? parseInt(cur.value, 10) : 0) + 1;
       db.run(`INSERT INTO _meta(key, value) VALUES('totalRequestsLifetime', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [String(next)]);
-      inserted = true;
     });
 
-    if (inserted) {
-      pushToRing(entry);
-      scheduleStatsEvent("update", 250);
-    }
+    pushToRing(usageEntry);
+    scheduleStatsEvent("update", 250);
   } catch (e) {
     console.error("Failed to save usage stats:", e);
   }
@@ -368,9 +336,8 @@ export async function getUsageStats(period = "all") {
   const apiKeyMap = {};
   for (const k of allApiKeys) apiKeyMap[k.key] = { name: k.name, id: k.id, createdAt: k.createdAt };
 
-  // recentRequests from live history (last 100 entries enough for 20 deduped)
+  // Keep independent records even when their displayed values happen to match.
   const recentRows = db.all(`SELECT timestamp, provider, model, tokens, status FROM usageHistory ORDER BY id DESC LIMIT 100`);
-  const seen = new Set();
   const recentRequests = recentRows
     .map((r) => {
       const t = parseJson(r.tokens, {}) || {};
@@ -382,14 +349,7 @@ export async function getUsageStats(period = "all") {
         status: r.status || "ok",
       };
     })
-    .filter((e) => {
-      if (e.promptTokens === 0 && e.completionTokens === 0) return false;
-      const minute = e.timestamp ? e.timestamp.slice(0, 16) : "";
-      const key = `${e.model}|${e.provider}|${e.promptTokens}|${e.completionTokens}|${minute}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
+    .filter((e) => e.promptTokens !== 0 || e.completionTokens !== 0)
     .slice(0, 20);
 
   const stats = {

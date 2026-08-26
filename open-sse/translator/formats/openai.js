@@ -1,6 +1,7 @@
 // OpenAI helper functions for translator
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK, VALID_OPENAI_CONTENT_TYPES, VALID_OPENAI_MESSAGE_TYPES } from "../schema/index.js";
 import { isHostedTool } from "../concerns/hostedToolPolicy.js";
+import { isCustomToolWrapper } from "../concerns/toolChoice.js";
 
 // Re-export valid-type lists (moved to schema/blocks.js) to keep existing importers working.
 export { VALID_OPENAI_CONTENT_TYPES, VALID_OPENAI_MESSAGE_TYPES };
@@ -9,14 +10,18 @@ export { VALID_OPENAI_CONTENT_TYPES, VALID_OPENAI_MESSAGE_TYPES };
 // Responses custom tools wrapped as functions must use the same wrapper here.
 function toChatToolSelector(choice, body) {
   if (!choice || typeof choice !== "object") return null;
-  let type = choice.type;
+  const type = choice.type;
   const name = choice.function?.name || choice.custom?.name || choice.name;
-  if (type === OPENAI_BLOCK.CUSTOM && body._customToolNames?.includes(name)) {
-    type = OPENAI_BLOCK.FUNCTION;
-  }
   if (type !== OPENAI_BLOCK.FUNCTION && type !== OPENAI_BLOCK.CUSTOM) return null;
-  if (!name || !body.tools?.some(tool => tool.type === type && tool[type]?.name === name)) return null;
-  return { type, [type]: { name } };
+  const matches = (body.tools || []).filter(tool => {
+    if (isCustomToolWrapper(tool)) return type === OPENAI_BLOCK.CUSTOM && tool.function?.name === name;
+    return tool.type === type && tool[type]?.name === name;
+  });
+  if (!name || matches.length !== 1) return null;
+  const targetType = matches[0].type;
+  // Two source declarations may collapse to the same Chat function name.
+  if (body.tools.filter(tool => tool.type === targetType && tool[targetType]?.name === name).length !== 1) return null;
+  return { type: targetType, [targetType]: { name } };
 }
 
 // Filter messages to OpenAI standard format

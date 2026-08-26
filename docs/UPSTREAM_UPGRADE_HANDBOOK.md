@@ -56,8 +56,11 @@ high-risk runtime seams have separate classifiers and must not be collapsed:
   `isModelCompatibilityError` advances to the next model without account cooldown
   or rotation. Other `400` responses stop. Exhausted combos select a coherent
   status/message pair, preferring the latest `429`/`5xx` failure if present;
-  thrown attempts count as `500`. Keep existing retry-after aggregation and
-  all-no-credentials handling; do not change account cooldown rules incidentally.
+  thrown attempts count as `500`. Read retry timing from actual HTTP headers as
+  well as legacy JSON metadata, and classify the app's real no-active-credentials
+  response. Confirmed cancellation is terminal: propagate the request signal,
+  do not advance accounts/models or cool a healthy account for `AbortError`/`499`.
+  Keep provider failures/timeouts and ordinary `400` controls distinct.
 - Codex Responses compatibility belongs at `open-sse/executors/codex.js`:
   developer instructions are hoisted, and only `content` is removed from
   `additional_tools` items. This is provider compatibility for the Codex OAuth
@@ -70,6 +73,90 @@ high-risk runtime seams have separate classifiers and must not be collapsed:
   removed forced selector must not enable unrelated functions: use `none` when
   other declarations remain. Preserve bare Claude client schemas even when their
   names match hosted aliases.
+
+The follow-up self-review repair is tracked by
+[#35](https://github.com/azox-ai/azox-9router/issues/35), with stable IDs
+`SR-01`–`SR-11` in the registry. Preserve these additional contracts:
+
+- Native Codex `allowed_tools` retains its mode and exact permitted identities;
+  malformed/unavailable selections return a typed compatibility error instead
+  of removing the restriction. Native function `strict`/`defer_loading` and
+  image-generation `action`/`input_image_mask` survive normalization.
+- Format conversion preserves disabled, required, forced and subset choices.
+  Keep real Claude hosted declarations distinct from client functions in the
+  intermediate representation, including the actual Claude input parser.
+- Responses domain filters map to compatible Claude domain fields. Claude
+  cannot express Responses cache-only web access or an explicit indexed-access
+  constraint; return `400 / unsupported_tool_constraint` rather than drop them.
+- Native Chat custom tools are supported only on the Chat target. All other
+  actual pipelines, including Responses, return the same typed compatibility
+  error until their response paths preserve native custom calls. Keep this guard
+  at both the central translator and the direct Responses converter: GitHub/Zed
+  can choose a Responses transport after the declared target was Chat. Preserve
+  already-native Responses passthrough and the separate Responses custom-wrapper
+  path; do not equate a correct request shape with a supported return path.
+- Handle typed compatibility errors at both translation and executor boundaries.
+  Combo may try another compatible target without account cooldown; never
+  convert these local request constraints into generic provider `502` errors.
+
+SR-01, SR-02 and SR-04 remain corrections to PR #24; other SR entries predate
+PR #34. Consult each entry's provenance rather than attributing every issue
+to customization. These are source contracts, not a live-provider acceptance
+claim. Keep upstream `v0.5.55` pinned until an actual reviewed upgrade.
+
+The next review round covers [#36](https://github.com/azox-ai/azox-9router/issues/36),
+[#38](https://github.com/azox-ai/azox-9router/issues/38),
+[#39](https://github.com/azox-ai/azox-9router/issues/39),
+[#40](https://github.com/azox-ai/azox-9router/issues/40), and
+[#41](https://github.com/azox-ai/azox-9router/issues/41). Keep these
+additional regression gates during upgrades:
+
+- Responses custom wrappers must survive actual Chat/Claude/Gemini JSON and
+  forced-SSE return paths, including Array/Set metadata and exact raw input.
+  Preserve ordinary function calls, IDs, text/thinking, usage and native payloads.
+  This does not remove SR-07's separate incoming native Chat custom guard.
+- Validate the upstream response before success or usage callbacks. Arbitrary
+  JSON, error envelopes, non-SSE bodies advertised as streaming, and truncated
+  streams are failures. Return `502 / invalid_upstream_response` before streaming
+  headers; after headers emit the client's safe protocol error. Preserve early
+  deltas/backpressure, valid empty/tool-only responses, legitimate token-limit
+  `response.incomplete`, and once-only cancellation/completion. Executors that
+  convert a transport into SSE must advertise its actual media type.
+  Recover authoritative terminal output when deltas were absent, without
+  duplicating already delivered output. Reject conflicting Responses tool
+  name/type/item/call identity before terminal recovery, and malformed Gemini
+  content/parts before forwarding, for native and translated clients alike.
+  A valid global semantic terminal ends
+  the stream promptly; cancel unused upstream bytes instead of waiting for
+  transport EOF. Do not promise inspection of unconsumed trailing bytes.
+  Keep explicitly requested native Responses background results and the narrow
+  Claude `max_tokens + content:null` to `content:[]` compatibility normalization.
+- At the final Codex boundary, retain representable Claude domain restrictions
+  and `parallel_tool_calls:false`. Reject constraints the Codex backend cannot
+  enforce, conflicting duplicate web-search declarations, and forced/required
+  tools removed by filtering. Keep the original declarations for compatible
+  combo fallback without account cooldown. The wider Responses API and the
+  Codex OAuth backend are distinct capability contracts.
+- Independent usage writes must remain distinct even with identical timestamps,
+  accounts and token counts. History, daily and lifetime counters stay atomic;
+  do not mutate caller entries or deduplicate recent views by coincidence.
+  The request lifecycle owns once-only recording. This patch does not migrate
+  the schema or reconstruct previously omitted historical usage.
+- The sql.js fallback must produce a real, reopenable lightweight backup before
+  migrations: include current in-memory critical rows/schema, exclude the large
+  `requestDetails` log, and do not mutate/export the entire source to obtain it.
+  Keep native-adapter backup behavior and the existing best-effort migration
+  policy. A helper must throw on a failed backup rather than return a false
+  success path. Verify file contents by reopening, not just pathname existence.
+
+The JSON/SSE gaps were reproduced on both `c9a1c3af` and `23feb40b`; they do not
+establish the live LiteLLM/Claude CLI incident cause. Issue #39 has mixed upstream
+and fork origins recorded per path. Issue #40 comes from upstream `0d216689`;
+the sql.js backup gap in #41 comes from upstream `b25e1016`.
+Carry the tests first and retire only patches proven redundant upstream.
+
+Protocol references: [Claude streaming event flow](https://platform.claude.com/docs/en/build-with-claude/streaming)
+and [Responses streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events).
 
 Community/upstream work maps to two distinct Codex Responses seams:
 `decolua/9router#2508` hoists instruction/system-prompt content into top-level
@@ -116,28 +203,45 @@ pre-fix fork SHA in another worktree. Use identical Node/Vitest versions, exclud
 `**/*.real.test.js`, disable live/E2E gates, and isolate both `DATA_DIR` and the
 process home/profile (usage storage does not fully honor `DATA_DIR`). Block
 external network calls; some upstream tests are ungated. Preserve both JSON
-reports and run `scripts/compare-test-results.mjs`; it compares both assertion
-and collection/suite-error identities, including failed hooks with passing tests.
+reports and run `scripts/compare-test-results.mjs`; it compares assertion,
+collection/suite and run-level error identities, including failed hooks with
+passing tests and global unhandled rejections.
 
 The reusable runner implements these safeguards without changing the upstream
 test files. Run from the candidate repository root, once per fresh output path:
 
 ```sh
-node scripts/offline-tests/run-offline.mjs /path/to/baseline tests/.task-tmp/baseline
-node scripts/offline-tests/run-offline.mjs . tests/.task-tmp/candidate
-node scripts/compare-test-results.mjs tests/.task-tmp/candidate/vitest.json tests/.task-tmp/baseline/vitest.json
+node scripts/offline-tests/run-offline.mjs /path/to/baseline ../9router-audit/baseline
+node scripts/offline-tests/run-offline.mjs . ../9router-audit/candidate
+node scripts/compare-test-results.mjs ../9router-audit/candidate/vitest.json ../9router-audit/baseline/vitest.json
 ```
 
 Install both worktrees' dependencies first. The runner uses the same base Vitest
 config, four fork workers and zero retries; records commands/SHAs/versions, JSON
 results, failure identities and blocked attempts; and refuses to overwrite a run.
+Keep `vitest.json`, `run.json` and `run-errors.json` together for each result.
+The custom reporter captures Vitest's `onTestRunEnd` error channel because the
+ordinary JSON reporter can report passing assertions even when an unhandled
+rejection makes the process exit nonzero. Missing, interrupted, incomplete or
+inconsistent evidence makes the comparator exit `2`, not report success; a new
+failure identity exits `1`. Re-run older baselines with the current collector
+instead of fabricating missing sidecars or relying only on JSON `success`.
+Vitest 4 can also log global teardown/resource-close errors after that reporter
+hook without changing its exit status. The reporter preserves the framework's
+structured `error during close` diagnostic as a lifecycle error and makes the
+run fail. The public `onProcessTimeout` hook marks leaked-handle shutdowns
+incomplete and nonzero, even if all assertions passed. This integration is
+version-sensitive: retain the real rejection, global-teardown and leaked-handle
+fixtures when upgrading Vitest; do not approve a collector from unit JSON
+fixtures alone. See the [reporter lifecycle](https://vitest.dev/guide/advanced/reporters.html).
 Only worker-owned ephemeral loopback fixtures can use the network. Provider and
 proxy environment variables are not inherited. Shell children are blocked;
 guarded Node, read-only Git, and bundled esbuild remain available. Ungated live
 tests can therefore fail offline; compare those identities rather than calling
 providers or suppressing failures. This process guard is not an OS firewall or
 a sandbox for hostile code; use it only with reviewed sources. Keep generated
-reports/profile/data under ignored task directories and out of Git.
+reports/profile/data outside both source worktrees and out of Git. Temporary
+probe test files must not enter the source tree's broad test-discovery glob.
 
 Windows SQLite teardown can transiently return `ENOTEMPTY` after closing the
 database. The migration-chain fixture retries only its temporary-directory
@@ -294,7 +398,8 @@ by OS, also run the same suite on an untouched worktree of the target tag and
 compare failure identities. Never add failures to an allowlist merely to make
 the candidate green.
 
-Write both runs with Vitest's JSON reporter, then compare them with:
+Write both runs using the current isolated runner above, then compare their
+JSON reports alongside the captured run-level evidence:
 
 ```bash
 node scripts/compare-test-results.mjs \

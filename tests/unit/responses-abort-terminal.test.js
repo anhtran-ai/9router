@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { createDisconnectAwareStream } from "../../open-sse/utils/streamHandler.js";
+import { createDisconnectAwareStream, createStreamController, pipeWithDisconnect } from "../../open-sse/utils/streamHandler.js";
 import { buildAbortedResponsesTerminalBytes } from "../../open-sse/utils/responsesStreamHelpers.js";
+import { createStreamContract } from "../../open-sse/utils/streamContract.js";
+import { FORMATS } from "../../open-sse/translator/formats.js";
 
 // Minimal stream controller stub
 function makeController() {
@@ -51,7 +53,7 @@ describe("Responses abort terminal synthesis", () => {
     expect(text).toContain("data: [DONE]");
   });
 
-  it("does not synthesize terminal for non-Responses streams (callback null)", async () => {
+  it("propagates a network failure when no client-format error callback exists", async () => {
     const upstream = new ReadableStream({
       start(controller) {
         controller.enqueue(new TextEncoder().encode("data: hi\n\n"));
@@ -65,8 +67,80 @@ describe("Responses abort terminal synthesis", () => {
       null
     );
 
-    const text = await readAll(out);
-    expect(text).not.toContain("response.failed");
-    expect(text).not.toContain("[DONE]");
+    await expect(readAll(out)).rejects.toThrow("socket hang up");
+  });
+});
+
+describe("client cancellation stream lifecycle", () => {
+  const log = { line: vi.fn(), errorLine: vi.fn() };
+
+  it("propagates a pre-aborted client signal immediately", () => {
+    const client = new AbortController(); client.abort();
+    const onDisconnect = vi.fn();
+    const controller = createStreamController({ signal: client.signal, onDisconnect, log });
+    expect(controller.signal.aborted).toBe(true);
+    expect(controller.isConnected()).toBe(false);
+    expect(onDisconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["handleComplete", "handleError", "handleDisconnect"])("removes its client listener on %s", (method) => {
+    vi.useFakeTimers();
+    try {
+      const client = new AbortController();
+      const add = vi.spyOn(client.signal, "addEventListener");
+      const remove = vi.spyOn(client.signal, "removeEventListener");
+      const controller = createStreamController({ signal: client.signal, log });
+      controller[method](new Error("fixture terminal"));
+      const listener = add.mock.calls.find(([event]) => event === "abort")?.[1];
+      expect(listener).toBeTypeOf("function");
+      expect(remove).toHaveBeenCalledWith("abort", listener);
+      vi.runAllTimers();
+    } finally { vi.useRealTimers(); vi.restoreAllMocks(); }
+  });
+
+  it("preserves the stream-stall watchdog without treating it as client cancellation", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new AbortController();
+      const onDisconnect = vi.fn(); const onError = vi.fn();
+      const controller = createStreamController({ signal: client.signal, onDisconnect, onError, log });
+      const upstream = new ReadableStream({ start(source) {
+        controller.signal.addEventListener("abort", () => source.error(new DOMException("fixture stall abort", "AbortError")), { once: true });
+      } });
+      const output = pipeWithDisconnect(new Response(upstream), new TransformStream(), controller, null, 10);
+      const read = output.getReader().read().then(result => ({ result }), error => ({ error }));
+      await vi.advanceTimersByTimeAsync(20);
+      expect(controller.signal.aborted).toBe(true);
+      expect(client.signal.aborted).toBe(false);
+      expect(onDisconnect).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "stream stall timeout" }));
+      expect((await read).error).toMatchObject({ message: "stream stall timeout" });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps raw upstream heartbeats alive while validation emits no semantic output", async () => {
+    vi.useFakeTimers();
+    const onError = vi.fn();
+    const controller = createStreamController({ onError, log });
+    let source;
+    const upstream = new ReadableStream({ start(value) { source = value; } });
+    const output = pipeWithDisconnect(new Response(upstream), createStreamContract(FORMATS.OPENAI), controller, null, 10);
+    const reader = output.getReader();
+    const first = reader.read();
+    try {
+      for (let i = 0; i < 5; i++) {
+        source.enqueue(new TextEncoder().encode(": heartbeat\n\n"));
+        await vi.advanceTimersByTimeAsync(8);
+      }
+      expect(onError).not.toHaveBeenCalled();
+      expect(controller.signal.aborted).toBe(false);
+      source.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'));
+      source.close();
+      expect((await first).done).toBe(false);
+      reader.releaseLock();
+      await readAll(output);
+      expect(onError).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { controller.abort(); await reader.cancel().catch(() => {}); vi.useRealTimers(); }
   });
 });

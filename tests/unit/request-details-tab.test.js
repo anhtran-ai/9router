@@ -13,7 +13,8 @@ let adapter;
 
 async function saveDetail(detail) {
   await db.saveRequestDetail(detail);
-  await new Promise((r) => setTimeout(r, 120));
+  // saveRequestDetail queues its batch; wait for the actual persisted record.
+  await expect.poll(() => db.getRequestDetailById(detail.id), { interval: 10, timeout: 2000 }).toBeTruthy();
 }
 
 beforeAll(async () => {
@@ -22,13 +23,14 @@ beforeAll(async () => {
   vi.resetModules();
   db = await import("@/lib/db/index.js");
   await db.initDb();
-  await db.updateSettings({ enableObservability2: true, observabilityBatchSize: 1 });
+  await db.updateSettings({ enableObservability: true, observabilityBatchSize: 1 });
 
   const { getAdapter } = await import("@/lib/db/driver.js");
   adapter = await getAdapter();
 });
 
 afterAll(() => {
+  adapter?.close();
   if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
@@ -128,23 +130,99 @@ describe("backupDbLite — excludes requestDetails, keeps critical data", () => 
     const { backupDbLite } = await import("@/lib/db/backup.js");
     await saveDetail({ id: "bk-1", provider: "openai", model: "m", status: "ok", tokens: {}, request: {}, response: {} });
 
-    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-bklite-"));
+    const backupDir = fs.mkdtempSync(path.join(tempDir, "bklite-"));
     const dest = backupDbLite(adapter, backupDir);
     expect(fs.existsSync(dest)).toBe(true);
 
-    // Open backup and assert requestDetails is empty, settings present
-    const Database = (await import("better-sqlite3")).default;
-    const bak = new Database(dest);
+    // Reopen the actual file with the always-available reader, not a native dep.
+    const { createSqlJsAdapter } = await import("@/lib/db/adapters/sqljsAdapter.js");
+    const bak = await createSqlJsAdapter(dest);
     try {
       // requestDetails is fully excluded — table must not exist in the backup
-      const rdTable = bak.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='requestDetails'").get();
+      const rdTable = bak.get("SELECT name FROM sqlite_master WHERE type='table' AND name='requestDetails'");
       expect(rdTable).toBeUndefined();
       // Critical data preserved
-      const st = bak.prepare("SELECT COUNT(*) c FROM settings").get();
+      const st = bak.get("SELECT COUNT(*) c FROM settings");
       expect(st.c).toBeGreaterThanOrEqual(1);
+      expect(bak.get("SELECT data FROM settings WHERE id = 1")).toEqual(adapter.get("SELECT data FROM settings WHERE id = 1"));
     } finally {
       bak.close();
       fs.rmSync(backupDir, { recursive: true, force: true });
+    }
+  });
+
+  it("SQL.js backs up unflushed critical rows without reading or copying the excluded log", async () => {
+    const { backupDbLite } = await import("@/lib/db/backup.js");
+    const { createSqlJsAdapter } = await import("@/lib/db/adapters/sqljsAdapter.js");
+    const sourcePath = path.join(tempDir, "unflushed-source.sqlite");
+    const source = await createSqlJsAdapter(sourcePath);
+    const backupDir = fs.mkdtempSync(path.join(tempDir, "unflushed-backup-"));
+    const excludedMarker = "excluded-observability-fixture-";
+    const excludedData = excludedMarker.repeat(65536);
+    let bak;
+    let sourceExport;
+    let sourcePrepare;
+    try {
+      source.exec('CREATE TABLE settings(id INTEGER PRIMARY KEY, data TEXT NOT NULL)');
+      source.exec('CREATE TABLE requestDetails(id TEXT PRIMARY KEY, data TEXT NOT NULL)');
+      source.exec('CREATE TABLE criticalValues(id INTEGER PRIMARY KEY, optional TEXT, ratio REAL, payload BLOB, exact_value)');
+      source.run('INSERT INTO settings VALUES(1, ?)', ['{"fixture":"unflushed"}']);
+      source.run('INSERT INTO requestDetails VALUES(?, ?)', ["excluded", excludedData]);
+      source.exec('INSERT INTO criticalValues VALUES(1, NULL, 1.25, x\'0001ff\', 9007199254740993)');
+      expect(fs.existsSync(sourcePath)).toBe(false);
+
+      // Exporting/cloning main would copy the large excluded table and reset
+      // source pragmas/statements. The backup must read only included tables.
+      sourceExport = vi.spyOn(source.raw, "export").mockImplementation(() => {
+        throw new Error("The backup must not export the source database");
+      });
+      sourcePrepare = vi.spyOn(source.raw, "prepare");
+      const dest = backupDbLite(source, backupDir, "critical.sqlite");
+      const backupQueries = sourcePrepare.mock.calls.map(([sql]) => sql);
+      expect(backupQueries.some((sql) => /SELECT[\s\S]*FROM\s+(?:main\.)?["`\[]?requestDetails/i.test(sql))).toBe(false);
+      expect(sourceExport).not.toHaveBeenCalled();
+      expect(fs.existsSync(sourcePath)).toBe(false);
+      expect(source.get('SELECT data FROM settings WHERE id = 1')).toEqual({ data: '{"fixture":"unflushed"}' });
+      expect(source.get('SELECT length(data) AS size FROM requestDetails WHERE id = ?', ["excluded"])).toEqual({ size: excludedData.length });
+      expect(source.get('PRAGMA foreign_keys')).toEqual({ foreign_keys: 1 });
+      expect(fs.existsSync(dest)).toBe(true);
+      const bytes = fs.readFileSync(dest);
+      expect(bytes.length).toBeLessThan(excludedData.length / 4);
+      expect(bytes.includes(Buffer.from(excludedMarker))).toBe(false);
+      sourcePrepare.mockRestore();
+      sourceExport.mockRestore();
+
+      bak = await createSqlJsAdapter(dest);
+      expect(bak.get('PRAGMA integrity_check')).toEqual({ integrity_check: "ok" });
+      expect(bak.get('SELECT data FROM settings WHERE id = 1')).toEqual({ data: '{"fixture":"unflushed"}' });
+      expect(bak.get("SELECT name FROM sqlite_master WHERE name = 'requestDetails'")).toBeUndefined();
+      expect(bak.get('SELECT id, optional, ratio, hex(payload) AS payload, typeof(exact_value) AS value_type, CAST(exact_value AS TEXT) AS exact_value FROM criticalValues')).toEqual({
+        id: 1, optional: null, ratio: 1.25, payload: "0001FF", value_type: "integer", exact_value: "9007199254740993",
+      });
+    } finally {
+      sourcePrepare?.mockRestore();
+      sourceExport?.mockRestore();
+      bak?.close();
+      source.close();
+    }
+  });
+
+  it("SQL.js propagates a failed filesystem backup and leaves the source usable", async () => {
+    const { backupDbLite } = await import("@/lib/db/backup.js");
+    const { createSqlJsAdapter } = await import("@/lib/db/adapters/sqljsAdapter.js");
+    const source = await createSqlJsAdapter(path.join(tempDir, "failed-backup-source.sqlite"));
+    const blockedDir = path.join(tempDir, "not-a-directory");
+    fs.writeFileSync(blockedDir, "keep this fixture");
+    try {
+      source.exec('CREATE TABLE settings(id INTEGER PRIMARY KEY, data TEXT NOT NULL)');
+      source.run('INSERT INTO settings VALUES(1, ?)', ["keep this row"]);
+      expect(() => backupDbLite(source, blockedDir)).toThrow();
+      expect(fs.readFileSync(blockedDir, "utf8")).toBe("keep this fixture");
+      expect(source.get('SELECT data FROM settings WHERE id = 1')).toEqual({ data: "keep this row" });
+      source.run('UPDATE settings SET data = ? WHERE id = 1', ["still writable"]);
+      expect(source.get('SELECT data FROM settings WHERE id = 1')).toEqual({ data: "still writable" });
+    } finally {
+      source.close();
     }
   });
 });

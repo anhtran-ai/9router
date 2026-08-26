@@ -7,7 +7,8 @@ import {
   formatRetryAfter,
   isModelCompatibilityError,
 } from "./accountFallback.js";
-import { unavailableResponse } from "../utils/error.js";
+import { errorResponse, unavailableResponse } from "../utils/error.js";
+import { isAbortError, throwIfAborted, waitWithSignal } from "../utils/abort.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
@@ -270,6 +271,21 @@ export function getComboModelsFromData(modelStr, combosData) {
   return null;
 }
 
+// HTTP Retry-After supports delay-seconds or dates; the legacy JSON field is a
+// timestamp. Reject malformed/overflow dates before they enter the minimum.
+function parseRetryDeadline(value, receivedAt, allowDelaySeconds = false) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const text = value.trim();
+  let deadline;
+  if (allowDelaySeconds && /^\d+$/.test(text)) {
+    deadline = receivedAt + Number(text) * 1000;
+  } else {
+    if (!Number.isNaN(Number(text))) return null;
+    deadline = Date.parse(text);
+  }
+  return Number.isFinite(new Date(deadline).getTime()) ? deadline : null;
+}
+
 /**
  * Handle combo chat with fallback
  * @param {Object} options
@@ -280,9 +296,11 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {string} [options.comboName] - Name of the combo (for round-robin tracking)
  * @param {string} [options.comboStrategy] - Strategy: "fallback" or "round-robin"
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
+ * @param {AbortSignal} [options.signal] - Client cancellation signal
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, signal }) {
+  if (signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
@@ -301,13 +319,20 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   let lastFailure = null;
   let retryableFailure = null;
   let earliestRetryAfter = null;
+  let allCredentialsUnavailable = rotatedModels.length > 0;
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {
+      throwIfAborted(signal);
       const result = await handleSingleModel(body, modelStr);
+      if (signal?.aborted) {
+        result.body?.cancel().catch(() => {});
+        return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
+      if (result.status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) return result;
       
       // Success (2xx) - return response
       if (result.ok) {
@@ -317,17 +342,21 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
 
       // Extract error info from response
       let errorText = result.statusText || "";
-      let retryAfter = null;
+      let errorCode = null;
+      const receivedAt = Date.now();
+      let retryAfter = parseRetryDeadline(result.headers?.get?.("Retry-After"), receivedAt, true);
       try {
         const errorBody = await result.clone().json();
         errorText = errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
-        retryAfter = errorBody?.retryAfter || null;
+        if (typeof errorBody?.error?.code === "string") errorCode = errorBody.error.code;
+        const jsonRetryAfter = parseRetryDeadline(errorBody?.retryAfter, receivedAt);
+        if (jsonRetryAfter !== null && (retryAfter === null || jsonRetryAfter < retryAfter)) retryAfter = jsonRetryAfter;
       } catch {
         // Ignore JSON parse errors
       }
 
       // Track earliest retryAfter across all combo models
-      if (retryAfter && (!earliestRetryAfter || new Date(retryAfter) < new Date(earliestRetryAfter))) {
+      if (retryAfter !== null && (earliestRetryAfter === null || retryAfter < earliestRetryAfter)) {
         earliestRetryAfter = retryAfter;
       }
 
@@ -335,6 +364,9 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       if (typeof errorText !== "string") {
         try { errorText = JSON.stringify(errorText); } catch { errorText = String(errorText); }
       }
+      allCredentialsUnavailable &&= result.status === HTTP_STATUS.NOT_FOUND
+        && /^no (?:active )?credentials for provider(?::|\s)/i.test(errorText.trim());
+      throwIfAborted(signal);
 
       // Check if should fallback to next model
       const isCompatibilityError = isModelCompatibilityError(result.status, errorText);
@@ -356,16 +388,18 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       if (cooldownMs && cooldownMs > 0 && cooldownMs <= 5000 &&
           (result.status === 503 || result.status === 502 || result.status === 504)) {
         log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${cooldownMs}ms before next`);
-        await new Promise(r => setTimeout(r, cooldownMs));
+        await waitWithSignal(cooldownMs, signal);
       }
 
       // Fallback to next model
-      lastFailure = { status: result.status, message: errorText || String(result.status) };
+      lastFailure = { status: result.status, message: errorText || String(result.status), ...(errorCode ? { code: errorCode } : {}) };
       if (result.status === HTTP_STATUS.RATE_LIMITED || result.status >= HTTP_STATUS.SERVER_ERROR) {
         retryableFailure = lastFailure;
       }
       log.warn("COMBO", `Model ${modelStr} failed, trying next`, { status: result.status });
     } catch (error) {
+      if (isAbortError(error, signal)) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      allCredentialsUnavailable = false;
       // Catch unexpected exceptions to ensure fallback continues
       lastFailure = { status: HTTP_STATUS.SERVER_ERROR, message: String(error?.message || error) };
       retryableFailure = lastFailure;
@@ -380,19 +414,19 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   // Keep status/message from the same attempt. A temporarily unavailable route
   // remains retryable even if another model rejects this request's tools.
   const failure = retryableFailure || lastFailure;
-  const allDisabled = failure?.message.toLowerCase().includes("no credentials");
-  const status = allDisabled ? HTTP_STATUS.SERVICE_UNAVAILABLE : (failure?.status || HTTP_STATUS.SERVICE_UNAVAILABLE);
+  const status = allCredentialsUnavailable ? HTTP_STATUS.SERVICE_UNAVAILABLE : (failure?.status || HTTP_STATUS.SERVICE_UNAVAILABLE);
   const msg = failure?.message || "All combo models unavailable";
 
-  if (earliestRetryAfter) {
-    const retryHuman = formatRetryAfter(earliestRetryAfter);
+  if (earliestRetryAfter !== null) {
+    const retryAt = new Date(earliestRetryAfter).toISOString();
+    const retryHuman = formatRetryAfter(retryAt);
     log.warn("COMBO", `All models failed | ${msg} (${retryHuman})`);
-    return unavailableResponse(status, msg, earliestRetryAfter, retryHuman);
+    return unavailableResponse(status, msg, retryAt, retryHuman);
   }
 
   log.warn("COMBO", `All models failed | ${msg}`);
   return new Response(
-    JSON.stringify({ error: { message: msg } }),
+    JSON.stringify({ error: { message: msg, ...(!allCredentialsUnavailable && failure?.code ? { code: failure.code } : {}) } }),
     { status, headers: { "Content-Type": "application/json" } }
   );
 }
@@ -560,7 +594,8 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs })
  * @param {Object} [options.tuning] - Override FUSION_DEFAULTS (minPanel, grace, timeout)
  * @returns {Promise<Response>}
  */
-export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning }) {
+export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning, signal }) {
+  if (signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
   const panel = Array.isArray(models) ? models.filter(Boolean) : [];
   if (panel.length === 0) {
     return new Response(
@@ -596,6 +631,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   const t0 = Date.now();
   const calls = panel.map((m) => withTimeout(handleSingleModel(panelBody, m, true), cfg.panelHardTimeoutMs));
   const settled = await collectPanel(calls, { ...cfg, minPanel });
+  if (signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
   log.info("FUSION", `fan-out collected in ${Date.now() - t0}ms`);
 
   // 2. Collect successful answers.
@@ -622,6 +658,7 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   }
 
   // 3. Degrade gracefully when the panel is too thin to fuse.
+  if (signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
   if (answers.length === 0) {
     log.warn("FUSION", "All panel models failed");
     return new Response(

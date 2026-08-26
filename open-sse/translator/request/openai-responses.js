@@ -9,6 +9,7 @@ import { FORMATS } from "../formats.js";
 import { normalizeResponsesInput } from "../formats/responsesApi.js";
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
 import { isHostedTool } from "../concerns/hostedToolPolicy.js";
+import { markCustomToolWrapper, rejectNativeCustomTools, translateToolChoice } from "../concerns/toolChoice.js";
 
 // Responses API enforces max 64 chars on call_id (#393)
 const MAX_CALL_ID_LEN = 64;
@@ -194,7 +195,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         if (tool.type === "custom") {
           customToolNames.add(name);
           const formatHint = [tool.format?.syntax, tool.format?.definition].filter(Boolean).join("\n");
-          return {
+          return markCustomToolWrapper({
             type: OPENAI_BLOCK.FUNCTION,
             function: {
               name,
@@ -211,7 +212,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
                 additionalProperties: false
               }
             }
-          };
+          });
         }
         // Responses API function tool: { type: "function", name, description, parameters }
         // Only convert when a non-empty name is present; skip hosted tools without one.
@@ -302,6 +303,10 @@ function buildReasoningInputItem(msg) {
 export function openaiToOpenAIResponsesRequest(model, body, stream, credentials) {
   // Body already in Responses API format (e.g. Cursor CLI calling /chat/completions with input[])
   if (body.input) return { ...body, model, stream: true };
+
+  // Executors can call this directly after Chat-to-Chat translation. Their
+  // Responses return paths cannot preserve native Chat custom-call semantics.
+  rejectNativeCustomTools(body);
 
   const result = {
     model,
@@ -400,20 +405,30 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
   }
 
   // Convert tools format
+  const toolBindings = [];
   if (body.tools && Array.isArray(body.tools)) {
     result.tools = body.tools.map(tool => {
+      let target;
       if (tool.type === OPENAI_BLOCK.FUNCTION) {
-        return {
+        const fn = tool.function || tool;
+        target = {
           type: OPENAI_BLOCK.FUNCTION,
-          name: tool.function.name,
-          description: String(tool.function.description || ""),
-          parameters: normalizeToolParameters(tool.function.parameters),
-          strict: tool.function.strict
+          name: fn.name,
+          description: String(fn.description || ""),
+          parameters: normalizeToolParameters(fn.parameters),
+          strict: fn.strict
         };
+      } else {
+        target = tool;
       }
-      return tool;
+      toolBindings.push({ source: tool, target });
+      return target;
     });
   }
+  if (body.tool_choice !== undefined) {
+    result.tool_choice = translateToolChoice(body.tool_choice, toolBindings, "responses").choice;
+  }
+  if (body.parallel_tool_calls !== undefined) result.parallel_tool_calls = body.parallel_tool_calls;
 
   // Pass through other relevant fields
   if (body.temperature !== undefined) result.temperature = body.temperature;

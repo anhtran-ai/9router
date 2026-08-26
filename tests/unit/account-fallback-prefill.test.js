@@ -39,6 +39,13 @@ beforeEach(() => {
 });
 
 describe("assistant prefill error classification", () => {
+  it("never cools an aborted request, even with stale reset metadata", async () => {
+    expect(checkFallbackError(499, "Request aborted")).toEqual({ shouldFallback: false, cooldownMs: 0 });
+    await expect(markAccountUnavailable("claude-a", 499, "Request aborted", "claude", "claude-opus-4-6", Date.now() + 60_000))
+      .resolves.toEqual({ shouldFallback: false, cooldownMs: 0 });
+    expect(dbMocks.updateProviderConnection).not.toHaveBeenCalled();
+  });
+
   it("does not fallback or cooldown for Claude request-shape errors", () => {
     expect(checkFallbackError(400, PREFILL_ERROR, 2)).toEqual({
       shouldFallback: false,
