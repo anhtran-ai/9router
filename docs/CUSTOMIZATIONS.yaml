@@ -16,11 +16,11 @@
   },
   "inventory_path": "docs/FORK_DIFF_INVENTORY.md",
   "counts": {
-    "additive_total": 57,
-    "modified_total": 77,
-    "modified_runtime": 45,
+    "additive_total": 64,
+    "modified_total": 96,
+    "modified_runtime": 56,
     "modified_runtime_target_approx": 10,
-    "target_note": "45 modified runtime seams exceed the approximate target of ten. Issues #35–#43 cover protocol selection, final-client response validation, cancellation, atomic usage, migration backup, and v0.5.69 integration stability. Keep additive policy helpers shared; retire each seam only when equivalent upstream behavior passes its linked regression gates."
+    "target_note": "56 modified runtime seams exceed the approximate target of ten. Issues #35–#43 cover protocol selection, final-client response validation, cancellation, atomic usage, migration backup, and v0.5.69 integration/security stability. Keep additive policy helpers shared; retire each seam only when equivalent upstream behavior passes its linked regression gates."
   },
   "runtime_policies": {
     "claude_assistant_prefill": {
@@ -489,33 +489,74 @@
     },
     {
       "issue": "https://github.com/azox-ai/azox-9router/issues/43",
-      "provenance": "The v0.5.69 integration audit found inherited upstream translator/CommandCode gaps plus cancellation and session-forwarding overlap risks; verification-harness fixes prevent false-green coverage.",
-      "preserve": "Replay unread CommandCode lines, stop cancelled Antigravity quota mutation/fallback, keep session-scoped Gemini signatures, reject post-clamp tool collisions, preserve OpenAI reasoning and sanitized one-chunk Claude tool input, and make golden/SAML stability gates fail visibly.",
+      "provenance": "The history-preserving v0.5.69 merge into fork base 9754c491 exposed inherited upstream translator/CommandCode gaps and overlap regressions at downstream routing/security seams; post-merge review added deterministic guards for SSRF, cancellation, concurrency, GitLab OAuth origin binding, and diagnostic redaction.",
+      "preserve": "Replay unread CommandCode lines; preserve valid Claude server tools, ordered developer instructions, session-scoped Gemini signatures, unique Responses item/tool identities, reasoning and sanitized tool input; pin public DNS through redirects and close bodies/agents; bind contributor GitLab OAuth to approved origins; redact request metadata; propagate cancellation through project discovery, credentials and Fusion; and order Antigravity success/failure DB mutations so stale work cannot cool, reroute, or unlock newer state.",
       "boundaries": [
         "open-sse/executors/commandcode.js",
+        "open-sse/handlers/chatCore.js",
+        "open-sse/handlers/search/callers.js",
+        "open-sse/handlers/search/index.js",
+        "open-sse/services/combo.js",
+        "open-sse/services/projectId.js",
+        "open-sse/services/thoughtSignatureStore.js",
+        "open-sse/translator/concerns/assistantPrefillPolicy.js",
+        "open-sse/translator/concerns/image.js",
         "open-sse/translator/concerns/toolChoice.js",
+        "open-sse/translator/formats/responsesApi.js",
         "open-sse/translator/request/openai-responses.js",
         "open-sse/translator/request/openai-to-claude.js",
         "open-sse/translator/request/openai-to-gemini.js",
         "open-sse/translator/request/openai-to-kiro.js",
+        "open-sse/translator/response/openai-responses.js",
         "open-sse/translator/response/openai-to-claude.js",
+        "open-sse/utils/requestLogger.js",
+        "src/app/api/cli-tools/cowork-mcp-tools/route.js",
+        "src/app/api/contribute/oauth/[provider]/[action]/route.js",
+        "src/app/api/contributor-admin/invites/route.js",
+        "src/app/api/provider-nodes/validate/route.js",
+        "src/lib/contributor/store.js",
+        "src/lib/db/repos/connectionsRepo.js",
+        "src/shared/utils/ssrfGuard.js",
         "src/sse/handlers/chat.js",
-        "src/sse/services/antigravityQuota.js"
+        "src/sse/services/antigravityQuota.js",
+        "src/sse/services/auth.js"
       ],
       "tests": [
         "tests/auth/saml.test.js",
         "tests/translator/assistant-prefill-policy.test.js",
         "tests/translator/bugs-antigravity.test.js",
+        "tests/translator/bugs-toClaude-context.test.js",
         "tests/translator/claude-kiro-direct.test.js",
         "tests/translator/golden-request.test.js",
         "tests/translator/golden-url-header.test.js",
         "tests/unit/antigravity-quota-routing.test.js",
+        "tests/unit/codex-image-fetch.test.js",
+        "tests/unit/combo-fusion.test.js",
+        "tests/unit/combo-routing.test.js",
         "tests/unit/commandcode-to-openai.test.js",
+        "tests/unit/connection-update-cancellation.test.js",
+        "tests/unit/contributor-gitlab-oauth-ssrf.test.js",
+        "tests/unit/contributor-oauth-guard.test.js",
+        "tests/unit/contributor-store.test.js",
+        "tests/unit/cowork-mcp-ssrf-guard.test.js",
+        "tests/unit/customization-boundary.test.js",
+        "tests/unit/gitlab-oauth-origin-policy.test.js",
+        "tests/unit/image-fetch-hardening.test.js",
         "tests/unit/openai-responses-custom-tools.test.js",
+        "tests/unit/openai-to-claude-response-tools.test.js",
         "tests/unit/openai-to-claude.test.js",
         "tests/unit/openai-to-kiro.test.js",
         "tests/unit/opencode-go-session.test.js",
-        "tests/unit/streaming-response-contract.test.js"
+        "tests/unit/project-id-cancellation.test.js",
+        "tests/unit/provider-node-ssrf-guard.test.js",
+        "tests/unit/request-logger-redaction.test.js",
+        "tests/unit/responses-parallel-tool-calls.test.js",
+        "tests/unit/search-ssrf-guard.test.js",
+        "tests/unit/ssrf-agent-lifecycle.test.js",
+        "tests/unit/ssrf-guard-hardening.test.js",
+        "tests/unit/streaming-response-contract.test.js",
+        "tests/unit/upstream-v0555-preservation.test.js",
+        "tests/unit/xquik-search-provider.test.js"
       ],
       "upgrade_action": "drop-if-upstream"
     }
@@ -707,6 +748,14 @@
         "reason": "Combo transfer regression coverage."
       },
       {
+        "path": "tests/unit/connection-update-cancellation.test.js",
+        "reason": "Abort and ordering regression coverage at the connection-update transaction boundary (#43)."
+      },
+      {
+        "path": "tests/unit/contributor-gitlab-oauth-ssrf.test.js",
+        "reason": "Contributor GitLab OAuth rejects unapproved/private origins and redirect rebinding (#43)."
+      },
+      {
         "path": "tests/unit/contributor-oauth-guard.test.js",
         "reason": "Contributor OAuth guard coverage."
       },
@@ -723,6 +772,10 @@
         "reason": "Boundary guard positive and negative coverage."
       },
       {
+        "path": "tests/unit/gitlab-oauth-origin-policy.test.js",
+        "reason": "Invite-scoped and administrator-approved GitLab origin policy coverage (#43)."
+      },
+      {
         "path": "tests/unit/hosted-tool-policy.test.js",
         "reason": "Hosted tool alias and rendering coverage."
       },
@@ -737,6 +790,22 @@
       {
         "path": "tests/unit/offline-test-runner.test.js",
         "reason": "Negative guard probes and actual Vitest rejection/teardown/timeout cases prevent false no-regression results."
+      },
+      {
+        "path": "tests/unit/project-id-cancellation.test.js",
+        "reason": "Coalesced project discovery cancellation, hard deadline, and stale-cache prevention coverage (#43)."
+      },
+      {
+        "path": "tests/unit/provider-node-ssrf-guard.test.js",
+        "reason": "Provider-node validation public-network and redirect guard coverage (#43)."
+      },
+      {
+        "path": "tests/unit/request-logger-redaction.test.js",
+        "reason": "Header, URL, query, userinfo, and malformed-request redaction coverage (#43)."
+      },
+      {
+        "path": "tests/unit/ssrf-agent-lifecycle.test.js",
+        "reason": "Pinned dispatcher, redirect header stripping, body cancellation, and agent lifecycle coverage (#43)."
       },
       {
         "path": "tests/unit/streaming-response-contract.test.js",
@@ -818,6 +887,16 @@
         "reason": "Map typed Responses collector failures to 502 at its standalone caller (#38)."
       },
       {
+        "path": "open-sse/handlers/search/callers.js",
+        "category": "runtime",
+        "reason": "Use the pinned public-fetch guard for remote search providers and cancel error bodies (#43)."
+      },
+      {
+        "path": "open-sse/handlers/search/index.js",
+        "category": "runtime",
+        "reason": "Reject credentialed search requests to unapproved custom origins and retain stored admin configuration (#43)."
+      },
+      {
         "path": "open-sse/services/accountFallback.js",
         "category": "runtime",
         "reason": "Classify exact compatibility errors without account cooldown and make client cancellation terminal (#35)."
@@ -826,6 +905,16 @@
         "path": "open-sse/services/combo.js",
         "category": "runtime",
         "reason": "Keep coherent model fallback, actual Retry-After metadata and true credential-exhaustion status; stop model/panel progression on cancellation (#35)."
+      },
+      {
+        "path": "open-sse/services/projectId.js",
+        "category": "runtime",
+        "reason": "Bound project discovery, share in-flight work safely, propagate caller cancellation, and prevent stale cache resurrection (#43)."
+      },
+      {
+        "path": "open-sse/services/thoughtSignatureStore.js",
+        "category": "runtime",
+        "reason": "Scope Gemini thought signatures by provider session in memory and SQLite without cross-session fallback (#43)."
       },
       {
         "path": "open-sse/services/tokenRefresh.js",
@@ -838,6 +927,11 @@
         "reason": "Retain authoritative Responses terminal metadata/output and distinguish incomplete from truncation (#36, #38)."
       },
       {
+        "path": "open-sse/translator/concerns/image.js",
+        "category": "runtime",
+        "reason": "Reuse canonical public-address validation with combined cancellation/timeout and deterministic body/agent cleanup (#43)."
+      },
+      {
         "path": "open-sse/translator/formats/claude.js",
         "category": "runtime",
         "reason": "Apply Claude-target prefill policy and reject forced/required tools removed by final provider filtering (#35)."
@@ -846,6 +940,11 @@
         "path": "open-sse/translator/formats/openai.js",
         "category": "runtime",
         "reason": "Remove hosted declarations at the final Chat boundary and synchronize retained function/custom tool selectors (#31)."
+      },
+      {
+        "path": "open-sse/translator/formats/responsesApi.js",
+        "category": "runtime",
+        "reason": "Emit unique monotonic Responses output indices across reasoning, messages, and tools (#43)."
       },
       {
         "path": "open-sse/translator/index.js",
@@ -913,6 +1012,11 @@
         "reason": "Preserve typed compatibility codes and avoid duplicating retry text (#35)."
       },
       {
+        "path": "open-sse/utils/requestLogger.js",
+        "category": "runtime",
+        "reason": "Redact sensitive headers, URL userinfo/query values, and malformed request metadata before logging (#43)."
+      },
+      {
         "path": "open-sse/utils/responsesStreamHelpers.js",
         "category": "runtime",
         "reason": "Preserve terminal usage in converted Responses streams (#38)."
@@ -931,6 +1035,16 @@
         "path": "open-sse/utils/usageTracking.js",
         "category": "runtime",
         "reason": "Extract usage from legitimate response.incomplete terminals (#38)."
+      },
+      {
+        "path": "src/app/api/cli-tools/cowork-mcp-tools/route.js",
+        "category": "runtime",
+        "reason": "Guard remote Cowork MCP fetches with DNS pinning while retaining reviewed local administration paths (#43)."
+      },
+      {
+        "path": "src/app/api/provider-nodes/validate/route.js",
+        "category": "runtime",
+        "reason": "Guard remote provider-node validation redirects/DNS while retaining reviewed self-hosted administration paths (#43)."
       },
       {
         "path": "src/dashboardGuard.js",
@@ -958,6 +1072,11 @@
         "reason": "Add combo import/export persistence operations."
       },
       {
+        "path": "src/lib/db/repos/connectionsRepo.js",
+        "category": "runtime",
+        "reason": "Recheck cancellation and causal predicates immediately before synchronous connection-update transactions (#43)."
+      },
+      {
         "path": "src/lib/db/repos/usageRepo.js",
         "category": "runtime",
         "reason": "Count independent concurrent usage events without timestamp/token coincidence deduplication; preserve atomic writes and caller input (#40)."
@@ -981,6 +1100,11 @@
         "path": "src/shared/components/Sidebar.js",
         "category": "runtime",
         "reason": "Small generic hook into additive navigation registry; exception above approximate runtime target."
+      },
+      {
+        "path": "src/shared/utils/ssrfGuard.js",
+        "category": "runtime",
+        "reason": "Fail closed on DNS, block non-global IPv4/IPv6 forms, pin dispatch, strip cross-origin secrets, and close bodies/agents (#43)."
       },
       {
         "path": "src/sse/handlers/chat.js",
@@ -1053,6 +1177,11 @@
         "reason": "Cover target-format assistant-prefill policy while retaining upstream Fable 5.1 and GPT-6 Astra capability expectations."
       },
       {
+        "path": "tests/unit/codex-image-fetch.test.js",
+        "category": "tests",
+        "reason": "Verify Codex image fetching uses the canonical SSRF and lifecycle guard (#43)."
+      },
+      {
         "path": "tests/unit/codex-tool-normalization.test.js",
         "category": "tests",
         "reason": "Cover Codex CLI Responses passthrough normalization, strict unsupported-content handling, and hosted tool rewrites."
@@ -1071,6 +1200,11 @@
         "path": "tests/unit/commandcode-to-openai.test.js",
         "category": "tests",
         "reason": "Check the executor converted body and advertised streaming content type agree (#38)."
+      },
+      {
+        "path": "tests/unit/cowork-mcp-ssrf-guard.test.js",
+        "category": "tests",
+        "reason": "Verify Cowork MCP remote requests cannot bypass public-origin validation (#43)."
       },
       {
         "path": "tests/unit/db-concurrent.test.js",
@@ -1093,6 +1227,11 @@
         "reason": "Verify the configured Headroom timeout reaches the compression boundary after the upstream settings change (#43)."
       },
       {
+        "path": "tests/unit/image-fetch-hardening.test.js",
+        "category": "tests",
+        "reason": "Cover image DNS pinning, abort/timeout composition, and cleanup (#43)."
+      },
+      {
         "path": "tests/unit/kiro-nonstream-error.test.js",
         "category": "tests",
         "reason": "Verify invalid upstream SSE returns a safe public error while retaining internal parser diagnostics (#38)."
@@ -1111,6 +1250,11 @@
         "path": "tests/unit/openai-responses-nonstream.test.js",
         "category": "tests",
         "reason": "Actual core JSON/forced-SSE response contracts, custom calls, invalid envelopes and terminal collector controls (#36, #38)."
+      },
+      {
+        "path": "tests/unit/openai-to-claude-response-tools.test.js",
+        "category": "tests",
+        "reason": "Cover reasoning-to-thinking conversion and split tool-name/id stream assembly (#43)."
       },
       {
         "path": "tests/unit/openai-to-claude.test.js",
@@ -1136,6 +1280,26 @@
         "path": "tests/unit/responses-abort-terminal.test.js",
         "category": "tests",
         "reason": "Verify actual abort propagation, completion listener cleanup and existing Responses terminal stream behavior (#35)."
+      },
+      {
+        "path": "tests/unit/responses-parallel-tool-calls.test.js",
+        "category": "tests",
+        "reason": "Cover collision-resistant bounded Responses tool IDs and unique output indices (#43)."
+      },
+      {
+        "path": "tests/unit/search-ssrf-guard.test.js",
+        "category": "tests",
+        "reason": "Cover authenticated search origin policy and guarded dispatch (#43)."
+      },
+      {
+        "path": "tests/unit/ssrf-guard-hardening.test.js",
+        "category": "tests",
+        "reason": "Cover special IPv4/IPv6 ranges, mapped forms, redirects, DNS failures, and credential stripping (#43)."
+      },
+      {
+        "path": "tests/unit/xquik-search-provider.test.js",
+        "category": "tests",
+        "reason": "Mock the canonical guarded-fetch boundary so offline Xquik accounting coverage cannot bypass or trip DNS pinning (#43)."
       }
     ]
   }

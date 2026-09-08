@@ -513,6 +513,55 @@ Update `SESSION_CONTEXT.md` and canonical Azox Knowledge with:
 
 Future upgrades begin from this evidence, not from chat history.
 
+## v0.5.69 source-candidate worked example
+
+The 2026-09-08 source candidate integrates upstream `v0.5.69` at
+`eb712ca821f0ba6bc41043fbd14494c5af5daba5` into AZOX base
+`9754c491500550cb4385212b98a0c3b6e2338fbe`. The inputs diverged from the
+shared `v0.5.55` ancestor by 36 AZOX commits and 91 upstream commits. Merge
+commit `05b9f25d2c1fe345d7d42e460de6bf71d95aec01` preserves both histories and
+resolved 11 conflicted files; source hardening is recorded in
+`24f817fd86f115a58eb1168ef8af499b634f7802`, followed by guarded-fetch test
+alignment in `9a3025d434fb44ed297db7e582d2d2752deed727`.
+
+The preservation pass kept the prior translator and session contracts and
+added fail-closed SSRF/DNS and redirect controls, request-log redaction,
+GitLab OAuth origin policy, project-ID/provider cancellation, combo quorum
+cleanup, credential mutation guards, and ordered Antigravity attempt handling.
+The concurrency regressions prove that late failures and late successes cannot
+overwrite newer account state. The refreshed dependency graph reduced the
+audit result to two moderate Monaco/DOMPurify findings; resolving them requires
+a separate breaking dependency review rather than a forced audit update.
+
+The final focused gate covers 49 files with 974 passing tests and two documented
+expected failures. Independent matrices pass `150/150` and `87/87`, and static
+parsing passes for all 47 source/test JavaScript files changed by the hardening
+commit. The guarded candidate suite at source commit `9a3025d4` contains 2,820
+tests: 2,726 pass, 63 inherited assertions fail, and 31 skip, with 3 collection,
+4 suite, and 0 run errors. A detached `9754c491` baseline using the exact same
+Node 20.20.2, Vitest 4.1.11, and candidate dependency graph through linked
+dependency directories
+contains 2,436 tests: 2,330 pass, 75 assertions fail, and 31 skip, with 4
+collection, 6 suite, and 0 run errors. The identity comparator reports zero new
+candidate failure and 14 reference failures absent from the candidate.
+
+The production build passes in an isolated profile/data/npm-cache environment
+and a fresh dist directory, followed by seven passing standalone loopback smoke
+checks for health, models, contributor/admin authorization, and dashboard login
+redirects. The Windows build records a non-fatal optional Tailscale trace-copy
+warning; standalone startup and the checked routes pass. A first build that
+inherited an inaccessible host npm-cache log failed `EPERM` and is superseded by
+the isolated passing run. No live provider was called and no release image,
+migration, publication, or deployment was performed. Keep the reports,
+checksums, passing build log, superseded build log, and smoke JSON with the PR
+evidence.
+
+This candidate changes authentication and security boundaries, so its source
+merge requires explicit Confirmation after the final evidence is attached.
+That Confirmation approves only the reviewed source merge. Building or
+publishing a release image and changing production remain Phase 6 work and
+require a separate explicit rollout approval.
+
 ## v0.5.45 worked example
 
 The 2026-08-02 candidate upgrade from `v0.5.35` to `v0.5.45` started from merge-base
