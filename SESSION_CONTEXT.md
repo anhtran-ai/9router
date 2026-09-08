@@ -83,7 +83,7 @@ snapshots; production has not been re-inspected or changed in this repair.
 - Current reviewed branch: `main`; source candidate:
   `codex/upgrade-v0.5.69-20260908` (issue `#43`).
 - Last merged upstream integration commit: `ab0de796`.
-- Pre-upgrade deployed source commit:
+- Historical pre-`v0.5.55` reviewed source commit:
   `a3ec8af4c9e6243e860e163d535f3af6dec324a5`
 - Candidate upstream tag: `v0.5.69` at
   `eb712ca821f0ba6bc41043fbd14494c5af5daba5`

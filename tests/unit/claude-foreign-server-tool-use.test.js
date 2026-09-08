@@ -36,7 +36,12 @@ describe("normalizeClaudePassthrough — foreign server_tool_use ids", () => {
 
   it("keeps a well-formed Anthropic server_tool_use block", () => {
     const block = { type: "server_tool_use", id: "srvtoolu_01EUi6RNgHntbStfCjgLyLzz", name: "web_search", input: {} };
-    const out = normalizeClaudePassthrough({ messages: [{ role: "assistant", content: [block] }] });
+    const out = normalizeClaudePassthrough({
+      messages: [
+        { role: "assistant", content: [block] },
+        { role: "user", content: [{ type: "text", text: "continue" }] },
+      ],
+    });
     expect(out.messages[0].content).toEqual([block]);
   });
 

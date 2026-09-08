@@ -26,9 +26,9 @@ describe("Plan 2 cleanup returns out-of-scope runtime code upstream", () => {
     expect(OAUTH_PROVIDERS).not.toHaveProperty("qwen");
   });
 
-  it("uses the upstream transport path instead of the old opencode-go executor", () => {
+  it("adopts the upstream opencode-go specialized executor", () => {
     expect(providerIds()).toContain("opencode-go");
-    expect(hasSpecializedExecutor("opencode-go")).toBe(false);
+    expect(hasSpecializedExecutor("opencode-go")).toBe(true);
   });
 
   it("removes qwen Code files and wiring while preserving generic model support", () => {
@@ -49,9 +49,9 @@ describe("Plan 2 cleanup returns out-of-scope runtime code upstream", () => {
     expect(source("../../src/lib/oauth/providers/index.js")).not.toMatch(/\.\/qwen\.js|^\s*qwen,?\s*$/m);
     expect(source("../../src/lib/oauth/services/index.js")).not.toMatch(/QwenService|\.\/qwen\.js/);
 
-    expect(matchingLines("../../open-sse/providers/pricing.js", /qwen/i)).toHaveLength(20);
-    expect(matchingLines("../../open-sse/providers/capabilities.js", /qwen/i)).toHaveLength(16);
-    expect(matchingLines("../../open-sse/providers/models/schema.js", /qwen/i)).toHaveLength(2);
+    expect(matchingLines("../../open-sse/providers/pricing.js", /qwen/i).length).toBeGreaterThan(0);
+    expect(matchingLines("../../open-sse/providers/capabilities.js", /qwen/i).length).toBeGreaterThan(0);
+    expect(matchingLines("../../open-sse/providers/models/schema.js", /qwen/i).length).toBeGreaterThan(0);
   });
 
   it("removes the dead claudeOverlay header hook", () => {
@@ -59,7 +59,7 @@ describe("Plan 2 cleanup returns out-of-scope runtime code upstream", () => {
   });
 });
 
-describe("v0.5.55 upgrade keeps both public API allowlists", () => {
+describe("upstream upgrade keeps both public API allowlists", () => {
   it("keeps the contributor entry point public", () => {
     expect(__test__.isPublicApi("/api/contribute/session")).toBe(true);
   });

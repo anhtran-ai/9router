@@ -19,12 +19,12 @@ describe("customization boundary guard", () => {
     const manifest = loadCustomizationManifest(manifestPath);
 
     expect(manifest.schema_version).toBe(1);
-    expect(manifest.upstream_ref).toBe("v0.5.55");
+    expect(manifest.upstream_ref).toBe("v0.5.69");
     expect(manifest.boundaries.additive.length).toBeGreaterThan(0);
     expect(manifest.boundaries.modified.length).toBeGreaterThan(0);
   });
 
-  it("accepts the current fork diff from upstream v0.5.55", () => {
+  it("accepts the current fork diff from the pinned upstream", () => {
     const manifest = loadCustomizationManifest(manifestPath);
     const diff = execFileSync(
       "git",
