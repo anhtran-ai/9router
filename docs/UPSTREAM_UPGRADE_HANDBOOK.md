@@ -102,7 +102,8 @@ The follow-up self-review repair is tracked by
 SR-01, SR-02 and SR-04 remain corrections to PR #24; other SR entries predate
 PR #34. Consult each entry's provenance rather than attributing every issue
 to customization. These are source contracts, not a live-provider acceptance
-claim. Keep upstream `v0.5.55` pinned until an actual reviewed upgrade.
+claim. The issue #43 candidate pins upstream `v0.5.69`; production remains on
+its separately recorded immutable image until review and rollout approval.
 
 The next review round covers [#36](https://github.com/azox-ai/azox-9router/issues/36),
 [#38](https://github.com/azox-ai/azox-9router/issues/38),

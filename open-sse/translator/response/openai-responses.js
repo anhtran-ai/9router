@@ -534,13 +534,18 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     return null;
   }
 
-  // Function call started (standard function_call or custom_tool_call)
+  // Function call started (standard function_call or custom_tool_call).
+  // Index is assigned here (not on done): attributing deltas by stream position
+  // merges parallel calls into index 0 whenever upstream emits all addeds
+  // before dones — the client then concatenates N JSON payloads into one
+  // tool input and fails validation. The server item id is the correlator.
   if (eventType === "response.output_item.added" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
     const item = data.item;
     state.currentToolCallId = item.call_id || fallbackToolCallId();
     state.responsesTools ||= new Map();
     state.responsesItemCalls ||= new Map();
-    if (item.id) state.responsesItemCalls.set(item.id, state.currentToolCallId);
+    const itemId = item.id || data.item_id;
+    if (itemId) state.responsesItemCalls.set(itemId, state.currentToolCallId);
     if (state.responsesTools.has(state.currentToolCallId)) return null;
     const progress = { index: state.responsesTools.size, argsSent: "", rawInput: "", custom: item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL };
     state.responsesTools.set(state.currentToolCallId, progress);
@@ -558,7 +563,8 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     );
   }
 
-  // Function call arguments delta (standard or custom_tool_call variant)
+  // Function call arguments delta (standard or custom_tool_call variant).
+  // Routed by item_id so interleaved parallel fragments stay on their own call.
   if (eventType === "response.function_call_arguments.delta" || eventType === "response.custom_tool_call_input.delta") {
     const argsDelta = data.delta || "";
     if (!argsDelta) return null;
@@ -576,12 +582,14 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     );
   }
 
-  // Function call done (standard or custom_tool_call variant)
+  // Function call done (standard or custom_tool_call variant).
+  // Index was assigned at added-time; nothing to advance. Some upstreams send
+  // complete arguments only here (no deltas) — emit them once in that case.
   if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
     const item = data.item;
-    const callId = item.call_id || state.responsesItemCalls?.get(item.id) || state.currentToolCallId;
+    const callId = item.call_id || state.responsesItemCalls?.get(item.id || data.item_id) || state.currentToolCallId;
     const progress = state.responsesTools?.get(callId);
-    state.toolCallIndex = Math.max(state.toolCallIndex + 1, (progress?.index ?? -1) + 1);
+    state.toolCallIndex = Math.max(state.toolCallIndex, (progress?.index ?? -1) + 1);
     if (progress) {
       const args = progress.custom ? JSON.stringify({ input: item.input ?? progress.rawInput }) : item.arguments;
       const missing = remainingTerminalValue(args, progress.argsSent);

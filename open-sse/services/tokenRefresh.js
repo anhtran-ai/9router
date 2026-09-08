@@ -5,6 +5,7 @@ import {
   refreshXaiToken,
   refreshAccessToken,
   refreshKimiToken,
+  refreshClineToken,
   refreshClaudeOAuthToken,
   refreshGoogleToken,
   refreshCodexToken,
@@ -24,6 +25,7 @@ import {
 export {
   refreshAccessToken,
   refreshKimiToken,
+  refreshClineToken,
   refreshClaudeOAuthToken,
   refreshGoogleToken,
   refreshCodexToken,
@@ -146,6 +148,7 @@ const REFRESH_HANDLERS = {
   "codebuddy-cn": (c, log) => refreshCodebuddyToken(c.refreshToken, log),
   "codebuddy-intl": (c, log) => refreshCodebuddyIntlToken(c.refreshToken, log),
   trae: (c, log) => refreshTraeToken(c.refreshToken, c, log),
+  cline: (c, log) => refreshClineToken(c.refreshToken, log),
   zed: () => refreshZedToken(),
   windsurf: (c, log) => refreshWindsurfToken(c, log),
   // Kimi Code OAuth (merged into id `kimi`); legacy id still routes here

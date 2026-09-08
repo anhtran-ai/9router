@@ -40,6 +40,6 @@ describe("OAuthModal apiBase seam", () => {
   });
 
   it("keeps the OAuth service barrel identical to upstream formatting", () => {
-    expect(oauthServicesIndexSource).toMatch(/export \{ CursorService \} from "\.\/cursor\.js";\n\n$/);
+    expect(oauthServicesIndexSource).toMatch(/export \{ CursorService \} from "\.\/cursor\.js";\r?\n\r?\n$/);
   });
 });

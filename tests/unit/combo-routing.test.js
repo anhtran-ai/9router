@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   connections: [], updates: [], execute: vi.fn(), refresh: vi.fn(), pending: vi.fn(), noAuth: true,
+  quotaError: vi.fn(), clearQuotaStrikes: vi.fn(),
   models: ["openrouter/model-a", "deepseek/model-b"],
 }));
 vi.mock("open-sse/index.js", () => ({}));
@@ -30,6 +31,11 @@ vi.mock("@/sse/services/model.js", () => ({
   getComboModels: vi.fn(async (name) => name === "test-combo" ? state.models : null),
 }));
 vi.mock("@/sse/services/tokenRefresh.js", () => ({ updateProviderCredentials: vi.fn(), checkAndRefreshToken: vi.fn(async (_provider, credentials) => credentials) }));
+vi.mock("@/sse/services/antigravityQuota.js", () => ({
+  handleAntigravityQuotaError: state.quotaError,
+  clearAntigravityStrikes: state.clearQuotaStrikes,
+  getAntigravityQuotaCache: vi.fn(() => new Map()),
+}));
 vi.mock("@/lib/headroom/detect", () => ({ DEFAULT_HEADROOM_URL: "http://example.invalid" }));
 vi.mock("@/lib/pxpipe/loader.js", () => ({ getTransform: vi.fn() }));
 vi.mock("@/lib/pxpipe/events.js", () => ({ appendPxpipeEvent: vi.fn() }));
@@ -138,6 +144,8 @@ describe("actual app, account selection, core and combo boundaries", () => {
     state.models = ["openrouter/model-a", "deepseek/model-b"];
     state.execute.mockReset().mockImplementation(async () => executorResult());
     state.refresh.mockReset();
+    state.quotaError.mockReset().mockResolvedValue(null);
+    state.clearQuotaStrikes.mockReset();
     vi.spyOn(Date, "now").mockReturnValue(fixedNow);
   });
   afterEach(() => vi.restoreAllMocks());
@@ -187,6 +195,40 @@ describe("actual app, account selection, core and combo boundaries", () => {
     expect(executorSignal.aborted).toBe(true);
     expect(aborted).toHaveBeenCalledTimes(1);
     expect(response.status).toBe(499);
+    expect(state.execute).toHaveBeenCalledTimes(1);
+    expect(state.updates).toEqual([]);
+  });
+
+  it("stops Antigravity quota refresh and account fallback when the request aborts", async () => {
+    state.connections = [
+      makeConnection("antigravity", { id: "ag-first" }),
+      makeConnection("antigravity", { id: "ag-second" }),
+    ];
+    state.execute.mockResolvedValueOnce(executorResult(new Response(
+      JSON.stringify({ error: { message: "quota exhausted" } }),
+      { status: 429, headers: { "Content-Type": "application/json" } },
+    )));
+
+    let quotaStarted;
+    const started = new Promise(resolve => { quotaStarted = resolve; });
+    state.quotaError.mockImplementation((...args) => {
+      const signal = args.at(-1);
+      quotaStarted();
+      return new Promise((resolve, reject) => {
+        const onAbort = () => reject(signal.reason ?? new DOMException("Request aborted", "AbortError"));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      });
+    });
+
+    const client = new AbortController();
+    const pending = handleChat(makeRequest("antigravity/model-a", client.signal));
+    await started;
+    client.abort();
+    const response = await pending;
+
+    expect(response.status).toBe(499);
+    expect(state.quotaError).toHaveBeenCalledTimes(1);
     expect(state.execute).toHaveBeenCalledTimes(1);
     expect(state.updates).toEqual([]);
   });
@@ -562,8 +604,9 @@ describe("actual app, account selection, core and combo boundaries", () => {
       expect(state.execute).toHaveBeenCalledTimes(2);
       expect(codexDispatch).not.toHaveBeenCalled();
       const expectedTools = structuredClone(original.tools);
-      // Native Claude adds its existing default prompt-cache marker to the last
-      // declaration; all caller restrictions must otherwise remain identical.
+      // Native Claude adds the upstream-required default tool type and its
+      // existing prompt-cache marker; caller objects and constraints stay intact.
+      expectedTools.forEach((tool) => { if (!tool.type) tool.type = "custom"; });
       expectedTools.at(-1).cache_control = { type: "ephemeral", ttl: "1h" };
       expect(compatibleBody.tools).toEqual(expectedTools);
       expect(compatibleBody.tool_choice).toEqual(original.choice);

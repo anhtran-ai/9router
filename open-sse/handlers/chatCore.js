@@ -28,6 +28,7 @@ import { compressWithPxpipe } from "../rtk/pxpipe.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
+import { defaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isAbortError, throwIfAborted } from "../utils/abort.js";
 import { ToolCompatibilityError } from "../translator/concerns/hostedToolPolicy.js";
@@ -85,7 +86,7 @@ export async function handleChatCore(options) {
   }
 }
 
-async function handleChatCoreRequest({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, signal }, lifecycle) {
+async function handleChatCoreRequest({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, signal }, lifecycle) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -118,7 +119,12 @@ async function handleChatCoreRequest({ body, modelInfo, credentials, log, onCred
   // differ — kimi/glm only do /chat/completions). Undeclared models keep the
   // upstream default (use the transport), preserving behavior for glm/deepseek/...
   const useTransport = (!modelSupportedFormats || modelSupportedFormats.includes(sourceFormat)) ? runtimeTransport : null;
-  const targetFormat = modelTargetFormat || useTransport?.format || getTargetFormat(provider, credentials);
+  // A source-format-matched endpoint keeps the request lossless. Prefer it
+  // over a model-level targetFormat, which is only the fallback for clients
+  // whose wire format has no supported transport (for example MiniMax-M3:
+  // OpenAI clients should stay on /chat/completions; other clients can fall
+  // back to its declared Claude target).
+  const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
   if (useTransport && credentials) credentials.runtimeTransport = useTransport;
   const stripList = getModelStrip(alias, model);
   const upstreamModel = getModelUpstreamId(alias, model);
@@ -268,6 +274,12 @@ async function handleChatCoreRequest({ body, modelInfo, credentials, log, onCred
     delete translatedBody.tools;
   }
 
+  // Claude tool schema requires `type` to be explicitly set; strict gateways (e.g., MiniMax)
+  // reject legacy payloads that omit it with HTTP 400. Default to "custom" when missing.
+  if (finalFormat === FORMATS.CLAUDE && Array.isArray(translatedBody.tools)) {
+    translatedBody.tools = defaultClaudeToolType(translatedBody.tools);
+  }
+
   // Per-request opt-out: client can bypass all token savers via header
   const tokenSaverEnabled = clientRawRequest?.headers?.[TOKEN_SAVER_HEADER]?.toLowerCase() !== "off";
 
@@ -278,7 +290,7 @@ async function handleChatCoreRequest({ body, modelInfo, credentials, log, onCred
 
   // Headroom: optional external proxy compression; fail open if proxy is absent.
   const headroomDiagnostics = {};
-  const headroomStats = await compressWithHeadroom(translatedBody, { enabled: tokenSaverEnabled && headroomEnabled, url: headroomUrl, model: upstreamModel, format: finalFormat, compressUserMessages: headroomCompressUserMessages, diagnostics: headroomDiagnostics });
+  const headroomStats = await compressWithHeadroom(translatedBody, { enabled: tokenSaverEnabled && headroomEnabled, url: headroomUrl, model: upstreamModel, format: finalFormat, compressUserMessages: headroomCompressUserMessages, timeoutMs: headroomTimeoutMs, diagnostics: headroomDiagnostics });
   const headroomLine = formatHeadroomLog(headroomStats);
   const headroomSizeLine = formatHeadroomSizeLog(headroomDiagnostics);
   if (headroomLine) {
@@ -388,7 +400,17 @@ async function handleChatCoreRequest({ body, modelInfo, credentials, log, onCred
   let providerResponseFormat = targetFormat;
   try {
     throwIfAborted(signal);
-    const result = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
+    const result = await executor.execute({
+      model,
+      body: translatedBody,
+      stream,
+      credentials,
+      providerSessionId: sessionSeed,
+      clientTool,
+      signal: streamController.signal,
+      log,
+      proxyOptions,
+    });
     providerResponse = result.response;
     providerUrl = result.url;
     providerHeaders = result.headers;
@@ -446,7 +468,17 @@ async function handleChatCoreRequest({ body, modelInfo, credentials, log, onCred
         }
         try {
           throwIfAborted(signal);
-          const retryResult = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
+          const retryResult = await executor.execute({
+            model,
+            body: translatedBody,
+            stream,
+            credentials,
+            providerSessionId: sessionSeed,
+            clientTool,
+            signal: streamController.signal,
+            log,
+            proxyOptions,
+          });
           if (retryResult.response.ok) {
             providerResponse = retryResult.response;
             providerUrl = retryResult.url;
@@ -510,7 +542,7 @@ async function handleChatCoreRequest({ body, modelInfo, credentials, log, onCred
 
   // Streaming response
   const { onStreamComplete, streamDetailId } = buildOnStreamComplete({ ...sharedCtx });
-  const result = await handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, trackDone });
+  const result = await handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, userAgent, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, trackDone, credentials });
   lifecycle.streaming = result?.success === true;
   return result;
 }

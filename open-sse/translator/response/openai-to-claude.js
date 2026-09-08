@@ -183,6 +183,7 @@ export function openaiToClaudeResponse(chunk, state) {
   if (delta?.tool_calls) {
     for (const tc of delta.tool_calls) {
       const idx = tc.index ?? 0;
+      let openedToolBlock = false;
 
       // GLM/fireworks repeats id+null-name on every arg chunk; open block once per idx
       if (tc.id && !state.toolCalls.has(idx)) {
@@ -191,6 +192,7 @@ export function openaiToClaudeResponse(chunk, state) {
 
         const toolBlockIndex = state.nextBlockIndex++;
         state.toolCalls.set(idx, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
+        openedToolBlock = true;
 
         // Strip prefix from tool name for response
         let toolName = tc.function?.name || "";
@@ -213,9 +215,22 @@ export function openaiToClaudeResponse(chunk, state) {
       if (tc.function?.arguments) {
         const toolInfo = state.toolCalls.get(idx);
         if (toolInfo) {
-          // Buffer args instead of streaming — sanitize at finish to fix bad params
-          if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
-          state.toolArgBuffers.set(idx, (state.toolArgBuffers.get(idx) || "") + tc.function.arguments);
+          // A complete tool call delivered in one chunk can be sanitized and
+          // emitted immediately. Keep buffering split arguments so the final
+          // JSON can still be repaired before it reaches Claude.
+          if (openedToolBlock && isCompleteJson(tc.function.arguments)) {
+            results.push({
+              type: "content_block_delta",
+              index: toolInfo.blockIndex,
+              delta: {
+                type: "input_json_delta",
+                partial_json: sanitizeToolArgs(toolInfo.name, tc.function.arguments)
+              }
+            });
+          } else {
+            if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
+            state.toolArgBuffers.set(idx, (state.toolArgBuffers.get(idx) || "") + tc.function.arguments);
+          }
         }
       }
     }
@@ -260,6 +275,15 @@ export function openaiToClaudeResponse(chunk, state) {
 }
 
 const convertFinishReason = (reason) => fromOpenAIFinish(reason, "claude");
+
+function isCompleteJson(value) {
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // Register
 register(FORMATS.OPENAI, FORMATS.CLAUDE, null, openaiToClaudeResponse);

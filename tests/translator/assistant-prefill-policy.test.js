@@ -133,3 +133,62 @@ describe.each(paths)("assistant prefill policy — %s", (_name, run) => {
     ]));
   });
 });
+
+const foreignServerToolId = "call_50b82aba1b754d82a4408a53";
+
+function nativeCleanupPrefillFixture() {
+  return [
+    { role: "user", content: [{ type: "text", text: "Start" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Searching" },
+        { type: "server_tool_use", id: foreignServerToolId, name: "analyze_image", input: {} },
+        { type: "text", text: "" },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        { type: "web_search_tool_result", tool_use_id: foreignServerToolId, content: [] },
+        { type: "tool_result", tool_use_id: foreignServerToolId, content: "foreign result" },
+        { type: "text", text: "Keep this context" },
+        { type: "text", text: "   " },
+      ],
+    },
+    { role: "assistant", content: [{ type: "text", text: "Partial answer" }] },
+    // Cleanup must remove this invalid tail before the prefill policy examines
+    // the conversation, exposing the preceding assistant as the real prefill.
+    { role: "assistant", content: [{ type: "text", text: "   " }] },
+  ];
+}
+
+function expectNativeCleanup(messages) {
+  const blocks = messages.flatMap(message => Array.isArray(message.content) ? message.content : []);
+  expect(JSON.stringify(messages)).not.toContain(foreignServerToolId);
+  expect(blocks.map(block => block.type)).not.toContain("server_tool_use");
+  expect(blocks.map(block => block.type)).not.toContain("web_search_tool_result");
+  expect(blocks.map(block => block.type)).not.toContain("tool_result");
+  expect(blocks.filter(block => block.type === "text").every(block => block.text.trim())).toBe(true);
+}
+
+describe("native Claude cleanup before assistant prefill policy", () => {
+  it("cleans foreign tool history and then normalizes the exposed prefill by default", () => {
+    const out = passthrough(nativeCleanupPrefillFixture());
+
+    expectNativeCleanup(out.messages);
+    expect(out.messages.map(message => message.role)).toEqual(["user", "assistant", "user", "assistant", "user"]);
+    expect(out.messages.at(-2).content).toEqual([{ type: "text", text: "Partial answer" }]);
+    expect(JSON.stringify(out.messages.at(-1).content)).toMatch(continuationPattern);
+  });
+
+  it("still cleans foreign tool history before preserving the exposed prefill", () => {
+    const out = passthrough(nativeCleanupPrefillFixture(), {
+      headers: { "x-9router-assistant-prefill": "preserve" },
+    });
+
+    expectNativeCleanup(out.messages);
+    expect(out.messages.map(message => message.role)).toEqual(["user", "assistant", "user", "assistant"]);
+    expect(out.messages.at(-1).content).toEqual([{ type: "text", text: "Partial answer" }]);
+  });
+});

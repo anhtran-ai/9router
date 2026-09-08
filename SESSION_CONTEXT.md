@@ -1,10 +1,34 @@
 # 9Router customization context
 
-Last updated: 2026-08-26
+Last updated: 2026-09-08
 
 This is the safe handoff file for continuing the customized 9Router work in a
 new session. It intentionally contains no admin password, API key, OAuth token,
 provider credential, Docker environment value, private key, or host address.
+
+## v0.5.69 source candidate
+
+Issue #43 integrates the exact upstream tag `v0.5.69` at
+`eb712ca821f0ba6bc41043fbd14494c5af5daba5` into AZOX base
+`9754c491500550cb4385212b98a0c3b6e2338fbe`, preserving upstream history and
+the customization registry. The candidate branch is
+`codex/upgrade-v0.5.69-20260908`; it is source-only until review and rollout
+approval. It does not change the currently deployed image or persistent data.
+
+The merge keeps all prior compatibility contracts and records the issue #43
+stability additions in `docs/CUSTOMIZATIONS.yaml`. These cover unread
+CommandCode lines in coalesced chunks, cancellation during Antigravity quota
+refresh, session-scoped Gemini thought signatures, Responses tool-name clamp
+collisions, OpenAI reasoning and tool-input conversion to Claude, and Kiro
+system/developer instruction mirroring. Golden snapshots now reject hidden
+translator exceptions and normalize only documented dynamic fields. The root
+dependency lock was refreshed within declared ranges: the inherited audit
+baseline changed from four high plus three moderate findings to two moderate
+Monaco/DOMPurify findings that require a separate breaking dependency review.
+
+No live provider call, image publication, production migration, or deployment
+is part of issue #43. Final test/build/comparison evidence and human review
+belong in its pull request.
 
 ## Source repair, separate from deployment
 
@@ -56,13 +80,14 @@ snapshots; production has not been re-inspected or changed in this repair.
 
 - Canonical customized repository: `https://github.com/azox-ai/azox-9router`
 - Upstream repository: `https://github.com/decolua/9router`
-- Current reviewed branch: `main`
-- Upstream integration commit: `ab0de796`.
+- Current reviewed branch: `main`; source candidate:
+  `codex/upgrade-v0.5.69-20260908` (issue `#43`).
+- Last merged upstream integration commit: `ab0de796`.
 - Pre-upgrade deployed source commit:
   `a3ec8af4c9e6243e860e163d535f3af6dec324a5`
-- Target upstream tag: `v0.5.55` at
-  `699edac3273e13d4744bc46f6082618f08560702`
-- Candidate package version inherited from upstream: `0.5.55`
+- Candidate upstream tag: `v0.5.69` at
+  `eb712ca821f0ba6bc41043fbd14494c5af5daba5`
+- Candidate package version inherited from upstream: `0.5.69`
 - Reviewed/deployed source commit:
   `fcf4300e6e0b263ad28a8a475a18702cb7c6774c` (PR `#21`, Codex Responses
   `additional_tools.content` compatibility fix), including PR `#20` at

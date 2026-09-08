@@ -35,7 +35,7 @@ function safeJSONParse(str, fallback) {
 
 /**
  * Convert OpenAI messages to Kiro format
- * Rules: system/tool/user -> user role, merge consecutive same roles.
+ * Rules: system/developer/tool/user -> user role, merge consecutive same roles.
  *
  * Returns { history, currentMessage }.
  */
@@ -91,9 +91,9 @@ function convertMessages(messages, model) {
     const msg = messages[i];
     let role = msg.role;
 
-    // Normalize: system/tool -> user
-    const wasSystem = role === ROLE.SYSTEM;
-    if (role === ROLE.SYSTEM || role === ROLE.TOOL) {
+    // Normalize: system/developer/tool -> user
+    const wasInstruction = role === ROLE.SYSTEM || role === ROLE.DEVELOPER;
+    if (wasInstruction || role === ROLE.TOOL) {
       role = ROLE.USER;
     }
 
@@ -163,7 +163,7 @@ function convertMessages(messages, model) {
       } else if (content) {
         // <instructions> tags: Claude models treat these as authoritative directives.
         pendingUserContent.push(
-          wasSystem ? `<instructions>\n${content}\n</instructions>` : content
+          wasInstruction ? `<instructions>\n${content}\n</instructions>` : content
         );
       }
     } else if (role === ROLE.ASSISTANT) {
@@ -340,9 +340,8 @@ export function openaiToKiroRequest(model, body, stream, credentials) {
 
   const timestamp = new Date().toISOString();
 
-  // Kiro CLI/KAS sends these as top-level systemPrompt. Keep a content fallback
-  // too because the CodeWhisperer surface does not always enforce top-level
-  // systemPrompt for direct calls.
+  // Build stable Kiro directives for the user-content mirror. Upstream v0.5.69
+  // intentionally omits the redundant top-level systemPrompt wire field.
   const systemPromptParts = [];
   if (thinkingBudget !== null && !usesNativeGptEffort) {
     systemPromptParts.push(buildThinkingSystemPrefix(thinkingBudget));
@@ -420,7 +419,6 @@ export function openaiToKiroRequest(model, body, stream, credentials) {
   if (profileArn) {
     payload.profileArn = profileArn;
   }
-  if (systemPrompt) payload.systemPrompt = systemPrompt;
   if (additionalModelRequestFields) {
     payload.additionalModelRequestFields = additionalModelRequestFields;
   }

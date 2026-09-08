@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const { executeMock } = vi.hoisted(() => ({
   executeMock: vi.fn(),
@@ -55,6 +55,8 @@ describe("handleChatCore Headroom diagnostics", () => {
       transformedBody: null,
     });
   });
+
+  afterEach(() => vi.restoreAllMocks());
 
   it("logs why Headroom was skipped on chat completions", async () => {
     const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn() };
@@ -162,6 +164,7 @@ describe("handleChatCore Headroom diagnostics", () => {
     const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn() };
     const original = "very large context that should be replaced";
     const compressed = "compressed context";
+    const timeout = vi.spyOn(AbortSignal, "timeout");
 
     global.fetch = vi.fn(async (url) => {
       if (String(url).includes("/v1/compress")) {
@@ -184,6 +187,7 @@ describe("handleChatCore Headroom diagnostics", () => {
       headroomEnabled: true,
       headroomUrl: "http://localhost:8787",
       headroomCompressUserMessages: false,
+      headroomTimeoutMs: 4321,
       rtkEnabled: false,
       cavemanEnabled: false,
       ponytailEnabled: false,
@@ -203,6 +207,7 @@ describe("handleChatCore Headroom diagnostics", () => {
     expect(log.info).toHaveBeenCalledWith("HEADROOM", expect.stringContaining("reported token delta=90 before=100 after=10"));
     expect(log.info).toHaveBeenCalledWith("HEADROOM", expect.stringContaining("body="));
     expect(log.info).toHaveBeenCalledWith("HEADROOM", expect.stringContaining("messages="));
+    expect(timeout).toHaveBeenCalledWith(4321);
 
     const logs = JSON.stringify([...log.info.mock.calls, ...log.warn.mock.calls]);
     expect(logs).not.toContain("saved");

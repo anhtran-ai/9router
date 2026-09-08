@@ -4,9 +4,17 @@ import { createStreamController } from "../../open-sse/utils/streamHandler.js";
 import { buildOnStreamComplete, handleStreamingResponse } from "../../open-sse/handlers/chatCore/streamingHandler.js";
 import { saveRequestUsage } from "@/lib/usageDb.js";
 
+const { storeThoughtSignature } = vi.hoisted(() => ({
+  storeThoughtSignature: vi.fn(),
+}));
+
 vi.mock("@/lib/usageDb.js", () => ({
   trackPendingRequest: vi.fn(), appendRequestLog: vi.fn(async () => {}),
   saveRequestDetail: vi.fn(async () => {}), saveRequestUsage: vi.fn(async () => {}),
+}));
+vi.mock("../../open-sse/services/thoughtSignatureStore.js", () => ({
+  storeGeminiThoughtSignature: storeThoughtSignature,
+  getGeminiThoughtSignatureSync: vi.fn(() => null),
 }));
 
 const encoder = new TextEncoder();
@@ -27,7 +35,7 @@ const textBlock = [
 ];
 const events = (items) => items.map(item => sse(item)).join("");
 
-async function run(input, { target = FORMATS.OPENAI, source = FORMATS.CLAUDE, contentType = "text/event-stream", provider = "openrouter", signal, persistUsage = false } = {}) {
+async function run(input, { target = FORMATS.OPENAI, source = FORMATS.CLAUDE, contentType = "text/event-stream", provider = "openrouter", signal, persistUsage = false, credentials = null } = {}) {
   const body = { messages: [{ role: "user", content: "fixture" }], stream: true };
   const requestStartTime = Date.now(); const log = { line: vi.fn(), errorLine: vi.fn() };
   const completion = persistUsage ? buildOnStreamComplete({ provider, model: "fixture", body, stream: true, requestStartTime, log }).onStreamComplete : undefined;
@@ -39,7 +47,7 @@ async function run(input, { target = FORMATS.OPENAI, source = FORMATS.CLAUDE, co
   const result = await handleStreamingResponse({
     providerResponse, provider, model: "fixture", sourceFormat: source, targetFormat: target,
     body, stream: true, requestStartTime, reqLogger: {}, streamController, onRequestSuccess,
-    onStreamComplete, trackDone: finish, log,
+    onStreamComplete, trackDone: finish, log, credentials,
   });
   return { ...result, trackDone, onStreamComplete, onRequestSuccess, streamController };
 }
@@ -68,6 +76,37 @@ describe("streaming response contract", () => {
     expect(result.response.status).toBe(502);
     expect(cancel).toHaveBeenCalledTimes(1);
     expect(pull).not.toHaveBeenCalled();
+  });
+
+  it("keeps pending completion and the Gemini session namespace across the merged stream tail", async () => {
+    const input = sse({
+      modelVersion: "gemini-fixture",
+      candidates: [{
+        content: {
+          role: "model",
+          parts: [{
+            thoughtSignature: "sig-stream-tail",
+            functionCall: { id: "call-stream-tail", name: "lookup", args: { q: "ok" } },
+          }],
+        },
+        finishReason: "STOP",
+      }],
+    });
+
+    const result = await run(input, {
+      target: FORMATS.GEMINI,
+      source: FORMATS.OPENAI,
+      provider: "gemini",
+      credentials: { _clientSessionId: "session-stream-tail" },
+    });
+    await result.response.text();
+
+    expect(storeThoughtSignature).toHaveBeenCalledWith(
+      "call-stream-tail",
+      "sig-stream-tail",
+      "session-stream-tail",
+    );
+    expect(result.trackDone).toHaveBeenCalledTimes(1);
   });
 
   it.each([

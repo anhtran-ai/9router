@@ -69,6 +69,51 @@ describe("native Chat custom tools at the shared Responses request boundary", ()
   });
 });
 
+describe("OpenAI Chat function declarations at the shared Responses request boundary", () => {
+  const functionTool = (name) => ({
+    type: "function",
+    function: {
+      name,
+      description: "Run a test function",
+      parameters: { type: "object", properties: {} },
+    },
+  });
+
+  const forcedFunction = (name) => ({ type: "function", function: { name } });
+
+  const convert = (tools, toolChoice) => openaiToOpenAIResponsesRequest("test-model", {
+    messages: [{ role: "user", content: "run" }],
+    tools,
+    tool_choice: toolChoice,
+  }, false, null);
+
+  it("rejects a forced selector whose blank function declaration is removed", () => {
+    expect(() => convert([functionTool("   ")], forcedFunction("   ")))
+      .toThrow(ToolCompatibilityError);
+  });
+
+  it("clamps a long function name consistently in its declaration and forced selector", () => {
+    const longName = `tool_${"x".repeat(140)}`;
+    const expectedName = longName.slice(0, 128);
+    const out = convert([functionTool(longName)], forcedFunction(longName));
+
+    expect(out.tools).toHaveLength(1);
+    expect(out.tools[0].name).toBe(expectedName);
+    expect(out.tool_choice).toEqual({ type: "function", name: expectedName });
+  });
+
+  it("rejects distinct function names that collide after the 128-character clamp", () => {
+    const commonPrefix = "x".repeat(128);
+    const first = `${commonPrefix}a`;
+    const second = `${commonPrefix}b`;
+
+    expect(() => convert(
+      [functionTool(first), functionTool(second)],
+      forcedFunction(first),
+    )).toThrow(ToolCompatibilityError);
+  });
+});
+
 describe("Codex Responses Lite custom tools → OpenAI Chat", () => {
   it("promotes additional_tools custom declarations into Chat tools", () => {
     const out = openaiResponsesToOpenAIRequest("cx/gpt-5.6-sol", {

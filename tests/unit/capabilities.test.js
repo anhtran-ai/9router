@@ -32,6 +32,13 @@ describe("getCapabilitiesForModel", () => {
     }
   });
 
+  it("reports Claude Fable 5.1 as a permanent adaptive-thinking model", () => {
+    expect(getCapabilitiesForModel("claude", "claude-fable-5-1")).toMatchObject({
+      ...claudeSonnet5Expected,
+      thinkingCanDisable: false,
+    });
+  });
+
   it("reports Kiro Claude Opus 4.8 as a 1M context model", () => {
     expect(getCapabilitiesForModel("kiro", "claude-opus-4.8").contextWindow).toBe(1000000);
     expect(getCapabilitiesForModel("kiro", "anthropic/claude-opus-4.8").contextWindow).toBe(1000000);
@@ -71,6 +78,7 @@ describe("getCapabilitiesForModel", () => {
       "claude-fable-5",
       "anthropic/claude-fable-5",
       "blackboxai/anthropic/claude-fable-5",
+      "claude-fable-5-1",
     ]) {
       expect(getCapabilitiesForModel("anthropic", model)).not.toHaveProperty("assistantPrefill");
     }
@@ -87,5 +95,16 @@ describe("getCapabilitiesForModel", () => {
         thinkingFormat: "claude-adaptive",
       });
     }
+  });
+
+  it("reports Codex GPT 6.0 Astra as a vision and thinking capable model", () => {
+    expect(getCapabilitiesForModel("codex", "gpt-6-astra")).toMatchObject({
+      vision: true,
+      reasoning: true,
+      search: true,
+      thinkingFormat: "openai",
+      contextWindow: 272000,
+      maxOutput: 128000,
+    });
   });
 });
