@@ -1,6 +1,6 @@
 # 9Router customization context
 
-Last updated: 2026-09-08
+Last updated: 2026-09-09
 
 This is the safe handoff file for continuing the customized 9Router work in a
 new session. It intentionally contains no admin password, API key, OAuth token,
@@ -15,6 +15,12 @@ the customization registry. The histories meet in merge commit
 `05b9f25d2c1fe345d7d42e460de6bf71d95aec01`; the source hardening commit is
 `24f817fd86f115a58eb1168ef8af499b634f7802`; full-suite Xquik coverage was
 aligned with the guarded-fetch boundary in `9a3025d434fb44ed297db7e582d2d2752deed727`.
+The final multi-pass post-audit source repair is
+`5ccb4540673160c405f03d213cbf826bb040cd7c`. It preserves the v0.5.69
+history while closing standalone SQL.js packaging, half-open Qoder and
+CommandCode streams, provider-scoped model capability collisions, stale
+provider-cache writes, unbounded model/token/OAuth responses, OAuth
+owner/generation races, and raw upstream error reflection.
 From the shared `v0.5.55`
 ancestor, the input histories contain 36 AZOX commits and 91 upstream commits,
 and the merge resolved 11 conflicted files. The candidate branch is
@@ -31,6 +37,17 @@ translator exceptions and normalize only documented dynamic fields. The root
 dependency lock was refreshed within declared ranges: the inherited audit
 baseline changed from four high plus three moderate findings to two moderate
 Monaco/DOMPurify findings that require a separate breaking dependency review.
+
+The post-audit focused gate passes 31 Vitest files / 541 assertions plus 30/30
+Kimchi assertions under their native `node:test` runner. All 56 changed
+JavaScript/MJS files parse, the customization guard covers 340 fork files, and
+the final dependency audit remains two moderate with zero high or critical.
+An isolated production build passes; its standalone artifact includes the
+658,410-byte SQL.js WASM runtime and passes nine loopback health, catalog,
+authentication and dashboard-redirect checks using the sql.js fallback. The
+separate CLI build also includes that WASM asset and completes after installing
+its declared `esbuild` development dependency without changing the lock or
+package manifest. No live provider request was made.
 
 The final focused source gate covers 49 files and passes 974 tests with two
 documented expected failures. Independent review matrices pass `150/150` and
@@ -126,6 +143,8 @@ snapshots; production has not been re-inspected or changed in this repair.
   `24f817fd86f115a58eb1168ef8af499b634f7802`
 - Candidate guarded-fetch test alignment commit:
   `9a3025d434fb44ed297db7e582d2d2752deed727`
+- Candidate final post-audit source repair commit:
+  `5ccb4540673160c405f03d213cbf826bb040cd7c`
 - Candidate package version inherited from upstream: `0.5.69`
 - Reviewed/deployed source commit:
   `fcf4300e6e0b263ad28a8a475a18702cb7c6774c` (PR `#21`, Codex Responses

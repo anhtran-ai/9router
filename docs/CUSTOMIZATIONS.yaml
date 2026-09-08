@@ -16,11 +16,11 @@
   },
   "inventory_path": "docs/FORK_DIFF_INVENTORY.md",
   "counts": {
-    "additive_total": 103,
-    "modified_total": 210,
-    "modified_runtime": 138,
+    "additive_total": 106,
+    "modified_total": 234,
+    "modified_runtime": 150,
     "modified_runtime_target_approx": 10,
-    "target_note": "138 modified runtime seams exceed the approximate target of ten. Issues #35–#43 cover protocol translation, response integrity, cancellation, atomic usage/OAuth, migration backup, media transport, model catalogs, MITM limits, and v0.5.69 integration security. Keep shared helpers additive and retire each seam only when equivalent upstream behavior passes its linked regression gates."
+    "target_note": "150 modified runtime seams exceed the approximate target of ten. Issues #35–#43 cover protocol translation, response integrity, cancellation, atomic usage/OAuth, migration backup, media transport, model catalogs, MITM limits, standalone packaging, provider-cache ordering, and v0.5.69 integration security. Keep shared helpers additive and retire each seam only when equivalent upstream behavior passes its linked regression gates."
   },
   "runtime_policies": {
     "claude_assistant_prefill": {
@@ -137,6 +137,47 @@
         "src/lib/oauth/utils/server.js"
       ],
       "preserve": "Commit a contributed connection and consume the exact completing invite in one SQLite transaction. Revocation, owner/session/provider changes, replayed proxy polling, stale reservations, malformed HTTP 200 callbacks, and server-side proxy mismatches fail closed without persisting credentials."
+    },
+    "standalone_sqljs_assets": {
+      "boundaries": [
+        "cli/scripts/build-cli.js",
+        "scripts/copy-standalone-assets.mjs"
+      ],
+      "preserve": "Copy sql.js/dist/sql-wasm.wasm into both Next standalone and packaged CLI artifacts, preserve the traced runtime path, and fail the build if the required asset is absent."
+    },
+    "live_model_discovery": {
+      "boundaries": [
+        "open-sse/providers/capabilities.js",
+        "open-sse/providers/catalogOverride.js",
+        "open-sse/services/clinepassModels.js",
+        "open-sse/services/cursorModels.js",
+        "open-sse/services/grokCliModels.js",
+        "open-sse/services/kimchiModels.js",
+        "open-sse/services/kiroModels.js",
+        "open-sse/services/modelCatalogResponse.js",
+        "open-sse/services/qoderModels.js",
+        "open-sse/shared/zedAuth.js",
+        "src/app/api/providers/[id]/models/route.js",
+        "src/app/api/v1/models/[...model]/route.js",
+        "src/app/api/v1/models/route.js",
+        "src/lib/modelCatalog/sync.js"
+      ],
+      "preserve": "Apply one request-wide absolute deadline, bounded fatal-UTF8 JSON reads, late-response cancellation, and caller aborts. Keep cache writes ordered by request identity and epoch; do not repopulate after clear. Resolve colliding model IDs with provider-scoped metadata and use a custom-provider fallback only when every upstream declaration agrees."
+    },
+    "oauth_transport_safety": {
+      "boundaries": [
+        "open-sse/services/tokenRefresh.js",
+        "open-sse/services/tokenRefresh/providers.js",
+        "open-sse/shared/zedAuth.js",
+        "src/app/api/oauth/[provider]/[action]/route.js",
+        "src/lib/oauth/providerHelpers.js",
+        "src/lib/oauth/providers/gitlab.js",
+        "src/lib/oauth/providers/xai.js",
+        "src/lib/oauth/services/xai.js",
+        "src/lib/oauth/utils/server.js",
+        "src/lib/oauth/utils/xaiHttp.js"
+      ],
+      "preserve": "Bound token and discovery headers/bodies, cancel late responses, validate required access-token fields, and expose only fixed or allowlisted failure metadata. Bind callback completion to the exact owner/session/generation and never log or return raw upstream bodies, callback query values, tokens, or client secrets."
     }
   },
   "compatibility_fixes": [
@@ -517,9 +558,10 @@
     },
     {
       "issue": "https://github.com/azox-ai/azox-9router/issues/43",
-      "provenance": "The history-preserving v0.5.69 merge into fork base 9754c491 exposed inherited upstream and overlap defects across translator, streaming, model-catalog, media, MITM, OAuth, Contributor and routing seams. Multi-pass adversarial review added deterministic fail-closed transport, identity, atomicity, cancellation and bounded-resource guards; each behavior below is fork-owned until equivalent upstream code passes these regressions.",
-      "preserve": "Preserve lossless supported translation and reject unsupported semantics explicitly; require strict bounded semantic HTTP 200 bodies and real protocol terminals; order account/quota mutations through request terminal events; keep cancellation and secondary cleanup non-blocking; pin public DNS and strip redirected secrets; make Contributor OAuth completion atomic; keep media credentials out of URLs and internal dispatch independent of inbound Host; validate audio/video/image/embedding containers and identities; cap MITM/request logs and bodies; preserve model-catalog refresh persistence and caller deadlines.",
+      "provenance": "The history-preserving v0.5.69 merge into fork base 9754c491 exposed inherited upstream and overlap defects across translator, streaming, model-catalog, media, MITM, OAuth, Contributor and routing seams. Multi-pass adversarial review added deterministic fail-closed transport, identity, atomicity, cancellation and bounded-resource guards. The final post-audit additionally found standalone SQL.js asset omission, half-open Qoder/CommandCode terminals, provider catalog ID collisions, cache ordering races, unbounded model/token/OAuth fetches, and raw upstream error reflection. Each behavior below is fork-owned until equivalent upstream code passes these regressions.",
+      "preserve": "Preserve lossless supported translation and reject unsupported semantics explicitly; require strict bounded semantic HTTP 200 bodies and real protocol terminals; close Qoder/CommandCode on logical completion even when upstream stays open; order account/quota and provider-cache mutations through request identity and epoch guards; scope catalog capabilities by provider and use only unanimous fallback metadata; keep cancellation and secondary cleanup non-blocking; pin public DNS and strip redirected secrets; never reflect raw provider bodies or callback data; make Contributor OAuth completion atomic; package the SQL.js WASM runtime in standalone and CLI artifacts; keep media credentials out of URLs and internal dispatch independent of inbound Host; validate audio/video/image/embedding containers and identities; cap MITM/request logs and bodies; preserve model-catalog refresh persistence and caller deadlines.",
       "boundaries": [
+        "cli/scripts/build-cli.js",
         "cli/src/cli/commands/xaiVideo.js",
         "custom-server.js",
         "open-sse/config/mediaConfig.js",
@@ -568,15 +610,23 @@
         "open-sse/handlers/ttsProviders/voiceList.js",
         "open-sse/handlers/ttsProviders/xiaomi-mimo.js",
         "open-sse/handlers/videoCore.js",
+        "open-sse/providers/capabilities.js",
+        "open-sse/providers/catalogOverride.js",
+        "open-sse/services/clinepassModels.js",
         "open-sse/services/combo.js",
         "open-sse/services/copilotModels.js",
+        "open-sse/services/cursorModels.js",
+        "open-sse/services/grokCliModels.js",
+        "open-sse/services/kimchiModels.js",
         "open-sse/services/kiroModels.js",
         "open-sse/services/modelCatalogResponse.js",
         "open-sse/services/projectId.js",
         "open-sse/services/qoderModels.js",
         "open-sse/services/thoughtSignatureStore.js",
+        "open-sse/services/tokenRefresh.js",
         "open-sse/services/tokenRefresh/providers.js",
         "open-sse/services/usage/shared.js",
+        "open-sse/shared/zedAuth.js",
         "open-sse/transformer/responsesTransformer.js",
         "open-sse/transformer/streamToJsonConverter.js",
         "open-sse/translator/concerns/assistantPrefillPolicy.js",
@@ -604,6 +654,8 @@
         "open-sse/utils/requestBody.js",
         "open-sse/utils/requestLogger.js",
         "open-sse/utils/stream.js",
+        "open-sse/utils/streamContract.js",
+        "scripts/copy-standalone-assets.mjs",
         "src/app/api/cli-tools/cowork-mcp-tools/route.js",
         "src/app/api/contribute/oauth/[provider]/[action]/route.js",
         "src/app/api/contributor-admin/invites/route.js",
@@ -619,6 +671,7 @@
         "src/app/api/proxy-pools/[id]/test/route.js",
         "src/app/api/v1/api/chat/route.js",
         "src/app/api/v1/audio/voices/route.js",
+        "src/app/api/v1/models/[...model]/route.js",
         "src/app/api/v1/models/route.js",
         "src/app/api/v1beta/models/[...path]/route.js",
         "src/app/login/page.js",
@@ -626,9 +679,14 @@
         "src/lib/contributor/store.js",
         "src/lib/db/repos/combosRepo.js",
         "src/lib/db/repos/connectionsRepo.js",
+        "src/lib/modelCatalog/sync.js",
+        "src/lib/oauth/providerHelpers.js",
         "src/lib/oauth/providers/gitlab.js",
+        "src/lib/oauth/providers/xai.js",
         "src/lib/oauth/services/qoder.js",
+        "src/lib/oauth/services/xai.js",
         "src/lib/oauth/utils/server.js",
+        "src/lib/oauth/utils/xaiHttp.js",
         "src/lib/tunnel/shared/state.js",
         "src/mitm/bodyLimit.js",
         "src/mitm/handlers/antigravity.js",
@@ -672,6 +730,7 @@
         "tests/unit/antigravity-retry-hook.test.js",
         "tests/unit/api-key-security.test.js",
         "tests/unit/base-executor-retry.test.js",
+        "tests/unit/cli-build-artifacts.test.js",
         "tests/unit/cli-xai-video.test.js",
         "tests/unit/codex-fast-capacity.test.js",
         "tests/unit/codex-image-fetch.test.js",
@@ -690,6 +749,7 @@
         "tests/unit/contributor-session-origin.test.js",
         "tests/unit/contributor-store.test.js",
         "tests/unit/cowork-mcp-ssrf-guard.test.js",
+        "tests/unit/cursor-models.test.js",
         "tests/unit/custom-server-peer-headers.test.js",
         "tests/unit/customization-boundary.test.js",
         "tests/unit/db-concurrent.test.js",
@@ -703,21 +763,26 @@
         "tests/unit/gemini-usage-projectid.test.js",
         "tests/unit/github-responses-routing.test.js",
         "tests/unit/gitlab-oauth-origin-policy.test.js",
+        "tests/unit/grok-cli-models.test.js",
         "tests/unit/image-fetch-hardening.test.js",
         "tests/unit/image-generation.test.js",
         "tests/unit/image-result-integrity.test.js",
         "tests/unit/jina-reader-fetch.test.js",
+        "tests/unit/kimchi.test.js",
         "tests/unit/kiro-nonstream-error.test.js",
         "tests/unit/kiro-terminal-integrity.test.js",
+        "tests/unit/live-model-availability-hardening.test.js",
         "tests/unit/local-device-tts.test.js",
         "tests/unit/minimax-tts.test.js",
         "tests/unit/mitm-base-stream-lifecycle.test.js",
         "tests/unit/mitm-body-limit.test.js",
         "tests/unit/mitm-logger-bounds.test.js",
         "tests/unit/mitm-transport-security.test.js",
+        "tests/unit/model-catalog-provider-collision.test.js",
         "tests/unit/multimodal-drop-lock.test.js",
         "tests/unit/nonstream-body-integrity.test.js",
         "tests/unit/oauth-message-origin.test.js",
+        "tests/unit/oauth-modal-api-base.test.js",
         "tests/unit/oauth-register-session.test.js",
         "tests/unit/ollama-api-request-body.test.js",
         "tests/unit/ollama-output-transform.test.js",
@@ -744,9 +809,12 @@
         "tests/unit/search-ssrf-guard.test.js",
         "tests/unit/ssrf-agent-lifecycle.test.js",
         "tests/unit/ssrf-guard-hardening.test.js",
+        "tests/unit/standalone-assets.test.js",
         "tests/unit/streaming-response-contract.test.js",
         "tests/unit/stt-core-integrity.test.js",
         "tests/unit/stt-handler-integrity.test.js",
+        "tests/unit/token-refresh-dispatch.test.js",
+        "tests/unit/token-refresh-generic.test.js",
         "tests/unit/trae-stream-integrity.test.js",
         "tests/unit/translator-helpers-edge.test.js",
         "tests/unit/translator-request-normalization.test.js",
@@ -757,6 +825,9 @@
         "tests/unit/unsupported-tool-fallback.test.js",
         "tests/unit/upstream-error-body.test.js",
         "tests/unit/upstream-v0555-preservation.test.js",
+        "tests/unit/v1-model-lookup-3588.test.js",
+        "tests/unit/xai-oauth-service.test.js",
+        "tests/unit/xai-tokenRefresh.test.js",
         "tests/unit/xai-video-core.test.js",
         "tests/unit/xai-video-handler.test.js",
         "tests/unit/xiaomi-mimo-tts.test.js",
@@ -940,6 +1011,10 @@
         "reason": "Contributor persistence domain module."
       },
       {
+        "path": "src/lib/oauth/utils/xaiHttp.js",
+        "reason": "Bounded, abort-aware and redacted xAI OAuth HTTP transport shared by dashboard and refresh flows (#43)."
+      },
+      {
         "path": "src/mitm/bodyLimit.js",
         "category": "runtime",
         "reason": "Bound MITM request/response bodies and logs, enforce strict stream decoding, and preserve peer/TLS lifecycle safety (#43)."
@@ -1059,6 +1134,10 @@
         "reason": "Regression coverage for the v0.5.69 compatibility, integrity, cancellation, OAuth, media, and concurrency review (#43)."
       },
       {
+        "path": "tests/unit/live-model-availability-hardening.test.js",
+        "reason": "Regression coverage for bounded live discovery, cache ordering, cancellation and error redaction (#43)."
+      },
+      {
         "path": "tests/unit/local-device-tts.test.js",
         "category": "tests",
         "reason": "Regression coverage for the v0.5.69 compatibility, integrity, cancellation, OAuth, media, and concurrency review (#43)."
@@ -1082,6 +1161,10 @@
         "path": "tests/unit/mitm-transport-security.test.js",
         "category": "tests",
         "reason": "Regression coverage for the v0.5.69 compatibility, integrity, cancellation, OAuth, media, and concurrency review (#43)."
+      },
+      {
+        "path": "tests/unit/model-catalog-provider-collision.test.js",
+        "reason": "Regression coverage for provider-scoped capability collisions and unanimous custom-provider fallback (#43)."
       },
       {
         "path": "tests/unit/nonstream-body-integrity.test.js",
@@ -1229,6 +1312,11 @@
         "path": "CLAUDE.md",
         "category": "documentation",
         "reason": "Document reproducible npm install commands and regression baseline."
+      },
+      {
+        "path": "cli/scripts/build-cli.js",
+        "category": "tooling",
+        "reason": "Package the SQL.js WASM runtime in the CLI standalone artifact and fail closed when it is missing (#43)."
       },
       {
         "path": "cli/src/cli/commands/xaiVideo.js",
@@ -1491,9 +1579,24 @@
         "reason": "Validate and bound media generation, polling, catalogs, downloads, local synthesis, cleanup, and account identity without URL credentials or origin-based self-fetch (#43)."
       },
       {
+        "path": "open-sse/providers/capabilities.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
+      },
+      {
+        "path": "open-sse/providers/catalogOverride.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
+      },
+      {
         "path": "open-sse/services/accountFallback.js",
         "category": "runtime",
         "reason": "Classify exact compatibility errors without account cooldown and make client cancellation terminal (#35)."
+      },
+      {
+        "path": "open-sse/services/clinepassModels.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
       },
       {
         "path": "open-sse/services/combo.js",
@@ -1504,6 +1607,21 @@
         "path": "open-sse/services/copilotModels.js",
         "category": "runtime",
         "reason": "Bound model catalog and token-refresh transport, validate HTTP 200 envelopes, persist refreshed credentials safely, and propagate caller cancellation (#43)."
+      },
+      {
+        "path": "open-sse/services/cursorModels.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
+      },
+      {
+        "path": "open-sse/services/grokCliModels.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
+      },
+      {
+        "path": "open-sse/services/kimchiModels.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
       },
       {
         "path": "open-sse/services/kiroModels.js",
@@ -1539,6 +1657,11 @@
         "path": "open-sse/services/usage/shared.js",
         "category": "runtime",
         "reason": "Preserve deterministic combo fallback and concurrency-safe usage/account mutation ordering (#43)."
+      },
+      {
+        "path": "open-sse/shared/zedAuth.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
       },
       {
         "path": "open-sse/transformer/responsesTransformer.js",
@@ -1691,6 +1814,11 @@
         "reason": "Extract usage from legitimate response.incomplete terminals (#38)."
       },
       {
+        "path": "scripts/copy-standalone-assets.mjs",
+        "category": "tooling",
+        "reason": "Package the SQL.js WASM runtime in standalone builds and fail closed when it is missing (#43)."
+      },
+      {
         "path": "src/app/api/cli-tools/cowork-mcp-tools/route.js",
         "category": "runtime",
         "reason": "Guard remote Cowork MCP fetches with DNS pinning while retaining reviewed local administration paths (#43)."
@@ -1751,6 +1879,11 @@
         "reason": "Validate and bound media generation, polling, catalogs, downloads, local synthesis, cleanup, and account identity without URL credentials or origin-based self-fetch (#43)."
       },
       {
+        "path": "src/app/api/v1/models/[...model]/route.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
+      },
+      {
         "path": "src/app/api/v1/models/route.js",
         "category": "runtime",
         "reason": "Bound model catalog and token-refresh transport, validate HTTP 200 envelopes, persist refreshed credentials safely, and propagate caller cancellation (#43)."
@@ -1806,14 +1939,34 @@
         "reason": "Expose combo transfer operations through local DB facade."
       },
       {
+        "path": "src/lib/modelCatalog/sync.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
+      },
+      {
+        "path": "src/lib/oauth/providerHelpers.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
+      },
+      {
         "path": "src/lib/oauth/providers/gitlab.js",
         "category": "runtime",
         "reason": "Fail closed on OAuth origin/state/proxy ambiguity, malformed success bodies, and unbounded provider operations (#43)."
       },
       {
+        "path": "src/lib/oauth/providers/xai.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
+      },
+      {
         "path": "src/lib/oauth/services/qoder.js",
         "category": "runtime",
         "reason": "Fail closed on OAuth origin/state/proxy ambiguity, malformed success bodies, and unbounded provider operations (#43)."
+      },
+      {
+        "path": "src/lib/oauth/services/xai.js",
+        "category": "runtime",
+        "reason": "Preserve bounded, abort-aware, redacted provider discovery/OAuth behavior and cache/catalog ordering from the final v0.5.69 review (#43)."
       },
       {
         "path": "src/lib/oauth/utils/server.js",
@@ -2026,6 +2179,11 @@
         "reason": "Cover target-format assistant-prefill policy while retaining upstream Fable 5.1 and GPT-6 Astra capability expectations."
       },
       {
+        "path": "tests/unit/cli-build-artifacts.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
+      },
+      {
         "path": "tests/unit/cli-xai-video.test.js",
         "category": "tests",
         "reason": "Regression coverage for the v0.5.69 compatibility, integrity, cancellation, OAuth, media, and concurrency review (#43)."
@@ -2069,6 +2227,11 @@
         "path": "tests/unit/cowork-mcp-ssrf-guard.test.js",
         "category": "tests",
         "reason": "Verify Cowork MCP remote requests cannot bypass public-origin validation (#43)."
+      },
+      {
+        "path": "tests/unit/cursor-models.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
       },
       {
         "path": "tests/unit/custom-server-peer-headers.test.js",
@@ -2126,6 +2289,11 @@
         "reason": "Exercise cached dynamic Responses routing to prove native Chat custom requests reject before provider dispatch (#35)."
       },
       {
+        "path": "tests/unit/grok-cli-models.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
+      },
+      {
         "path": "tests/unit/headroom-chat-core.test.js",
         "category": "tests",
         "reason": "Verify the configured Headroom timeout reaches the compression boundary after the upstream settings change (#43)."
@@ -2144,6 +2312,11 @@
         "path": "tests/unit/jina-reader-fetch.test.js",
         "category": "tests",
         "reason": "Regression coverage for the v0.5.69 compatibility, integrity, cancellation, OAuth, media, and concurrency review (#43)."
+      },
+      {
+        "path": "tests/unit/kimchi.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
       },
       {
         "path": "tests/unit/kiro-nonstream-error.test.js",
@@ -2241,6 +2414,21 @@
         "reason": "Cover special IPv4/IPv6 ranges, mapped forms, redirects, DNS failures, and credential stripping (#43)."
       },
       {
+        "path": "tests/unit/standalone-assets.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
+      },
+      {
+        "path": "tests/unit/token-refresh-dispatch.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
+      },
+      {
+        "path": "tests/unit/token-refresh-generic.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
+      },
+      {
         "path": "tests/unit/translator-helpers-edge.test.js",
         "category": "tests",
         "reason": "Regression coverage for the v0.5.69 compatibility, integrity, cancellation, OAuth, media, and concurrency review (#43)."
@@ -2249,6 +2437,21 @@
         "path": "tests/unit/translator-request-normalization.test.js",
         "category": "tests",
         "reason": "Regression coverage for the v0.5.69 compatibility, integrity, cancellation, OAuth, media, and concurrency review (#43)."
+      },
+      {
+        "path": "tests/unit/v1-model-lookup-3588.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
+      },
+      {
+        "path": "tests/unit/xai-oauth-service.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
+      },
+      {
+        "path": "tests/unit/xai-tokenRefresh.test.js",
+        "category": "tests",
+        "reason": "Regression coverage for the final v0.5.69 post-audit stability and security fixes (#43)."
       },
       {
         "path": "tests/unit/xai-video-core.test.js",
