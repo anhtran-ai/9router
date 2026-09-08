@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const mocks = vi.hoisted(() => ({
+  fetchPublic: vi.fn(),
+}));
+
+vi.mock("../../src/shared/utils/ssrfGuard.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, fetchPublic: mocks.fetchPublic };
+});
+
 import REGISTRY from "../../open-sse/providers/registry/index.js";
 import { buildSearchRequest } from "../../open-sse/handlers/search/callers.js";
 import { handleSearchCore } from "../../open-sse/handlers/search/index.js";
@@ -41,7 +50,7 @@ const RESPONSE = {
 };
 
 afterEach(() => {
-  vi.unstubAllGlobals();
+  mocks.fetchPublic.mockReset();
 });
 
 describe("Xquik search provider", () => {
@@ -130,10 +139,10 @@ describe("Xquik search provider", () => {
   });
 
   it("reports Xquik credits without claiming an unknown USD cost", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(RESPONSE), {
+    mocks.fetchPublic.mockResolvedValue(new Response(JSON.stringify(RESPONSE), {
       status: 200,
       headers: { "Content-Type": "application/json" },
-    })));
+    }));
 
     const result = await handleSearchCore({
       body: { query: PARAMS.query, max_results: 10, provider_options: PARAMS.providerOptions },
