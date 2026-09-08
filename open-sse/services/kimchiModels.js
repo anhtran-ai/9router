@@ -1,6 +1,11 @@
 import { createHash } from "crypto";
 
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import {
+  awaitModelCatalogResponse,
+  cancelModelCatalogBody,
+  readModelCatalogJson,
+} from "./modelCatalogResponse.js";
 
 export const KIMCHI_API = "https://llm.kimchi.dev";
 export const KIMCHI_USER_AGENT = "kimchi/0.1.40";
@@ -11,8 +16,49 @@ const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 /** @type {Map<string, { expiresAt: number, models: object[], rawModels: object[] }>} */
 const catalogCache = new Map();
+/** @type {Map<string, { controller: AbortController, promise: Promise<object | null>, waiters: number, settled: boolean }>} */
+const catalogInflight = new Map();
+let catalogCacheEpoch = 0;
 /** @type {Map<string, object>} */
 const metadataByModelId = new Map();
+
+function callerAbortReason(signal) {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new DOMException("Kimchi catalog request aborted", "AbortError");
+}
+
+function awaitWithCallerSignal(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(callerAbortReason(signal));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(reject, callerAbortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+async function waitForCatalog(entry, signal) {
+  entry.waiters += 1;
+  try {
+    return await awaitWithCallerSignal(entry.promise, signal);
+  } finally {
+    entry.waiters -= 1;
+    if (entry.waiters === 0 && !entry.settled && !entry.controller.signal.aborted) {
+      entry.controller.abort(new DOMException("Kimchi catalog has no active callers", "AbortError"));
+    }
+  }
+}
 
 function normalizeKimchiEndpoint(endpoint) {
   const raw = typeof endpoint === "string" ? endpoint.trim() : "";
@@ -112,7 +158,7 @@ async function fetchKimchiCatalogRaw(token, endpoint, options = {}) {
     : controller.signal;
 
   try {
-    const response = await proxyAwareFetch(url, {
+    const response = await awaitModelCatalogResponse(proxyAwareFetch(url, {
       method: "GET",
       headers: {
         "Accept": "application/json",
@@ -121,20 +167,40 @@ async function fetchKimchiCatalogRaw(token, endpoint, options = {}) {
       },
       cache: "no-store",
       signal,
-    }, options.proxyOptions || null);
+    }, options.proxyOptions || null), signal);
 
     if (!response.ok) {
-      const error = new Error(`Kimchi models ${response.status}: ${response.statusText}`);
+      cancelModelCatalogBody(response);
+      const error = new Error(`Kimchi models returned HTTP ${response.status}`);
       error.status = response.status;
       error.retryable = RETRYABLE_STATUSES.has(response.status);
       throw error;
     }
 
-    const data = await response.json();
+    const data = await readModelCatalogJson(response, { signal });
     return Array.isArray(data?.models) ? data.models : [];
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function resolveKimchiModelsUncached(token, endpoint, options) {
+  let rawModels;
+  try {
+    rawModels = await fetchKimchiCatalogRaw(token, endpoint, options);
+  } catch (error) {
+    options.log?.warn?.("KIMCHI_MODELS", "Kimchi catalog request failed");
+    return null;
+  }
+
+  const models = rawModels.map(normalizeKimchiModel).filter(Boolean);
+  if (models.length === 0) return null;
+
+  return {
+    expiresAt: Date.now() + CACHE_TTL_MS,
+    models,
+    rawModels,
+  };
 }
 
 export async function resolveKimchiModels(credentials, options = {}) {
@@ -143,34 +209,74 @@ export async function resolveKimchiModels(credentials, options = {}) {
 
   const endpoint = credentials?.providerSpecificData?.kimchiEndpoint || options.endpoint || KIMCHI_API;
   const key = cacheKey(credentials, endpoint);
-  const now = Date.now();
   if (!options.forceRefresh) {
     const cached = catalogCache.get(key);
-    if (cached && cached.expiresAt > now) return cached;
+    if (cached && cached.expiresAt > Date.now()) return cached;
   }
 
-  let rawModels;
+  const existing = catalogInflight.get(key);
+  if (existing && !existing.controller.signal.aborted && !options.forceRefresh) {
+    try {
+      return await waitForCatalog(existing, options.signal);
+    } catch (error) {
+      if (!options.signal?.aborted) {
+        options.log?.warn?.("KIMCHI_MODELS", "Kimchi catalog request failed");
+      }
+      return null;
+    }
+  }
+
+  const controller = new AbortController();
+  const requestEpoch = catalogCacheEpoch;
+  const entry = {
+    controller,
+    promise: null,
+    waiters: 0,
+    settled: false,
+  };
+  entry.promise = Promise.resolve()
+    .then(() => resolveKimchiModelsUncached(token, endpoint, {
+      ...options,
+      signal: controller.signal,
+    }))
+    .then((result) => {
+      if (
+        result
+        && requestEpoch === catalogCacheEpoch
+        && catalogInflight.get(key) === entry
+        && !controller.signal.aborted
+      ) {
+        rememberModels(result.models);
+        catalogCache.set(key, result);
+      }
+      return result;
+    });
+  catalogInflight.set(key, entry);
+  entry.promise.then(
+    () => {
+      entry.settled = true;
+      if (catalogInflight.get(key) === entry) catalogInflight.delete(key);
+    },
+    () => {
+      entry.settled = true;
+      if (catalogInflight.get(key) === entry) catalogInflight.delete(key);
+    },
+  );
+
   try {
-    rawModels = await fetchKimchiCatalogRaw(token, endpoint, options);
+    return await waitForCatalog(entry, options.signal);
   } catch (error) {
-    options.log?.warn?.("KIMCHI_MODELS", error.message);
+    if (!options.signal?.aborted) {
+      options.log?.warn?.("KIMCHI_MODELS", "Kimchi catalog request failed");
+    }
     return null;
   }
-
-  const models = rawModels.map(normalizeKimchiModel).filter(Boolean);
-  if (models.length === 0) return null;
-
-  rememberModels(models);
-  const entry = {
-    expiresAt: Date.now() + CACHE_TTL_MS,
-    models,
-    rawModels,
-  };
-  catalogCache.set(key, entry);
-  return entry;
 }
 
 export function clearKimchiCatalog() {
+  catalogCacheEpoch += 1;
+  if (!Number.isSafeInteger(catalogCacheEpoch)) catalogCacheEpoch = 1;
   catalogCache.clear();
   metadataByModelId.clear();
+  catalogInflight.clear();
 }

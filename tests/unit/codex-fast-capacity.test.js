@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CodexExecutor } from "../../open-sse/executors/codex.js";
 
 function streamFromText(text) {
@@ -50,6 +50,28 @@ describe("Codex fast tier and capacity handling", () => {
     const peek = await executor._peekSseTransientError(response);
     expect(peek.accountFallback).toBe(true);
     expect(peek.message).toBe("Selected model is at capacity. Please try a different model.");
+  });
+
+  it("reports a matched transient error without waiting for source cancellation", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode([
+          "event: error",
+          'data: {"error":{"message":"Selected model is at capacity."}}',
+          "",
+        ].join("\n")));
+      },
+      cancel,
+    });
+
+    const peek = await new CodexExecutor()._peekSseTransientError(new Response(source, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    }));
+
+    expect(peek.accountFallback).toBe(true);
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it("reassembles normal SSE after peeking", async () => {

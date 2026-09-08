@@ -10,6 +10,7 @@ import { refreshKiroToken } from "../services/tokenRefresh.js";
 import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { STREAM_FIRST_CHUNK_TIMEOUT_MS } from "../config/runtimeConfig.js";
+import { cancelReaderBestEffort } from "../utils/reader.js";
 
 const KIRO_REPAIR_BUFFER_MAX_BYTES = 8 * 1024 * 1024;
 const KIRO_REPAIR_HEARTBEAT_MS = 10_000;
@@ -122,7 +123,7 @@ async function readResponsePrefix(response, signal, maxBytes, timeoutMs) {
       if (value.byteLength > remaining) break;
     }
   } finally {
-    await reader.cancel("bounded Kiro retry error body").catch(() => {});
+    cancelReaderBestEffort(reader, "bounded Kiro retry error body");
   }
   return decoder.decode(concatChunks(chunks, totalBytes));
 }
@@ -548,7 +549,7 @@ export class KiroExecutor extends BaseExecutor {
         sawChunk = true;
         totalBytes += value.byteLength;
         if (totalBytes > options.maxBytes) {
-          await reader.cancel("kiro_integrity_buffer_exceeded").catch(() => {});
+          cancelReaderBestEffort(reader, "kiro_integrity_buffer_exceeded");
           return {
             kind: "terminal_stop",
             message: `Kiro integrity buffer exceeded ${options.maxBytes} bytes`,
@@ -559,7 +560,7 @@ export class KiroExecutor extends BaseExecutor {
         inspectSSEChunk(value, output);
       }
     } catch (error) {
-      await reader.cancel(error.message).catch(() => {});
+      cancelReaderBestEffort(reader, error.message);
       throw error;
     }
 
@@ -1136,7 +1137,7 @@ export class KiroExecutor extends BaseExecutor {
             const chunksBefore = state.chunkIndex;
             const framesBefore = state.validatedFrames;
             if (!processBytes(value, controller)) {
-              await reader.cancel("invalid Kiro EventStream").catch(() => {});
+              cancelReaderBestEffort(reader, "invalid Kiro EventStream");
               break;
             }
             if (state.validatedFrames > framesBefore && state.chunkIndex === chunksBefore) {
@@ -1159,7 +1160,7 @@ export class KiroExecutor extends BaseExecutor {
         }
       },
       cancel(reason) {
-        return reader.cancel(reason);
+        cancelReaderBestEffort(reader, reason);
       }
     });
     return new Response(stream, {

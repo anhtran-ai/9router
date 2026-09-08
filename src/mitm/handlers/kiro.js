@@ -1,6 +1,6 @@
 const { err } = require("../logger");
 const { IS_DEV } = require("../config");
-const { fetchRouter, pipeTransformedEventStream } = require("./base");
+const { fetchRouter, pipeTransformedEventStream, createBridgeAbortController } = require("./base");
 const fs = require("fs");
 const path = require("path");
 
@@ -133,18 +133,13 @@ function encodeHeader(name, value) {
  *   :event-type    = e.g. "assistantResponseEvent"
  *   :content-type  = "application/json"  (initial-response uses x-amz-json-1.0)
  */
-function buildEventStreamFrame(eventType, payload, contentType = "application/json") {
+function buildRawEventStreamFrame(headerEntries, payload) {
   const payloadBuf = Buffer.from(
     typeof payload === "string" ? payload : JSON.stringify(payload),
     "utf8"
   );
 
-  // All three Smithy system headers are required
-  const headersBuf = Buffer.concat([
-    encodeHeader(":message-type", "event"),
-    encodeHeader(":event-type", eventType),
-    encodeHeader(":content-type", contentType),
-  ]);
+  const headersBuf = Buffer.concat(headerEntries.map(([name, value]) => encodeHeader(name, value)));
   const headersLen = headersBuf.length;
 
   const totalLen = 4 + 4 + 4 + headersLen + payloadBuf.length + 4;
@@ -158,6 +153,23 @@ function buildEventStreamFrame(eventType, payload, contentType = "application/js
   frame.writeUInt32BE(crc32(frame.slice(0, totalLen - 4)), totalLen - 4); // message CRC
 
   return frame;
+}
+
+function buildEventStreamFrame(eventType, payload, contentType = "application/json") {
+  // All three Smithy system headers are required for normal event messages.
+  return buildRawEventStreamFrame([
+    [":message-type", "event"],
+    [":event-type", eventType],
+    [":content-type", contentType],
+  ], payload);
+}
+
+function buildEventStreamExceptionFrame(exceptionType, payload) {
+  return buildRawEventStreamFrame([
+    [":message-type", "exception"],
+    [":exception-type", exceptionType],
+    [":content-type", "application/json"],
+  ], payload);
 }
 
 /** Real Kiro Runtime always starts the stream with this frame (capture of IDE 1.0.228). */
@@ -179,6 +191,14 @@ function withInitialFrame(state, frames) {
 }
 
 // ─── CodeWhisperer → OpenAI conversion ───────────────────────────────────────
+
+const INLINE_IMAGE_MIME_BY_FORMAT = new Map([
+  ["png", "image/png"],
+  ["jpeg", "image/jpeg"],
+  ["jpg", "image/jpeg"],
+  ["gif", "image/gif"],
+  ["webp", "image/webp"],
+]);
 
 /**
  * Safely stringify a tool-call input value.
@@ -214,9 +234,32 @@ function convertUserInputMessage(uim) {
     });
   }
 
+  const images = Array.isArray(uim.images) ? uim.images : [];
+  const imageParts = images
+    .filter(image => image !== null
+      && typeof image === "object"
+      && !Array.isArray(image)
+      && image.source !== null
+      && typeof image.source === "object"
+      && !Array.isArray(image.source)
+      && INLINE_IMAGE_MIME_BY_FORMAT.has(image.format)
+      && typeof image.source.bytes === "string"
+      && image.source.bytes.length > 0)
+    .map(image => ({
+      type: "image_url",
+      image_url: {
+        url: `data:${INLINE_IMAGE_MIME_BY_FORMAT.get(image.format)};base64,${image.source.bytes}`,
+      },
+    }));
+
   // Emit user text only if it exists alongside OR when there are no tool results
   const text = (uim.content || "").trim();
-  if (text || toolResults.length === 0) {
+  if (imageParts.length > 0) {
+    const content = [];
+    if (text) content.push({ type: "text", text });
+    content.push(...imageParts);
+    out.push({ role: "user", content });
+  } else if (text || toolResults.length === 0) {
     out.push({ role: "user", content: text });
   }
 
@@ -485,6 +528,7 @@ function emitFinish(state) {
  * @param {string} mappedModel - Model name after MITM alias mapping
  */
 async function intercept(req, res, bodyBuffer, mappedModel) {
+  const bridge = createBridgeAbortController(req, res);
   try {
     // Detect and handle binary data (e.g., continuation requests with EventStream frames)
     if (isBinaryEventStream(bodyBuffer)) {
@@ -512,24 +556,37 @@ async function intercept(req, res, bodyBuffer, mappedModel) {
     };
 
     // 3: Forward to 9router
-    const routerRes = await fetchRouter(openaiBody, "/v1/chat/completions", req.headers);
+    const routerRes = await fetchRouter(openaiBody, "/v1/chat/completions", req.headers, bridge.signal);
 
     // 4 + 5: Re-encode response as AWS EventStream binary using standard pipeline
     const state = initKiroState(mappedModel);
 
-    await pipeTransformedEventStream(routerRes, res, convertOpenAIToKiro, state);
+    await pipeTransformedEventStream(routerRes, res, convertOpenAIToKiro, state, bridge.signal);
   } catch (error) {
+    if (bridge.signal.aborted || res.destroyed) return;
     err(`[Kiro MITM] Request processing failed: ${error.message}`);
+    const publicMessage = "9Router returned an invalid or incomplete response stream";
     if (!res.headersSent) {
-      res.writeHead(500, { "Content-Type": "application/json" });
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: {
+          message: publicMessage,
+          type: "mitm_upstream_error",
+          handler: "kiro"
+        }
+      }));
+      return;
     }
-    res.end(JSON.stringify({ 
-      error: { 
-        message: error.message, 
-        type: "mitm_error",
-        handler: "kiro"
-      } 
-    }));
+    // Once binary EventStream headers or partial content have reached the IDE,
+    // appending plain JSON corrupts the wire protocol and can be mistaken for a
+    // clean empty completion. Surface a typed Smithy exception frame instead.
+    if (!res.writableEnded) {
+      res.end(buildEventStreamExceptionFrame("InternalServerException", {
+        message: publicMessage,
+      }));
+    }
+  } finally {
+    bridge.cleanup();
   }
 }
 

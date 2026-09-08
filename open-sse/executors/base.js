@@ -4,6 +4,68 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
+import { readUpstreamBodyText, rebuildUpstreamResponse } from "../utils/error.js";
+import { waitWithSignal } from "../utils/abort.js";
+
+const RETRY_INSPECTION_MAX_BYTES = 256 * 1024;
+const RETRY_HOOK_TIMEOUT_MS = 5000;
+
+function discardResponseBody(response, reason) {
+  if (!response?.body || response.bodyUsed === true) return;
+  try {
+    const cancellation = response.body.cancel(reason);
+    cancellation?.catch?.(() => {});
+  } catch { /* best-effort connection release */ }
+}
+
+async function inspectRetryResponse(response, signal) {
+  if (!response?.body?.getReader) return { response, bodyText: "" };
+  const deadline = new AbortController();
+  const timer = setTimeout(
+    () => deadline.abort(new DOMException("Retry response inspection timed out", "TimeoutError")),
+    RETRY_HOOK_TIMEOUT_MS,
+  );
+  timer.unref?.();
+  const readSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+  let bodyText = "";
+  try {
+    bodyText = await readUpstreamBodyText(response, {
+      signal: readSignal,
+      maxBytes: RETRY_INSPECTION_MAX_BYTES,
+      stallTimeoutMs: RETRY_HOOK_TIMEOUT_MS,
+    });
+  } catch (error) {
+    if (signal?.aborted) throw signal.reason ?? new DOMException("Request aborted", "AbortError");
+    // The response was already cancelled by the bounded reader. Preserve its
+    // status and headers with an empty bounded body for the final-error path.
+  } finally {
+    clearTimeout(timer);
+  }
+  return { response: rebuildUpstreamResponse(response, bodyText), bodyText };
+}
+
+function runRetryHookWithDeadline(operation, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("Request aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener?.("abort", onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(reject, signal.reason ?? new DOMException("Request aborted", "AbortError"));
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+    timer = setTimeout(() => finish(resolve, false), RETRY_HOOK_TIMEOUT_MS);
+    timer.unref?.();
+    Promise.resolve().then(operation).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
 
 /**
  * BaseExecutor - Base class for provider executors
@@ -110,18 +172,33 @@ export class BaseExecutor {
     // response (optional) lets a subclass hook compute a dynamic delay (e.g. antigravity Retry-After).
     const tryRetry = async (urlIndex, statusKey, reason, response = null) => {
       const { attempts, delayMs } = resolveRetryEntry(retryConfig[statusKey]);
-      if (attempts <= 0 || retryAttemptsByUrl[urlIndex] >= attempts) return false;
+      if (attempts <= 0 || retryAttemptsByUrl[urlIndex] >= attempts) return { retry: false, response };
       // Hook: subclass may derive delay from the response (headers/body). null → skip retry, use fallback.
       let waitMs = delayMs;
       if (response && this.computeRetryDelay) {
-        const dynamic = await this.computeRetryDelay(response, retryAttemptsByUrl[urlIndex] + 1, delayMs);
-        if (dynamic === false) return false; // hook vetoes retry (e.g. Retry-After too long)
+        let bodyText = "";
+        if (this.inspectRetryBody === true) {
+          const inspected = await inspectRetryResponse(response, signal);
+          response = inspected.response;
+          bodyText = inspected.bodyText;
+        }
+        const dynamic = await runRetryHookWithDeadline(
+          () => this.computeRetryDelay(
+            response,
+            retryAttemptsByUrl[urlIndex] + 1,
+            delayMs,
+            { bodyText, signal },
+          ),
+          signal,
+        );
+        if (dynamic === false) return { retry: false, response }; // hook vetoes retry (e.g. Retry-After too long)
         if (dynamic != null) waitMs = dynamic;
       }
       retryAttemptsByUrl[urlIndex]++;
       log?.debug?.("RETRY", `${reason} retry ${retryAttemptsByUrl[urlIndex]}/${attempts} after ${waitMs / 1000}s`);
-      await new Promise(resolve => setTimeout(resolve, waitMs));
-      return true;
+      discardResponseBody(response, "retrying upstream request");
+      await waitWithSignal(waitMs, signal);
+      return { retry: true, response };
     };
 
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
@@ -141,7 +218,7 @@ export class BaseExecutor {
         const bodyStr = JSON.stringify(transformedBody);
         const fetchT0 = Date.now();
         dbg("FETCH", `${this.provider.toUpperCase()} → ${url} | body=${bodyStr.length}B | connectTimeout=${timeoutMs}ms`);
-        const response = await proxyAwareFetch(url, {
+        let response = await proxyAwareFetch(url, {
           method: "POST",
           headers,
           body: bodyStr,
@@ -152,11 +229,14 @@ export class BaseExecutor {
         const cl = response.headers?.get?.("content-length") || "?";
         dbg("FETCH", `${this.provider.toUpperCase()} ← ${response.status} | ttft=${Date.now() - fetchT0}ms | ct=${ct} | cl=${cl}`);
 
-        if (await tryRetry(urlIndex, response.status, `status ${response.status}`, response)) { urlIndex--; continue; }
+        const retryDecision = await tryRetry(urlIndex, response.status, `status ${response.status}`, response);
+        response = retryDecision.response || response;
+        if (retryDecision.retry) { urlIndex--; continue; }
 
         if (this.shouldRetry(response.status, urlIndex)) {
           log?.debug?.("RETRY", `${response.status} on ${url}, trying fallback ${urlIndex + 1}`);
           lastStatus = response.status;
+          discardResponseBody(response, "trying fallback URL");
           continue;
         }
 
@@ -166,11 +246,14 @@ export class BaseExecutor {
         lastError = error;
         const isConnectTimeout = connectCtrl.signal.aborted && error.name === "AbortError";
         dbg("FETCH", `${this.provider.toUpperCase()} ✖ ${error.name}: ${error.message}${isConnectTimeout ? " (connect timeout)" : ""}`);
+        // Caller cancellation is authoritative even when AbortController.abort()
+        // carries a custom Error whose name is not "AbortError".
+        if (signal?.aborted) throw signal.reason ?? error;
         // Connect timeout is internal — convert to retryable network error, don't propagate AbortError
         if (error.name === "AbortError" && !isConnectTimeout) throw error;
 
         // Map network/fetch exceptions to 502 retry config
-        if (await tryRetry(urlIndex, HTTP_STATUS.BAD_GATEWAY, `network "${error.message}"`)) { urlIndex--; continue; }
+        if ((await tryRetry(urlIndex, HTTP_STATUS.BAD_GATEWAY, `network "${error.message}"`)).retry) { urlIndex--; continue; }
 
         if (urlIndex + 1 < fallbackCount) {
           log?.debug?.("RETRY", `Error on ${url}, trying fallback ${urlIndex + 1}`);

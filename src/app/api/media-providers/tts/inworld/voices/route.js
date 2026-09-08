@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { getProviderConnections } from "@/lib/localDb";
+import {
+  VoiceListInvalidResponseError,
+  VoiceListUpstreamError,
+  assertVoiceListSuccessEnvelope,
+  fetchVoiceListJson,
+  voiceListErrorStatus,
+} from "open-sse/handlers/ttsProviders/voiceList.js";
 
 const langNames = new Intl.DisplayNames(["en"], { type: "language" });
 
@@ -16,15 +23,25 @@ export async function GET(request) {
     const apiKey = connections[0]?.apiKey;
     if (!apiKey) return NextResponse.json({ error: "No Inworld connection found" }, { status: 400 });
 
-    const res = await fetch("https://api.inworld.ai/tts/v1/voices", {
-      headers: { "Authorization": `Basic ${apiKey}` },
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      return NextResponse.json({ error: `Inworld API ${res.status}: ${text || "Failed"}` }, { status: 502 });
+    const { response, data } = await fetchVoiceListJson(
+      "https://api.inworld.ai/tts/v1/voices",
+      { headers: { "Authorization": `Basic ${apiKey}` } },
+      { signal: request.signal },
+    );
+    if (!response.ok) throw new VoiceListUpstreamError("Inworld", response.status);
+    assertVoiceListSuccessEnvelope(data, "Inworld");
+    if (!Array.isArray(data.voices) || data.voices.some((voice) =>
+      !voice || typeof voice !== "object" || Array.isArray(voice) ||
+      typeof voice.voiceId !== "string" || !voice.voiceId.trim() ||
+      (voice.displayName != null && typeof voice.displayName !== "string") ||
+      (voice.gender != null && typeof voice.gender !== "string") ||
+      (voice.languages != null && (
+        !Array.isArray(voice.languages) || voice.languages.some((lang) => typeof lang !== "string" || !lang)
+      ))
+    )) {
+      throw new VoiceListInvalidResponseError("Inworld returned an invalid voice catalog");
     }
-    const data = await res.json();
-    const voices = data.voices || [];
+    const voices = data.voices;
 
     const byLang = {};
     for (const v of voices) {
@@ -56,6 +73,7 @@ export async function GET(request) {
     }
     return NextResponse.json({ languages, byLang });
   } catch (err) {
-    return NextResponse.json({ error: err.message || "Failed to fetch voices" }, { status: 502 });
+    const status = request.signal?.aborted ? 499 : voiceListErrorStatus(err);
+    return NextResponse.json({ error: err.message || "Failed to fetch voices" }, { status });
   }
 }

@@ -5,6 +5,7 @@ import {
   refreshXaiToken,
   refreshAccessToken,
   refreshKimiToken,
+  refreshClineToken,
   refreshClaudeOAuthToken,
   refreshGoogleToken,
   refreshCodexToken,
@@ -18,12 +19,14 @@ import {
   refreshZedToken,
   refreshWindsurfToken,
   classifyOAuthRefreshError,
+  requestRefreshJson,
 } from "./tokenRefresh/providers.js";
 
 // Re-export all provider refresh functions (preserves public API for all consumers)
 export {
   refreshAccessToken,
   refreshKimiToken,
+  refreshClineToken,
   refreshClaudeOAuthToken,
   refreshGoogleToken,
   refreshCodexToken,
@@ -97,22 +100,29 @@ export async function refreshVertexToken(saJson, log) {
       .setExpirationTime(now + 3600)
       .sign(privateKey);
 
-    const res = await fetch(OAUTH_ENDPOINTS.google.token, {
+    const refreshResult = await requestRefreshJson("Vertex token mint", OAUTH_ENDPOINTS.google.token, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
         assertion: jwt,
       }),
-    });
+    }, log);
+    if (refreshResult.transportError) return null;
+    const { response: res, data: tokens } = refreshResult;
 
     if (!res.ok) {
-      const err = await res.text();
-      log?.error?.("TOKEN_REFRESH", `Vertex token mint failed: ${err}`);
+      log?.error?.("TOKEN_REFRESH", "Vertex token mint failed", {
+        status: res.status,
+      });
       return null;
     }
 
-    const { access_token, expires_in } = await res.json();
+    const { access_token, expires_in } = tokens || {};
+    if (!access_token) {
+      log?.error?.("TOKEN_REFRESH", "Vertex token mint returned no access token");
+      return null;
+    }
     const expiresAt = Date.now() + (expires_in ?? 3600) * 1000;
 
     vertexTokenCache.set(cacheKey, { token: access_token, expiresAt });
@@ -120,7 +130,7 @@ export async function refreshVertexToken(saJson, log) {
 
     return { accessToken: access_token, expiresAt };
   } catch (error) {
-    log?.error?.("TOKEN_REFRESH", `Vertex token error: ${error.message}`);
+    log?.error?.("TOKEN_REFRESH", "Vertex token mint failed");
     return null;
   }
 }
@@ -146,6 +156,7 @@ const REFRESH_HANDLERS = {
   "codebuddy-cn": (c, log) => refreshCodebuddyToken(c.refreshToken, log),
   "codebuddy-intl": (c, log) => refreshCodebuddyIntlToken(c.refreshToken, log),
   trae: (c, log) => refreshTraeToken(c.refreshToken, c, log),
+  cline: (c, log) => refreshClineToken(c.refreshToken, log),
   zed: () => refreshZedToken(),
   windsurf: (c, log) => refreshWindsurfToken(c, log),
   // Kimi Code OAuth (merged into id `kimi`); legacy id still routes here
@@ -265,7 +276,16 @@ export async function refreshWithRetry(refreshFn, maxRetries = 3, log = null, si
       if (result) return result;
     } catch (error) {
       if (isAbortError(error, signal)) throw error;
-      log?.warn?.("TOKEN_REFRESH", `Attempt ${attempt + 1}/${maxRetries} failed: ${error.message}`);
+      const reason = error?.name === "TimeoutError"
+        ? "refresh timed out"
+        : error?.code === "ERR_MODEL_CATALOG_BODY_TOO_LARGE"
+          ? "refresh response was too large"
+          : error?.name === "SyntaxError"
+            ? "refresh returned malformed JSON"
+            : error?.name === "EncodingError"
+              ? "refresh returned invalid UTF-8"
+              : "refresh failed";
+      log?.warn?.("TOKEN_REFRESH", `Attempt ${attempt + 1}/${maxRetries} failed: ${reason}`);
     }
   }
 

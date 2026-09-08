@@ -1,4 +1,5 @@
 import { VOICE_FETCHERS } from "open-sse/handlers/ttsCore.js";
+import { voiceListErrorStatus } from "open-sse/handlers/ttsProviders/voiceList.js";
 import { NextResponse } from "next/server";
 
 // Map locale code → country name
@@ -15,25 +16,38 @@ function langName(code) {
 /**
  * GET /api/media-providers/tts/voices
  * Query:
- *   ?provider=edge-tts | local-device | elevenlabs  (default: edge-tts)
+ *   ?provider=edge-tts | local-device | gemini  (default: edge-tts)
  *   ?lang=en     (optional filter by lang code)
- *   ?apiKey=xxx  (required for elevenlabs)
+ * ElevenLabs credentials must be read from the local connection database by
+ * /api/media-providers/tts/elevenlabs/voices, never carried in a URL.
  */
 export async function GET(request) {
   try {
     const { searchParams } = new URL(request.url);
     const provider   = searchParams.get("provider") || "edge-tts";
     const langFilter = searchParams.get("lang");
-    const apiKey     = searchParams.get("apiKey");
+
+    // Security boundary (#45): URL credentials reach browser history, proxy
+    // logs and access logs. Re-enabling this path requires human review.
+    if (searchParams.has("apiKey")) {
+      return NextResponse.json({
+        error: "Credentials are not accepted in query parameters; configure the provider connection instead",
+      }, { status: 400 });
+    }
+    if (provider === "elevenlabs") {
+      return NextResponse.json({
+        error: "Use /api/media-providers/tts/elevenlabs/voices with a configured ElevenLabs connection",
+      }, { status: 400 });
+    }
 
     const fetcher = VOICE_FETCHERS[provider];
     if (!fetcher) {
       return NextResponse.json({ error: `Provider '${provider}' does not support voice listing` }, { status: 400 });
     }
 
-    // ElevenLabs requires API key
-    const raw = provider === "elevenlabs" ? await fetcher(apiKey) : await fetcher();
-    const useElevenShape = provider === "elevenlabs" || provider === "gemini";
+    const raw = await fetcher({ signal: request.signal });
+    if (!Array.isArray(raw)) throw new Error("Voice provider returned an invalid catalog");
+    const useElevenShape = provider === "gemini";
     let voices;
 
     if (provider === "local-device") {
@@ -94,6 +108,7 @@ export async function GET(request) {
 
     return NextResponse.json({ voices, languages, byLang });
   } catch (err) {
-    return NextResponse.json({ error: err.message || "Failed to fetch voices" }, { status: 502 });
+    const status = request.signal?.aborted ? 499 : voiceListErrorStatus(err);
+    return NextResponse.json({ error: err.message || "Failed to fetch voices" }, { status });
   }
 }

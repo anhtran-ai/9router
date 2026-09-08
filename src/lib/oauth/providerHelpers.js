@@ -1,4 +1,12 @@
+import {
+  awaitModelCatalogResponse,
+  cancelModelCatalogBody,
+  readModelCatalogJson,
+} from "../../../open-sse/services/modelCatalogResponse.js";
+
 const BASE64_BLOCK_SIZE = 4;
+const KIRO_PROFILE_FETCH_TIMEOUT_MS = 10_000;
+const KIRO_PROFILE_RESPONSE_LIMIT_BYTES = 256 * 1024;
 
 function validateXaiOAuthEndpoint(rawUrl, field) {
   const value = String(rawUrl || "").trim();
@@ -50,10 +58,30 @@ function extractEmailFromAccessToken(accessToken) {
   return payload.email || payload.preferred_username || payload.sub || undefined;
 }
 
-export async function fetchKiroProfileArn(accessToken) {
+export async function fetchKiroProfileArn(
+  accessToken,
+  { signal = null, timeoutMs = KIRO_PROFILE_FETCH_TIMEOUT_MS } = {},
+) {
   if (!accessToken) return null;
+  const controller = new AbortController();
+  const effectiveTimeoutMs = Number.isSafeInteger(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : KIRO_PROFILE_FETCH_TIMEOUT_MS;
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("Kiro profile lookup timed out", "TimeoutError")),
+    effectiveTimeoutMs,
+  );
+  timer.unref?.();
+  let abortListener = null;
+  if (signal) {
+    abortListener = () => controller.abort(signal.reason);
+    if (signal.aborted) abortListener();
+    else signal.addEventListener("abort", abortListener, { once: true });
+  }
+
   try {
-    const response = await fetch("https://codewhisperer.us-east-1.amazonaws.com/ListAvailableProfiles", {
+    if (controller.signal.aborted) return null;
+    const response = await awaitModelCatalogResponse(fetch("https://codewhisperer.us-east-1.amazonaws.com/ListAvailableProfiles", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -61,12 +89,22 @@ export async function fetchKiroProfileArn(accessToken) {
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({ maxResults: 10 }),
+      signal: controller.signal,
+    }), controller.signal);
+    if (!response.ok) {
+      cancelModelCatalogBody(response, "Kiro profile lookup rejected");
+      return null;
+    }
+    const data = await readModelCatalogJson(response, {
+      signal: controller.signal,
+      maxBytes: KIRO_PROFILE_RESPONSE_LIMIT_BYTES,
     });
-    if (!response.ok) return null;
-    const data = await response.json();
     return data.profiles?.find((p) => p.arn?.trim())?.arn?.trim() || null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
+    if (signal && abortListener) signal.removeEventListener("abort", abortListener);
   }
 }
 

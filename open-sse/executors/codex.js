@@ -1,4 +1,5 @@
 import { BaseExecutor } from "./base.js";
+import { cancelReaderBestEffort } from "../utils/reader.js";
 import { CODEX_DEFAULT_INSTRUCTIONS } from "../config/codexInstructions.js";
 import { PROVIDERS } from "../config/providers.js";
 import {
@@ -441,8 +442,7 @@ export class CodexExecutor extends BaseExecutor {
     }
 
     if (matched) {
-      try { await reader.cancel(); } catch { /* noop */ }
-      try { reader.releaseLock(); } catch { /* noop */ }
+      cancelReaderBestEffort(reader, "Codex transient SSE error");
       return { matched, message: extractSseErrorMessage(text, matched), accountFallback, replacementBody: null };
     }
 

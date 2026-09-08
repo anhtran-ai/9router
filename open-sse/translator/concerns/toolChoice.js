@@ -91,6 +91,16 @@ function responsesSelector(binding, sourceSelector) {
 export function translateToolChoice(choice, bindings, target) {
   const parsed = parseChoice(choice);
   const tools = bindings.map(binding => binding.target).filter(Boolean);
+  if (target === "responses") {
+    const renderedNames = new Set();
+    for (const tool of tools) {
+      const rendered = identity(tool);
+      if (!['function', 'custom'].includes(rendered.type) || !rendered.name) continue;
+      const key = `${rendered.type}:${rendered.name}`;
+      if (renderedNames.has(key)) unsupported("tool names collide after Responses translation");
+      renderedNames.add(key);
+    }
+  }
   if (!parsed) return { tools };
   if (target === "gemini" && parsed.mode !== "none" && choice?.disable_parallel_tool_use === true && tools.length) {
     unsupported("Gemini cannot enforce disabled parallel tool calling");

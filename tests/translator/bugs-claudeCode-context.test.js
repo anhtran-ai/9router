@@ -1,10 +1,11 @@
 // Real Claude Code CLI requests (Claude format) → non-Claude provider via OpenAI bridge.
 // Focuses on context components a real CLI sends: system arrays w/ cache_control, thinking
-// signatures, tool_result with images, audio. KNOWN BUG = it.fails (source file:line in comments).
+// signatures, tool_result with images, and audio fail-closed behavior.
 import { describe, it, expect } from "vitest";
 import "./registerAll.js";
 import { translateRequest } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
+import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 
 const T = (src, tgt, body, provider = null) =>
   translateRequest(src, tgt, "m", body, true, null, provider);
@@ -39,10 +40,8 @@ describe("Claude Code CLI context → OpenAI", () => {
     expect(JSON.stringify(out)).toContain("step-by-step plan");
   });
 
-  // claude-to-openai.js:128 — redacted_thinking also dropped
-  // KNOWN BUG
-  it.fails("redacted_thinking block is not silently dropped", () => {
-    const out = T(FORMATS.CLAUDE, FORMATS.OPENAI, {
+  it("fails closed when Chat cannot preserve redacted_thinking", () => {
+    expect(() => T(FORMATS.CLAUDE, FORMATS.OPENAI, {
       messages: [
         { role: "assistant", content: [
           { type: "redacted_thinking", data: "ENCRYPTED_BLOB" },
@@ -50,14 +49,11 @@ describe("Claude Code CLI context → OpenAI", () => {
         ] },
         { role: "user", content: "go" },
       ],
-    });
-    expect(JSON.stringify(out)).toContain("ENCRYPTED_BLOB");
+    })).toThrowError(ToolCompatibilityError);
   });
 
-  // claude-to-openai.js:155-173 — tool_result image block stringified into raw JSON
-  // KNOWN BUG
-  it.fails("tool_result image block is preserved", () => {
-    const out = T(FORMATS.CLAUDE, FORMATS.OPENAI, {
+  it("fails closed instead of stringifying a tool_result image", () => {
+    expect(() => T(FORMATS.CLAUDE, FORMATS.OPENAI, {
       messages: [
         { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "screenshot", input: {} }] },
         { role: "user", content: [
@@ -66,8 +62,6 @@ describe("Claude Code CLI context → OpenAI", () => {
           ] },
         ] },
       ],
-    });
-    const tool = out.messages.find((m) => m.role === "tool");
-    expect(tool?.content, "image turned into raw JSON").not.toMatch(/^\[/);
+    })).toThrowError(ToolCompatibilityError);
   });
 });

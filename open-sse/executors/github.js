@@ -11,7 +11,11 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
+import { readUpstreamBodyText, rebuildUpstreamResponse } from "../utils/error.js";
 import crypto from "crypto";
+
+const ENDPOINT_PROBE_MAX_BYTES = 256 * 1024;
+const ENDPOINT_PROBE_STALL_TIMEOUT_MS = 5000;
 
 export class GithubExecutor extends BaseExecutor {
   constructor() {
@@ -152,7 +156,21 @@ export class GithubExecutor extends BaseExecutor {
     // Gemini/Claude would otherwise loop into a misleading "does not support
     // Responses API" 400 instead of surfacing the real /chat/completions error (#1062).
     if (result.response.status === HTTP_STATUS.BAD_REQUEST && this.supportsResponsesEndpoint(model)) {
-      const errorBody = await result.response.clone().text();
+      let errorBody = "";
+      try {
+        errorBody = await readUpstreamBodyText(result.response, {
+          signal: options.signal,
+          maxBytes: ENDPOINT_PROBE_MAX_BYTES,
+          stallTimeoutMs: ENDPOINT_PROBE_STALL_TIMEOUT_MS,
+        });
+      } catch (error) {
+        if (options.signal?.aborted) {
+          throw options.signal.reason ?? new DOMException("Request aborted", "AbortError");
+        }
+        // A stalled or attacker-sized diagnostic must not retain a tee branch
+        // or delay the request. The bounded reader has already cancelled it.
+      }
+      result.response = rebuildUpstreamResponse(result.response, errorBody);
 
       if (errorBody.includes("not accessible via the /chat/completions endpoint") || errorBody.includes("The requested model is not supported")) {
         log?.warn("GITHUB", `Model ${model} requires /responses. Switching...`);
@@ -186,7 +204,7 @@ export class GithubExecutor extends BaseExecutor {
     const state = initState("openai-responses");
     state.model = model;
 
-    const decoder = new TextDecoder();
+    const decoder = new TextDecoder("utf-8", { fatal: true });
     let buffer = "";
 
     const transformStream = new TransformStream({
@@ -282,7 +300,7 @@ export class GithubExecutor extends BaseExecutor {
     state.model = model;
     if (toolNameMap) state.toolNameMap = toolNameMap;
 
-    const decoder = new TextDecoder();
+    const decoder = new TextDecoder("utf-8", { fatal: true });
     let buffer = "";
 
     const emitAll = (controller, chunks) => {

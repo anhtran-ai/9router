@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCombos, getSettings, importComboItems } from "@/lib/localDb";
 import { resetComboRotation } from "open-sse/services/combo.js";
+import { readRequestJson, RequestBodyError } from "open-sse/utils/requestBody.js";
 
 export const dynamic = "force-dynamic";
 
@@ -11,6 +12,14 @@ const MAX_MODELS_PER_COMBO = 200;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
 const VALID_STRATEGIES = new Set(["fallback", "round-robin", "fusion"]);
+
+async function readJsonWithLimit(request) {
+  return readRequestJson(request, {
+    maxBytes: MAX_BODY_BYTES,
+    label: "Import payload",
+    requireBody: true,
+  });
+}
 
 function isRecord(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -52,7 +61,10 @@ function strategyForItem(item, name, strategyMap, strategyMapProvided) {
     return { provided: true, value: normalizeStrategy(item.strategy) };
   }
   if (strategyMapProvided) {
-    return { provided: true, value: normalizeStrategy(strategyMap[name] || {}) };
+    const mapped = Object.prototype.hasOwnProperty.call(strategyMap, name)
+      ? strategyMap[name]
+      : {};
+    return { provided: true, value: normalizeStrategy(mapped) };
   }
   return { provided: false, value: {} };
 }
@@ -128,11 +140,7 @@ export async function GET() {
 
 export async function POST(request) {
   try {
-    const contentLength = Number(request.headers.get("content-length") || 0);
-    if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
-      return NextResponse.json({ error: "Import payload must be 2 MB or smaller" }, { status: 413 });
-    }
-    const body = await request.json();
+    const body = await readJsonWithLimit(request);
     const payload = isRecord(body) && Object.prototype.hasOwnProperty.call(body, "data")
       ? body.data
       : body;
@@ -198,7 +206,7 @@ export async function POST(request) {
     console.error("[ImportExport][Combos] Import failed:", error);
     return NextResponse.json(
       { error: error?.message || "Failed to import combos" },
-      { status: 400 },
+      { status: error instanceof RequestBodyError ? error.status : 400 },
     );
   }
 }

@@ -13,6 +13,12 @@
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { GITHUB_COPILOT } from "../config/appConstants.js";
 import { refreshCopilotToken } from "./tokenRefresh.js";
+import {
+  cancelModelCatalogBody,
+  readModelCatalogJson,
+  readModelCatalogText,
+  runModelCatalogRefresh,
+} from "./modelCatalogResponse.js";
 
 const MODELS_URL = "https://api.githubcopilot.com/models";
 const FETCH_TIMEOUT_MS = 10_000;
@@ -41,21 +47,39 @@ function buildHeaders(token) {
 
 async function fetchCatalogRaw(token, signal) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timeoutId = setTimeout(
+    () => controller.abort(new DOMException("Copilot model catalog timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  const requestSignal = signal
+    ? AbortSignal.any([signal, controller.signal])
+    : controller.signal;
+  let response;
   try {
-    const response = await proxyAwareFetch(MODELS_URL, {
+    response = await proxyAwareFetch(MODELS_URL, {
       method: "GET",
       headers: buildHeaders(token),
       cache: "no-store",
-      signal: signal || controller.signal,
+      signal: requestSignal,
     });
     if (!response.ok) {
+      try {
+        await readModelCatalogText(response, { signal: requestSignal });
+      } catch (error) {
+        error.status = response.status;
+        throw error;
+      }
       const err = new Error(`Copilot /models returned ${response.status}`);
       err.status = response.status;
       throw err;
     }
-    const data = await response.json();
+    const data = await readModelCatalogJson(response, { signal: requestSignal });
     return Array.isArray(data?.data) ? data.data : [];
+  } catch (error) {
+    if (requestSignal.aborted) {
+      cancelModelCatalogBody(response, error);
+    }
+    throw error;
   } finally {
     clearTimeout(timeoutId);
   }
@@ -85,6 +109,7 @@ function expandCatalog(raw) {
  *   providerSpecificData {copilotToken, copilotTokenExpiresAt}).
  * @param {object} [options]
  * @param {boolean} [options.forceRefresh] Bypass the per-credential cache.
+ * @param {AbortSignal} [options.signal] Cancel this caller's catalog/refresh wait.
  * @param {object}  [options.log] Logger.
  * @param {function} [options.onCredentialsRefreshed] Persist a refreshed
  *   Copilot token back to your store. Called with `{ copilotToken,
@@ -111,22 +136,55 @@ export async function resolveCopilotModels(credentials, options = {}) {
   try {
     raw = await fetchCatalogRaw(token, options.signal);
   } catch (err) {
+    if (options.signal?.aborted) {
+      options.log?.debug?.("COPILOT_MODELS", "Caller aborted live model fetch");
+      return null;
+    }
     // A 401/403 means the Copilot token is stale — refresh from the GitHub
     // access token and retry once.
     if (err && (err.status === 401 || err.status === 403) && credentials.accessToken) {
       options.log?.info?.("COPILOT_MODELS", `Got ${err.status}; refreshing Copilot token`);
-      const refreshed = await refreshCopilotToken(credentials.accessToken);
+      let refreshed;
+      try {
+        refreshed = await runModelCatalogRefresh(
+          (refreshSignal) => refreshCopilotToken(
+            credentials.accessToken,
+            options.log,
+            { signal: refreshSignal },
+          ),
+          {
+            signal: options.signal,
+            timeoutMs: FETCH_TIMEOUT_MS,
+            label: "Copilot model catalog token refresh",
+          },
+        );
+      } catch (refreshError) {
+        const detail = options.signal?.aborted
+          ? "Caller aborted Copilot token refresh"
+          : `Copilot token refresh failed: ${refreshError?.message || refreshError}`;
+        options.log?.warn?.("COPILOT_MODELS", detail);
+        return null;
+      }
+      if (options.signal?.aborted) return null;
       if (refreshed?.token) {
         if (typeof options.onCredentialsRefreshed === "function") {
           try {
-            await options.onCredentialsRefreshed({
-              copilotToken: refreshed.token,
-              copilotTokenExpiresAt: refreshed.expiresAt,
-            });
+            await runModelCatalogRefresh(
+              () => options.onCredentialsRefreshed({
+                copilotToken: refreshed.token,
+                copilotTokenExpiresAt: refreshed.expiresAt,
+              }),
+              {
+                signal: options.signal,
+                timeoutMs: FETCH_TIMEOUT_MS,
+                label: "Copilot model catalog credential persistence",
+              },
+            );
           } catch (e) {
             options.log?.warn?.("COPILOT_MODELS", `onCredentialsRefreshed failed: ${e?.message || e}`);
           }
         }
+        if (options.signal?.aborted) return null;
         try {
           raw = await fetchCatalogRaw(refreshed.token, options.signal);
         } catch (err2) {

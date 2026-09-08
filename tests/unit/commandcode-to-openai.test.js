@@ -25,7 +25,10 @@ describe("CommandCode executor stream media type", () => {
       expect(response.headers.has("content-length")).toBe(false);
       expect(response.headers.has("content-encoding")).toBe(false);
       expect(response.headers.get("x-fixture")).toBe("retained");
-      expect(await response.text()).toContain('data: {"id"');
+      const text = await response.text();
+      expect(text).toContain('"content":"fixture"');
+      expect(text).toContain('"finish_reason":"stop"');
+      expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
     } finally { execute.mockRestore(); }
   });
 

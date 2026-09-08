@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { SignJWT, jwtVerify } from "jose";
 import { DATA_DIR } from "@/lib/dataDir";
-import { getContributorInvite, isInviteActive } from "./store";
+import { getContributorInvite, isContributorSessionUsable } from "./store";
 
 export const CONTRIBUTOR_COOKIE = "contributor_session";
 
@@ -33,14 +33,14 @@ export async function createContributorSession(invite) {
     .sign(getSecret());
 }
 
-export async function getContributorSession(request) {
+export async function getContributorSession(request, { allowUsed = false } = {}) {
   const token = request.cookies.get(CONTRIBUTOR_COOKIE)?.value;
   if (!token) return null;
   try {
     const { payload } = await jwtVerify(token, getSecret());
     if (payload.role !== "contributor" || !payload.inviteId || !payload.sessionId) return null;
     const invite = await getContributorInvite(payload.inviteId);
-    if (!isInviteActive(invite) || invite.sessionId !== payload.sessionId) return null;
+    if (!isContributorSessionUsable(invite, payload.sessionId, { allowUsed })) return null;
     return { payload, invite };
   } catch {
     return null;
@@ -61,6 +61,12 @@ export function contributorCookieOptions(request, invite) {
 }
 
 export function isSameOrigin(request) {
+  // SameSite=Lax cookies are still sent on top-level cross-site GET
+  // navigations. Fetch Metadata closes that gap for OAuth proxy actions while
+  // preserving direct/manual navigation when browsers omit Origin entirely.
+  if (request.headers.get("sec-fetch-site")?.toLowerCase() === "cross-site") {
+    return false;
+  }
   const origin = request.headers.get("origin");
   if (!origin) return true;
   try {

@@ -69,6 +69,51 @@ describe("native Chat custom tools at the shared Responses request boundary", ()
   });
 });
 
+describe("OpenAI Chat function declarations at the shared Responses request boundary", () => {
+  const functionTool = (name) => ({
+    type: "function",
+    function: {
+      name,
+      description: "Run a test function",
+      parameters: { type: "object", properties: {} },
+    },
+  });
+
+  const forcedFunction = (name) => ({ type: "function", function: { name } });
+
+  const convert = (tools, toolChoice) => openaiToOpenAIResponsesRequest("test-model", {
+    messages: [{ role: "user", content: "run" }],
+    tools,
+    tool_choice: toolChoice,
+  }, false, null);
+
+  it("rejects a forced selector whose blank function declaration is removed", () => {
+    expect(() => convert([functionTool("   ")], forcedFunction("   ")))
+      .toThrow(ToolCompatibilityError);
+  });
+
+  it("clamps a long function name consistently in its declaration and forced selector", () => {
+    const longName = `tool_${"x".repeat(140)}`;
+    const expectedName = longName.slice(0, 128);
+    const out = convert([functionTool(longName)], forcedFunction(longName));
+
+    expect(out.tools).toHaveLength(1);
+    expect(out.tools[0].name).toBe(expectedName);
+    expect(out.tool_choice).toEqual({ type: "function", name: expectedName });
+  });
+
+  it("rejects distinct function names that collide after the 128-character clamp", () => {
+    const commonPrefix = "x".repeat(128);
+    const first = `${commonPrefix}a`;
+    const second = `${commonPrefix}b`;
+
+    expect(() => convert(
+      [functionTool(first), functionTool(second)],
+      forcedFunction(first),
+    )).toThrow(ToolCompatibilityError);
+  });
+});
+
 describe("Codex Responses Lite custom tools → OpenAI Chat", () => {
   it("promotes additional_tools custom declarations into Chat tools", () => {
     const out = openaiResponsesToOpenAIRequest("cx/gpt-5.6-sol", {
@@ -201,5 +246,34 @@ describe("OpenAI Chat stream → Codex custom_tool_call", () => {
       name: "search",
       arguments: "{\"q\":\"x\"}",
     });
+  });
+
+  it("assigns unique stable output indexes to reasoning, text, and parallel tools", () => {
+    const state = initState(FORMATS.OPENAI_RESPONSES);
+    const chunks = [
+      { id: "chatcmpl-indexes", choices: [{ index: 0, delta: { reasoning_content: "think" }, finish_reason: null }] },
+      { id: "chatcmpl-indexes", choices: [{ index: 0, delta: { content: "answer" }, finish_reason: null }] },
+      { id: "chatcmpl-indexes", choices: [{ index: 0, delta: { tool_calls: [
+        { index: 0, id: "call_a", type: "function", function: { name: "first", arguments: "{\"a\":1}" } },
+        { index: 1, id: "call_b", type: "function", function: { name: "second", arguments: "{\"b\":2}" } },
+      ] }, finish_reason: null }] },
+      { id: "chatcmpl-indexes", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ];
+
+    const events = chunks.flatMap((chunk) => openaiToOpenAIResponsesResponse(chunk, state));
+    const added = events.filter((event) => event.event === "response.output_item.added");
+    expect(added.map((event) => event.data.output_index)).toEqual([0, 1, 2, 3]);
+    expect(new Set(added.map((event) => event.data.output_index)).size).toBe(added.length);
+
+    const indexById = new Map(added.map((event) => [event.data.item.id, event.data.output_index]));
+    for (const event of events) {
+      const itemId = event.data.item_id || event.data.item?.id;
+      if (itemId && indexById.has(itemId) && event.data.output_index !== undefined) {
+        expect(event.data.output_index).toBe(indexById.get(itemId));
+      }
+    }
+
+    const completed = events.find((event) => event.event === "response.completed");
+    expect(completed.data.response.output.map((item) => item.id)).toEqual(added.map((event) => event.data.item.id));
   });
 });

@@ -20,7 +20,7 @@ export default {
     const images = parts.filter((p) => p.inlineData?.data).map((p) => ({ b64_json: p.inlineData.data }));
     return {
       created: nowSec(),
-      data: images.length > 0 ? images : [{ b64_json: "", revised_prompt: prompt }],
+      data: images.map((image) => ({ ...image, revised_prompt: prompt })),
     };
   },
 };

@@ -2,6 +2,9 @@ import {
   getProviderCredentials,
   markAccountUnavailable,
   clearAccountError,
+  beginAccountMutationAttempt,
+  endAccountMutationAttempt,
+  recordAccountMutationSuccess,
   extractApiKey,
   isValidApiKey,
 } from "../services/auth.js";
@@ -13,7 +16,17 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
-import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
+import { assertPublicUrlResolved } from "@/shared/utils/ssrfGuard.js";
+
+function observeAccountCleanup(cleanup, connectionId) {
+  try {
+    Promise.resolve(cleanup()).catch((error) => {
+      log.warn("FETCH", `Failed to clear account state after successful fetch (${connectionId}): ${error?.message || error}`);
+    });
+  } catch (error) {
+    log.warn("FETCH", `Failed to start account-state cleanup after successful fetch (${connectionId}): ${error?.message || error}`);
+  }
+}
 
 /**
  * Handle web fetch (URL extraction) request for the SSE/Next.js server.
@@ -22,6 +35,9 @@ import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
  * @param {Request} request
  */
 export async function handleFetch(request) {
+  if (request.signal?.aborted) {
+    return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+  }
   let body;
   try {
     body = await request.json();
@@ -79,9 +95,10 @@ export async function handleFetch(request) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid URL format");
   }
 
-  // SSRF guard: reject internal/private/metadata targets
+  // SSRF guard: reject internal/private/metadata targets, including
+  // hostnames that merely resolve to one (DNS lookup, not just literal checks).
   try {
-    assertPublicUrl(targetUrl);
+    await assertPublicUrlResolved(targetUrl);
   } catch (err) {
     log.warn("FETCH", "Blocked URL", { url: targetUrl });
     return errorResponse(HTTP_STATUS.BAD_REQUEST, err.message);
@@ -102,7 +119,8 @@ export async function handleFetch(request) {
       log,
       comboName: providerInput,
       comboStrategy,
-      comboStickyLimit
+      comboStickyLimit,
+      signal: request.signal,
     });
   }
 
@@ -143,7 +161,8 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
       provider: resolvedProvider.id,
       providerConfig,
       credentials: null,
-      log
+      log,
+      signal: request.signal,
     });
     if (result.success) {
       return new Response(JSON.stringify(result.data), {
@@ -158,8 +177,13 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
   let lastError = null;
   let lastStatus = null;
 
+  // Keep web-fetch failures scoped to this capability. Providers such as
+  // Ollama use the same connection for chat and fetch, so an upstream fetch
+  // failure must not take the account offline for LLM requests.
+  const fetchLockKey = `webfetch:${providerId}`;
+
   while (true) {
-    const credentials = await getProviderCredentials(providerId, excludeConnectionIds);
+    const credentials = await getProviderCredentials(providerId, excludeConnectionIds, fetchLockKey);
 
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
@@ -180,41 +204,65 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
 
     const refreshedCredentials = await checkAndRefreshToken(providerId, credentials);
 
-    const result = await handleFetchCore({
-      url: targetUrl,
-      format,
-      maxCharacters,
-      provider: resolvedProvider.id,
-      providerConfig,
-      credentials: refreshedCredentials,
-      log,
-      onCredentialsRefreshed: async (newCreds) => {
-        await updateProviderCredentials(credentials.connectionId, {
-          accessToken: newCreds.accessToken,
-          refreshToken: newCreds.refreshToken,
-          providerSpecificData: newCreds.providerSpecificData,
-          testStatus: "active"
+    const mutationAttempt = beginAccountMutationAttempt(credentials.connectionId, fetchLockKey);
+    try {
+      const result = await handleFetchCore({
+        url: targetUrl,
+        format,
+        maxCharacters,
+        provider: resolvedProvider.id,
+        providerConfig,
+        credentials: refreshedCredentials,
+        log,
+        signal: request.signal,
+        onCredentialsRefreshed: async (newCreds) => {
+          await updateProviderCredentials(credentials.connectionId, {
+            accessToken: newCreds.accessToken,
+            refreshToken: newCreds.refreshToken,
+            providerSpecificData: newCreds.providerSpecificData,
+            testStatus: "active"
+          });
+        }
+      });
+
+      if (result.success) {
+        recordAccountMutationSuccess(mutationAttempt);
+        // Account bookkeeping must never replace a verified provider result
+        // with a gateway error or keep the client waiting on a stuck database.
+        observeAccountCleanup(
+          () => clearAccountError(credentials.connectionId, credentials, fetchLockKey, { mutationAttempt }),
+          credentials.connectionId,
+        );
+        return new Response(JSON.stringify(result.data), {
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
         });
       }
-    });
 
-    if (result.success) {
-      await clearAccountError(credentials.connectionId, credentials);
-      return new Response(JSON.stringify(result.data), {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-      });
+      if (request.signal?.aborted || result.status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) {
+        return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
+
+      const { shouldFallback } = await markAccountUnavailable(
+        credentials.connectionId,
+        result.status,
+        result.error,
+        providerId,
+        fetchLockKey,
+        null,
+        { mutationAttempt },
+      );
+
+      if (shouldFallback) {
+        log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
+        excludeConnectionIds.add(credentials.connectionId);
+        lastError = result.error;
+        lastStatus = result.status;
+        continue;
+      }
+
+      return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "Fetch failed");
+    } finally {
+      endAccountMutationAttempt(mutationAttempt);
     }
-
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, providerId);
-
-    if (shouldFallback) {
-      log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
-      excludeConnectionIds.add(credentials.connectionId);
-      lastError = result.error;
-      lastStatus = result.status;
-      continue;
-    }
-
-    return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "Fetch failed");
   }
 }

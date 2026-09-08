@@ -108,9 +108,7 @@ const MITM_BYPASS_HOSTS = [
   "api2.cursor.sh",
 ];
 const GOOGLE_DNS_SERVERS = ["8.8.8.8", "8.8.4.4"];
-const HTTPS_PORT = 443;
-const HTTP_SUCCESS_MIN = 200;
-const HTTP_SUCCESS_MAX = 300;
+const DNS_LOOKUP_TIMEOUT_MS = 5000;
 
 function normalizeString(value) {
   if (value === undefined || value === null) return "";
@@ -120,7 +118,14 @@ function normalizeString(value) {
 /**
  * Resolve real IP using Google DNS (bypass system DNS)
  */
-async function resolveRealIP(hostname) {
+function abortReason(signal) {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new DOMException("Request aborted", "AbortError");
+}
+
+async function resolveRealIP(hostname, signal) {
+  if (signal?.aborted) throw abortReason(signal);
   const cached = DNS_CACHE.get(hostname);
   if (cached && Date.now() < cached.expiry) return cached.ip;
 
@@ -130,22 +135,43 @@ async function resolveRealIP(hostname) {
     const resolver = new dns.Resolver();
     resolver.setServers(GOOGLE_DNS_SERVERS);
     const resolve4 = promisify(resolver.resolve4.bind(resolver));
-    const addresses = await resolve4(hostname);
+    let onAbort;
+    let timer;
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("MITM bypass DNS timeout")), DNS_LOOKUP_TIMEOUT_MS);
+      timer.unref?.();
+      if (signal) {
+        onAbort = () => reject(abortReason(signal));
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    });
+    let addresses;
+    try {
+      addresses = await Promise.race([resolve4(hostname), deadline]);
+    } finally {
+      clearTimeout(timer);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+    if (signal?.aborted) throw abortReason(signal);
+    if (!Array.isArray(addresses) || !addresses[0]) {
+      throw new Error(`No public IPv4 address returned for ${hostname}`);
+    }
     DNS_CACHE.set(hostname, { ip: addresses[0], expiry: Date.now() + MEMORY_CONFIG.dnsCacheTtlMs });
     return addresses[0];
   } catch (error) {
+    if (signal?.aborted || error?.name === "AbortError") throw error;
     console.warn(`[ProxyFetch] DNS resolve failed for ${hostname}:`, error.message);
-    return null;
+    throw error;
   }
 }
 
 /**
  * Check if request should bypass MITM DNS redirect
  */
-function shouldBypassMitmDns(url) {
+export function shouldBypassMitmDns(url) {
   try {
-    const hostname = new URL(url).hostname;
-    return MITM_BYPASS_HOSTS.some(host => hostname.includes(host));
+    const hostname = new URL(url).hostname.toLowerCase();
+    return MITM_BYPASS_HOSTS.some(host => hostname === host);
   } catch { return false; }
 }
 
@@ -232,67 +258,57 @@ async function getDispatcher(proxyUrl) {
   return proxyDispatchers.get(normalized);
 }
 
+export function createPinnedBypassLookup(expectedHostname, realIP) {
+  const normalizedHost = String(expectedHostname).toLowerCase().replace(/\.$/, "");
+  return (requestedHostname, lookupOptions, callback) => {
+    const requested = String(requestedHostname).toLowerCase().replace(/\.$/, "");
+    if (requested !== normalizedHost) {
+      callback(new Error("MITM bypass blocked an unexpected DNS lookup"));
+      return;
+    }
+    const record = { address: realIP, family: 4 };
+    if (lookupOptions?.all) callback(null, [record]);
+    else callback(null, record.address, record.family);
+  };
+}
+
 /**
- * Create HTTPS request with manual socket connection (bypass DNS)
+ * Use native fetch with an Undici dispatcher whose DNS lookup is pinned to the
+ * real public address. Native fetch preserves standard Response/body semantics,
+ * TLS SNI/certificate verification, streaming backpressure and AbortSignal.
  */
-async function createBypassRequest(parsedUrl, realIP, options) {
-  const httpsModule = await import("https");
-  const netModule = await import("net");
-  // CJS modules expose exports via .default in ESM dynamic import context
-  const https = httpsModule.default ?? httpsModule;
-  const net = netModule.default ?? netModule;
-
-  return new Promise((resolve, reject) => {
-    const socket = new net.Socket();
-
-    socket.connect(HTTPS_PORT, realIP, () => {
-      const reqOptions = {
-        socket,
-        // SNI + cert hostname are validated against the hostname the caller
-        // asked for, not the IP we connected to. This keeps the DNS-bypass
-        // (avoiding /etc/hosts MITM) while still rejecting on-path attackers
-        // that present a different cert. The MITM_BYPASS_HOSTS targets are
-        // all public-CA-issued (Google / GitHub / AWS / Cursor) so default
-        // verification works without any extra trust store.
-        servername: parsedUrl.hostname,
-        path: parsedUrl.pathname + parsedUrl.search,
-        method: options.method || "POST",
-        headers: {
-          ...options.headers,
-          Host: parsedUrl.hostname,
-        },
-      };
-
-      const req = https.request(reqOptions, (res) => {
-        const response = {
-          ok: res.statusCode >= HTTP_SUCCESS_MIN && res.statusCode < HTTP_SUCCESS_MAX,
-          status: res.statusCode,
-          statusText: res.statusMessage,
-          headers: new Map(Object.entries(res.headers)),
-          body: Readable.toWeb(res),
-          text: async () => {
-            const chunks = [];
-            for await (const chunk of res) chunks.push(chunk);
-            return Buffer.concat(chunks).toString();
-          },
-          json: async () => JSON.parse(await response.text()),
-        };
-        resolve(response);
-      });
-
-      req.on("error", reject);
-      if (options.body) {
-        req.write(typeof options.body === "string" ? options.body : JSON.stringify(options.body));
-      }
-      req.end();
-    });
-
-    socket.on("error", reject);
+export async function createBypassRequest(parsedUrl, realIP, options) {
+  const { Agent } = await import("undici");
+  const dispatcher = new Agent({
+    connect: {
+      lookup: createPinnedBypassLookup(parsedUrl.hostname, realIP),
+    },
   });
+  try {
+    const headers = new Headers(options?.headers || {});
+    headers.set("host", parsedUrl.host);
+    const response = await originalFetch(parsedUrl.toString(), { ...options, headers, dispatcher });
+    // Agent.close() waits for the caller-owned response body to finish without
+    // buffering it. Do not await here or fetch would stop being streaming.
+    dispatcher.close().catch(() => {});
+    return response;
+  } catch (error) {
+    await dispatcher.close().catch(() => {});
+    throw error;
+  }
 }
 
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
+
+  // An explicit dispatcher is a transport security invariant, not a proxy
+  // preference. SSRF-safe callers use a dispatcher whose DNS lookup is pinned
+  // to addresses they already validated. Replacing it with an environment or
+  // relay proxy would make that proxy resolve the hostname again and reopen the
+  // DNS-rebinding window the caller deliberately closed.
+  if (options?.dispatcher) {
+    return originalFetch(url, options);
+  }
 
   // Vercel relay: forward request via relay headers
   const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
@@ -318,6 +334,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
         const dispatcher = await getDispatcher(proxyUrl);
         return await originalFetch(url, { ...options, dispatcher });
       } catch (proxyError) {
+        if (options.signal?.aborted || proxyError?.name === "AbortError") throw proxyError;
         if (proxyOptions?.strictProxy === true) {
           throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
         }
@@ -327,10 +344,14 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
     // No proxy — manually resolve real IP to bypass DNS spoof
     try {
       const parsedUrl = new URL(targetUrl);
-      const realIP = await resolveRealIP(parsedUrl.hostname);
-      if (realIP) return await createBypassRequest(parsedUrl, realIP, options);
+      const realIP = await resolveRealIP(parsedUrl.hostname, options.signal);
+      return await createBypassRequest(parsedUrl, realIP, options);
     } catch (error) {
-      console.warn(`[ProxyFetch] MITM bypass failed: ${error.message}`);
+      if (options.signal?.aborted || error?.name === "AbortError") throw error;
+      // Native/system DNS may intentionally point these names at the local
+      // MITM. Falling through would recurse through the interceptor and could
+      // resend credentials indefinitely, so the direct bypass is fail-closed.
+      throw new Error(`[ProxyFetch] MITM bypass failed: ${error.message}`, { cause: error });
     }
   }
 
@@ -339,6 +360,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       const dispatcher = await getDispatcher(proxyUrl);
       return await originalFetch(url, { ...options, dispatcher });
     } catch (proxyError) {
+      if (options.signal?.aborted || proxyError?.name === "AbortError") throw proxyError;
       // If strictProxy is enabled, fail hard instead of falling back to direct
       if (proxyOptions?.strictProxy === true) {
         throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);

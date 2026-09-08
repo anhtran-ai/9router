@@ -1,12 +1,23 @@
 import { AI_PROVIDERS } from "@/shared/constants/providers";
+import {
+  VoiceListInvalidResponseError,
+  assertVoiceListSuccessEnvelope,
+  fetchVoiceListJson,
+  voiceListErrorStatus,
+} from "open-sse/handlers/ttsProviders/voiceList.js";
+import { GET as getGenericVoices } from "@/app/api/media-providers/tts/voices/route.js";
+import { GET as getElevenLabsVoices } from "@/app/api/media-providers/tts/elevenlabs/voices/route.js";
+import { GET as getDeepgramVoices } from "@/app/api/media-providers/tts/deepgram/voices/route.js";
+import { GET as getInworldVoices } from "@/app/api/media-providers/tts/inworld/voices/route.js";
 
-// Provider → internal voices API. Edge/local-device share the generic endpoint.
+// Provider → in-process route handler. Never relay through request.url.origin:
+// the inbound Host/forwarded-host is not a trusted server-side fetch target.
 const PROVIDER_API = {
-  elevenlabs: (origin) => `${origin}/api/media-providers/tts/elevenlabs/voices`,
-  deepgram: (origin) => `${origin}/api/media-providers/tts/deepgram/voices`,
-  inworld: (origin) => `${origin}/api/media-providers/tts/inworld/voices`,
-  "edge-tts": (origin) => `${origin}/api/media-providers/tts/voices?provider=edge-tts`,
-  "local-device": (origin) => `${origin}/api/media-providers/tts/voices?provider=local-device`,
+  elevenlabs: { handler: getElevenLabsVoices, path: "/api/media-providers/tts/elevenlabs/voices" },
+  deepgram: { handler: getDeepgramVoices, path: "/api/media-providers/tts/deepgram/voices" },
+  inworld: { handler: getInworldVoices, path: "/api/media-providers/tts/inworld/voices" },
+  "edge-tts": { handler: getGenericVoices, path: "/api/media-providers/tts/voices?provider=edge-tts" },
+  "local-device": { handler: getGenericVoices, path: "/api/media-providers/tts/voices?provider=local-device" },
 };
 
 export async function OPTIONS() {
@@ -19,7 +30,7 @@ export async function OPTIONS() {
 // Returns OpenAI-style list with each voice's full model id ready for /v1/audio/speech
 export async function GET(request) {
   try {
-    const { searchParams, origin } = new URL(request.url);
+    const { searchParams } = new URL(request.url);
     const provider = searchParams.get("provider");
     const lang = searchParams.get("lang");
 
@@ -30,21 +41,55 @@ export async function GET(request) {
       );
     }
 
-    const baseUrl = PROVIDER_API[provider](origin);
-    const url = lang ? `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}lang=${encodeURIComponent(lang)}` : baseUrl;
-    const res = await fetch(url, { cache: "no-store" });
-    const data = await res.json();
-    if (!res.ok || data.error) {
+    const route = PROVIDER_API[provider];
+    const internalUrl = new URL(route.path, "http://9router.internal");
+    if (lang) internalUrl.searchParams.set("lang", lang);
+    const { response: res, data } = await fetchVoiceListJson(
+      internalUrl,
+      {},
+      {
+        signal: request.signal,
+        fetchImpl: (_url, init) => route.handler(new Request(internalUrl, {
+          method: "GET",
+          signal: init.signal,
+        })),
+      },
+    );
+    if (!res.ok) {
+      const upstreamMessage = typeof data.error === "string"
+        ? data.error
+        : data.error?.message;
       return Response.json(
-        { error: { message: data.error || `Upstream ${res.status}`, type: "server_error" } },
+        { error: { message: upstreamMessage || `Upstream ${res.status}`, type: "server_error" } },
         { status: res.status, headers: { "Access-Control-Allow-Origin": "*" } },
       );
     }
+    assertVoiceListSuccessEnvelope(data, "Internal");
 
     // Internal API shape: { voices } when lang filter, else { byLang, languages }
-    const rawVoices = lang
-      ? (data.voices || [])
-      : Object.values(data.byLang || {}).flatMap((l) => l.voices || []);
+    let rawVoices;
+    if (lang) {
+      if (!Array.isArray(data.voices)) {
+        throw new VoiceListInvalidResponseError("Internal voice-list response has no voices array");
+      }
+      rawVoices = data.voices;
+    } else {
+      if (!data.byLang || typeof data.byLang !== "object" || Array.isArray(data.byLang)) {
+        throw new VoiceListInvalidResponseError("Internal voice-list response has no language catalog");
+      }
+      const groups = Object.values(data.byLang);
+      if (groups.some((group) => !group || !Array.isArray(group.voices))) {
+        throw new VoiceListInvalidResponseError("Internal voice-list response has an invalid language catalog");
+      }
+      rawVoices = groups.flatMap((group) => group.voices);
+    }
+    if (rawVoices.some((voice) =>
+      !voice || typeof voice !== "object" || Array.isArray(voice) ||
+      typeof voice.id !== "string" || !voice.id.trim() ||
+      typeof voice.name !== "string" || !voice.name.trim()
+    )) {
+      throw new VoiceListInvalidResponseError("Internal voice-list response has an invalid voice entry");
+    }
 
     // Use provider alias for /v1/audio/speech model param (matches skill convention e.g. el/, dg/, edge-tts/)
     const alias = AI_PROVIDERS[provider]?.alias || provider;
@@ -60,9 +105,10 @@ export async function GET(request) {
       headers: { "Access-Control-Allow-Origin": "*" },
     });
   } catch (err) {
+    const status = request.signal?.aborted ? 499 : voiceListErrorStatus(err);
     return Response.json(
       { error: { message: err.message || "Failed", type: "server_error" } },
-      { status: 502, headers: { "Access-Control-Allow-Origin": "*" } },
+      { status, headers: { "Access-Control-Allow-Origin": "*" } },
     );
   }
 }

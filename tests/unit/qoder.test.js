@@ -9,12 +9,15 @@
  *   - device flow URL construction
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import crypto from "crypto";
 
 import { qoderEncodeBody } from "../../src/lib/qoder/encoding.js";
 import { buildCosyHeaders } from "../../src/lib/qoder/cosy.js";
-import { QoderService } from "../../src/lib/oauth/services/qoder.js";
+import {
+  QoderService,
+  QODER_OAUTH_MAX_RESPONSE_BYTES,
+} from "../../src/lib/oauth/services/qoder.js";
 import {
   QODER_CHAT_URL_ENCODED,
   QODER_MODEL_LIST_URL,
@@ -29,6 +32,282 @@ import { __test__ as qoderExecutorInternals } from "../../open-sse/executors/qod
 const generatePkcePair = () => new QoderService().generatePkcePair();
 const initiateDeviceFlow = () => new QoderService().initiateDeviceFlow();
 const parseExpiry = QoderService.parseExpiry;
+const QODER_FETCH_TIMEOUT_MS = 15_000;
+
+function stalledBodyResponse(init, method) {
+  const cancel = vi.fn(async () => {});
+  return {
+    ok: true,
+    status: 200,
+    body: { cancel },
+    [method]: () => new Promise((resolve, reject) => {
+      const onAbort = () => reject(new DOMException("body stalled", "AbortError"));
+      if (init.signal.aborted) onAbort();
+      else init.signal.addEventListener("abort", onAbort, { once: true });
+    }),
+  };
+}
+
+describe("Qoder OAuth response deadlines", () => {
+  it("keeps the poll deadline active while reading the token body", async () => {
+    const originalFetch = globalThis.fetch;
+    vi.useFakeTimers();
+    let upstream;
+    try {
+      globalThis.fetch = vi.fn(async (_url, init) => {
+        upstream = stalledBodyResponse(init, "text");
+        return upstream;
+      });
+      const pending = new QoderService().pollDeviceToken({
+        nonce: "nonce-fixture",
+        codeVerifier: "verifier-fixture",
+      });
+      const rejected = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
+      await vi.advanceTimersByTimeAsync(QODER_FETCH_TIMEOUT_MS);
+
+      await rejected;
+      expect(upstream.body.cancel).toHaveBeenCalledOnce();
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns promptly when the optional user-info body stalls", async () => {
+    const originalFetch = globalThis.fetch;
+    vi.useFakeTimers();
+    let upstream;
+    try {
+      globalThis.fetch = vi.fn(async (_url, init) => {
+        upstream = stalledBodyResponse(init, "text");
+        return upstream;
+      });
+      const pending = new QoderService().fetchUserInfo("access-token-fixture");
+      await vi.advanceTimersByTimeAsync(QODER_FETCH_TIMEOUT_MS);
+
+      await expect(pending).resolves.toEqual({ name: "", email: "" });
+      expect(upstream.body.cancel).toHaveBeenCalledOnce();
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("enforces the header deadline when fetch ignores AbortSignal", async () => {
+    const originalFetch = globalThis.fetch;
+    vi.useFakeTimers();
+    try {
+      globalThis.fetch = vi.fn(() => new Promise(() => {}));
+      const pending = new QoderService().pollDeviceToken({
+        nonce: "nonce-fixture",
+        codeVerifier: "verifier-fixture",
+      });
+      const rejected = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      expect(globalThis.fetch).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(QODER_FETCH_TIMEOUT_MS);
+
+      await rejected;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not wait for a non-cooperative body read or cancellation", async () => {
+    const originalFetch = globalThis.fetch;
+    vi.useFakeTimers();
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const releaseLock = vi.fn();
+    const reader = {
+      read: vi.fn(() => new Promise(() => {})),
+      cancel,
+      releaseLock,
+    };
+    try {
+      globalThis.fetch = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "application/json" }),
+        body: {
+          getReader: () => reader,
+          cancel: () => { throw new TypeError("body is locked"); },
+        },
+      }));
+      const pending = new QoderService().pollDeviceToken({
+        nonce: "nonce-fixture",
+        codeVerifier: "verifier-fixture",
+      });
+      const rejected = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
+
+      await vi.advanceTimersByTimeAsync(QODER_FETCH_TIMEOUT_MS);
+
+      await rejected;
+      expect(reader.read).toHaveBeenCalledOnce();
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(releaseLock).toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not await cancellation for a pending device authorization", async () => {
+    const originalFetch = globalThis.fetch;
+    vi.useFakeTimers();
+    const cancel = vi.fn(() => new Promise(() => {}));
+    try {
+      globalThis.fetch = vi.fn(async () => ({
+        ok: true,
+        status: 202,
+        headers: new Headers(),
+        body: { cancel },
+      }));
+
+      await expect(new QoderService().pollDeviceToken({
+        nonce: "nonce-fixture",
+        codeVerifier: "verifier-fixture",
+      })).resolves.toEqual({ status: "pending" });
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects an oversized declared OAuth body without waiting for cancellation", async () => {
+    const originalFetch = globalThis.fetch;
+    const cancel = vi.fn(() => new Promise(() => {}));
+    try {
+      globalThis.fetch = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({
+          "content-type": "application/json",
+          "content-length": String(QODER_OAUTH_MAX_RESPONSE_BYTES + 1),
+        }),
+        body: { cancel },
+      }));
+
+      await expect(new QoderService().pollDeviceToken({
+        nonce: "nonce-fixture",
+        codeVerifier: "verifier-fixture",
+      })).rejects.toMatchObject({ code: "ERR_QODER_OAUTH_BODY_TOO_LARGE" });
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("rejects invalid UTF-8 in an otherwise valid HTTP 200 token envelope", async () => {
+    const originalFetch = globalThis.fetch;
+    const bytes = new Uint8Array([
+      ...new TextEncoder().encode('{"token":"dt-'),
+      0xff,
+      ...new TextEncoder().encode('","user_id":"fixture"}'),
+    ]);
+    try {
+      globalThis.fetch = vi.fn(async () => new Response(bytes, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+
+      await expect(new QoderService().pollDeviceToken({
+        nonce: "nonce-fixture",
+        codeVerifier: "verifier-fixture",
+      })).rejects.toBeInstanceOf(TypeError);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("keeps accepting a bounded valid token envelope", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = vi.fn(async () => Response.json({
+        token: "dt-valid-fixture",
+        refresh_token: "refresh-fixture",
+        user_id: "user-fixture",
+        expires_in: 60,
+      }));
+
+      await expect(new QoderService().pollDeviceToken({
+        nonce: "nonce-fixture",
+        codeVerifier: "verifier-fixture",
+      })).resolves.toMatchObject({
+        status: "ok",
+        accessToken: "dt-valid-fixture",
+        userId: "user-fixture",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("Qoder PAT failure hardening", () => {
+  it("does not reflect a PAT exchange error body into exceptions, logs, or responses", async () => {
+    const originalFetch = globalThis.fetch;
+    const marker = "SENSITIVE_QODER_PAT_ERROR";
+    const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
+    try {
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(marker, { status: 401 }));
+      vi.resetModules();
+      const { resolveQoderCredentials } = await import("../../open-sse/services/qoderModels.js");
+      const { QoderExecutor } = await import("../../open-sse/executors/qoder.js");
+
+      await expect(resolveQoderCredentials({ apiKey: "pt-redaction-fixture" }))
+        .rejects.toMatchObject({ status: 401 });
+
+      const result = await new QoderExecutor().execute({
+        model: "qoder/auto",
+        body: { messages: [{ role: "user", content: "hello" }] },
+        stream: true,
+        credentials: { apiKey: "pt-redaction-executor-fixture" },
+        signal: null,
+        log,
+      });
+      const body = await result.response.text();
+
+      expect(body).not.toContain(marker);
+      expect(JSON.stringify(log.error.mock.calls)).not.toContain(marker);
+      expect(body).toContain("reconnect the account");
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.resetModules();
+    }
+  });
+
+  it("cancels a PAT exchange response that arrives after the deadline", async () => {
+    const originalFetch = globalThis.fetch;
+    vi.useFakeTimers();
+    let resolveFetch;
+    const cancel = vi.fn();
+    try {
+      globalThis.fetch = vi.fn(() => new Promise(resolve => { resolveFetch = resolve; }));
+      vi.resetModules();
+      const { resolveQoderCredentials } = await import("../../open-sse/services/qoderModels.js");
+      const pending = resolveQoderCredentials({ apiKey: "pt-late-response-fixture" });
+      const rejected = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
+      await vi.advanceTimersByTimeAsync(QODER_FETCH_TIMEOUT_MS + 1);
+      await rejected;
+
+      resolveFetch({ body: { cancel } });
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(cancel).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+      vi.resetModules();
+    }
+  });
+});
 
 describe("QODER_MODEL_MAP", () => {
   it("allows Qoder's latest model key", () => {
@@ -367,6 +646,70 @@ describe("normalizeMessages", () => {
     expect(result.messages).toEqual([]);
     expect(result.systemText).toBe("");
   });
+
+  it("preserves image_url blocks (http URL) instead of dropping them", () => {
+    const result = normalizeMessages([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "describe" },
+          { type: "image_url", image_url: { url: "https://example.com/a.png" } },
+        ],
+      },
+    ]);
+    const content = result.messages[0].content;
+    expect(Array.isArray(content)).toBe(true);
+    expect(content).toContainEqual({ type: "text", text: "describe" });
+    expect(content).toContainEqual({ type: "image_url", image_url: { url: "https://example.com/a.png" } });
+  });
+
+  it("preserves base64 data: URI images (no OSS upload needed)", () => {
+    const dataUri = "data:image/png;base64,iVBORw0KGgo=";
+    const result = normalizeMessages([
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: dataUri } },
+          { type: "text", text: "what color?" },
+        ],
+      },
+    ]);
+    const content = result.messages[0].content;
+    expect(Array.isArray(content)).toBe(true);
+    expect(content[0]).toEqual({ type: "image_url", image_url: { url: dataUri } });
+    expect(content.some((b) => b.type === "text" && b.text === "what color?")).toBe(true);
+  });
+
+  it("converts claude-style base64 image blocks to image_url data URIs", () => {
+    const result = normalizeMessages([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "see this" },
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "AAAA" } },
+        ],
+      },
+    ]);
+    const content = result.messages[0].content;
+    expect(content).toContainEqual({
+      type: "image_url",
+      image_url: { url: "data:image/jpeg;base64,AAAA" },
+    });
+  });
+
+  it("drops image blocks with no usable url but keeps the text", () => {
+    const result = normalizeMessages([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "hi" },
+          { type: "image_url", image_url: {} },
+          { type: "image", source: { type: "base64" } },
+        ],
+      },
+    ]);
+    expect(result.messages[0].content).toBe("hi");
+  });
 });
 
 describe("wrapQoderSSE", () => {
@@ -398,19 +741,20 @@ describe("wrapQoderSSE", () => {
     return buf;
   }
 
-  it("forwards an OpenAI envelope chunk and emits [DONE] in flush", async () => {
+  it("reports a missing terminal instead of synthesizing success at EOF", async () => {
     const inner = JSON.stringify({ choices: [{ delta: { content: "hi" } }] });
     const upstream = `data: ${JSON.stringify({ statusCodeValue: 200, body: inner })}\n\n`;
     const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/auto");
     const out = await drain(wrapped);
     expect(out).toContain(`data: ${inner}\n\n`);
+    expect(out).toContain("qoder_missing_terminal");
     expect(out).toContain("data: [DONE]\n\n");
   });
 
   // Regression for review finding #4: a final data: line without a trailing
   // newline used to be silently dropped from `buffer` in flush().
   it("drains a trailing partial line without a newline in flush()", async () => {
-    const inner = JSON.stringify({ choices: [{ delta: { content: "tail" } }], finish_reason: "stop" });
+    const inner = JSON.stringify({ choices: [{ delta: { content: "tail" }, finish_reason: "stop" }] });
     // Note: NO trailing \n on the final line.
     const upstream = `data: ${JSON.stringify({ statusCodeValue: 200, body: inner })}`;
     const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/auto");
@@ -453,12 +797,185 @@ describe("wrapQoderSSE", () => {
     expect(() => JSON.parse(dataLine.slice("data: ".length))).not.toThrow();
   });
 
-  it("upstream error envelope produces an error chunk + [DONE]", async () => {
+  it("upstream error envelope produces a protocol error + [DONE]", async () => {
     const env = JSON.stringify({ statusCodeValue: 503, body: "service unavailable" });
     const wrapped = await wrapQoderSSE(makeResponse([`data: ${env}\n\n`]), "qoder/lite");
     const out = await drain(wrapped);
-    expect(out).toContain("[qoder error 503");
+    expect(out).toContain("qoder_upstream_error");
+    expect(out).not.toContain("finish_reason\":\"stop");
     expect(out).toContain("data: [DONE]\n\n");
+  });
+
+  it("closes on a terminal frame even when upstream cancellation never settles", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const inner = JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] });
+    const envelope = JSON.stringify({ statusCodeValue: 200, body: inner });
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          `data: ${envelope}\ndata: ${JSON.stringify({ statusCodeValue: 200, body: "[DONE]" })}\n\n`,
+        ));
+      },
+      cancel,
+    });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto");
+    await expect(drain(wrapped)).resolves.toContain("data: [DONE]\n\n");
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes after finish_reason when Qoder omits [DONE] and keeps the socket open", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const inner = JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] });
+    const envelope = JSON.stringify({ statusCodeValue: 200, body: inner });
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${envelope}\n\n`));
+      },
+      cancel,
+    });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto");
+    const out = await Promise.race([
+      drain(wrapped),
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("Qoder finish_reason did not terminate the stream")),
+        250,
+      )),
+    ]);
+
+    expect(out).toContain(`data: ${inner}\n\n`);
+    expect(out.match(/data: \[DONE\]/g)).toHaveLength(1);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not drain Qoder upstream beyond downstream demand", async () => {
+    const encoder = new TextEncoder();
+    const cancel = vi.fn();
+    let pulls = 0;
+    const dataFrames = 20;
+    const source = new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        if (pulls <= dataFrames) {
+          const inner = JSON.stringify({ choices: [{ delta: { content: String(pulls) } }] });
+          const envelope = JSON.stringify({ statusCodeValue: 200, body: inner });
+          controller.enqueue(encoder.encode(`data: ${envelope}\n\n`));
+          return;
+        }
+        const terminal = JSON.stringify({ statusCodeValue: 200, body: "[DONE]" });
+        controller.enqueue(encoder.encode(`data: ${terminal}\n\n`));
+        controller.close();
+      },
+      cancel,
+    }, { highWaterMark: 0 });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto", {
+      firstFrameTimeoutMs: 100,
+    });
+
+    // The billing prelude peek needs one chunk. Constructing the wrapper may
+    // prefill one transformed frame, but must not read the second upstream one.
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(pulls).toBe(1);
+
+    const reader = wrapped.body.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain('"content":"1"');
+
+    // Once the first frame is consumed, the wrapper may prefetch exactly one
+    // more frame into its bounded queue; it must not continue draining.
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(pulls).toBeLessThanOrEqual(2);
+
+    await reader.cancel("test complete");
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("terminates a long non-emitting sequence of unsupported SSE fields", async () => {
+    const encoder = new TextEncoder();
+    const cancel = vi.fn();
+    let pulls = 0;
+    const source = new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        if (pulls === 1) {
+          const inner = JSON.stringify({ choices: [{ delta: { content: "first" } }] });
+          const envelope = JSON.stringify({ statusCodeValue: 200, body: inner });
+          controller.enqueue(encoder.encode(`data: ${envelope}\n\n`));
+          return;
+        }
+        if (pulls <= 1050) {
+          controller.enqueue(encoder.encode("event: heartbeat\n"));
+          return;
+        }
+        controller.close();
+      },
+      cancel,
+    }, { highWaterMark: 0 });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto", {
+      firstFrameTimeoutMs: 100,
+    });
+    const reader = wrapped.body.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain("first");
+
+    const failure = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("non-emitting stream did not terminate")), 1000)),
+    ]);
+    expect(new TextDecoder().decode(failure.value)).toContain("qoder_non_emitting_stream");
+    expect(pulls).toBeLessThan(1100);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("peeks past SSE comments and event fields to the first Qoder data frame", async () => {
+    const inner = JSON.stringify({ choices: [{ delta: { content: "after heartbeat" } }] });
+    const envelope = JSON.stringify({ statusCodeValue: 200, body: inner });
+    const terminal = JSON.stringify({ statusCodeValue: 200, body: "[DONE]" });
+    const wrapped = await wrapQoderSSE(makeResponse([
+      `: heartbeat\n\nevent: message\ndata: ${envelope}\n\ndata: ${terminal}\n\n`,
+    ]), "qoder/auto", { firstFrameTimeoutMs: 100 });
+
+    const out = await drain(wrapped);
+    expect(out).toContain("after heartbeat");
+    expect(out).toContain("data: [DONE]\n\n");
+  });
+
+  it("times out a stalled first frame without waiting for reader cancellation", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const source = new ReadableStream({ start() {}, cancel });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto", {
+      firstFrameTimeoutMs: 10,
+    });
+
+    expect(wrapped.status).toBe(504);
+    await expect(wrapped.json()).resolves.toMatchObject({
+      error: { code: "upstream_stream_timeout" },
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an oversized unterminated first frame", async () => {
+    const cancel = vi.fn();
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${"x".repeat(1024 * 1024 + 1)}`));
+      },
+      cancel,
+    });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto", {
+      firstFrameTimeoutMs: 100,
+    });
+
+    expect(wrapped.status).toBe(502);
+    await expect(wrapped.json()).resolves.toMatchObject({
+      error: { code: "invalid_upstream_response" },
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it("non-ok responses are returned unchanged (no transform)", async () => {

@@ -1,10 +1,16 @@
 // OpenRouter TTS — via chat completions + audio modality (SSE stream)
 import { PROVIDER_MEDIA } from "../../providers/index.js";
+import {
+  cancelTtsResponse,
+  readTtsResponseText,
+  throwUpstreamError,
+  TtsInvalidResponseError,
+} from "./_base.js";
 
 const TTS_CFG = PROVIDER_MEDIA["openrouter"]?.ttsConfig || {};
 
 export default {
-  async synthesize(text, model, credentials) {
+  async synthesize(text, model, credentials, _responseFormat, options = {}) {
     if (!credentials?.apiKey) throw new Error("No OpenRouter API key configured");
 
     // model format: "tts-model/voice" e.g. "openai/gpt-4o-mini-tts/alloy"
@@ -38,35 +44,59 @@ export default {
         stream: true,
         messages: [{ role: "user", content: text }],
       }),
+      signal: options.signal,
     });
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err?.error?.message || `OpenRouter TTS failed: ${res.status}`);
+    if (!res.ok) await throwUpstreamError(res, options);
+
+    const mediaType = String(res.headers.get("content-type") || "")
+      .split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+    if (mediaType && mediaType !== "text/event-stream") {
+      cancelTtsResponse(res, new TtsInvalidResponseError("OpenRouter TTS returned a non-SSE response"));
+      throw new TtsInvalidResponseError(`OpenRouter TTS returned unexpected content-type '${mediaType}'`);
     }
 
-    // Parse SSE stream, accumulate base64 audio chunks
+    // The endpoint is SSE, but TTS already buffers all audio before returning.
+    // Read it through the shared cap/deadline and require the terminal marker so
+    // an upstream disconnect cannot turn a partial clip into HTTP 200 success.
+    const textBody = await readTtsResponseText(res, options);
     const chunks = [];
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
-        try {
-          const json = JSON.parse(line.slice(6));
-          const audioData = json.choices?.[0]?.delta?.audio?.data;
-          if (audioData) chunks.push(audioData);
-        } catch {}
+    let sawDone = false;
+    for (const rawLine of textBody.split(/\r?\n/)) {
+      const line = rawLine.trimEnd();
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trimStart();
+      if (payload === "[DONE]") {
+        if (sawDone) throw new TtsInvalidResponseError("OpenRouter TTS returned duplicate terminal markers");
+        sawDone = true;
+        continue;
       }
+      if (!payload) continue;
+      if (sawDone) throw new TtsInvalidResponseError("OpenRouter TTS returned data after [DONE]");
+      let json;
+      try {
+        json = JSON.parse(payload);
+      } catch {
+        throw new TtsInvalidResponseError("OpenRouter TTS returned malformed SSE JSON");
+      }
+      const status = typeof json?.status === "string" ? json.status.trim().toLowerCase() : "";
+      if (json?.error != null || json?.errors != null || json?.success === false ||
+          ["error", "failed", "failure", "cancelled", "canceled", "expired"].includes(status)) {
+        throw new TtsInvalidResponseError(
+          json.error?.message || json.errors?.[0]?.message || json.message ||
+          "OpenRouter TTS returned an error envelope with HTTP 200",
+        );
+      }
+      const audioData = json?.choices?.[0]?.delta?.audio?.data;
+      if (audioData !== undefined && (typeof audioData !== "string" || !audioData)) {
+        throw new TtsInvalidResponseError("OpenRouter TTS returned invalid audio data");
+      }
+      if (audioData) chunks.push(audioData);
     }
 
+    if (!sawDone) throw new TtsInvalidResponseError("OpenRouter TTS stream ended before [DONE]");
     if (chunks.length === 0) throw new Error("OpenRouter TTS returned no audio data");
     return { base64: chunks.join(""), format: "wav" };
   },

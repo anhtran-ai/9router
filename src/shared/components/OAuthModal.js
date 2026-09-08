@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import PropTypes from "prop-types";
 import { Modal, Button, Input } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { appendSafeOAuthAuthorizeMeta, isTrustedOAuthMessageEvent } from "@/shared/utils/oauthOrigin";
 
 // Providers using the dynamic-port local callback proxy.
 // Browser OAuth: popup → auto callback → auto exchange → poll-status.
@@ -181,30 +182,73 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
 
   // Trae/Windsurf proxy OAuth flow: dynamic-port local callback → auto exchange.
   const startProxyFlow = useCallback(async (providerId) => {
+    const stopProxyBestEffort = () => {
+      fetch(`${apiBase}/${providerId}/stop-proxy`).catch(() => {});
+    };
     // 1. Start the local callback server (returns a dynamic port + callback URL).
-    const startRes = await fetch(`${apiBase}/${providerId}/start-proxy`);
-    const startData = await startRes.json();
-    if (!startRes.ok || !startData.success || !startData.callbackUrl) {
-      throw new Error(startData.reason || startData.error || `Failed to start ${providerId} callback server`);
+    let startRes;
+    let startData;
+    try {
+      startRes = await fetch(`${apiBase}/${providerId}/start-proxy`);
+      startData = await startRes.json();
+    } catch (error) {
+      stopProxyBestEffort();
+      throw error;
+    }
+    if (!startRes.ok || startData?.success !== true || typeof startData.callbackUrl !== "string") {
+      // A structured {success:false} means no new listener was acquired. Any
+      // other shape is ambiguous, so close a listener the server may have started.
+      if (startData?.success !== false) stopProxyBestEffort();
+      throw new Error(startData?.reason || startData?.error || `Failed to start ${providerId} callback server`);
     }
     // 2. Build the authorize URL with redirect_uri = proxy callback URL.
     const authorizeUrl = new URL(`${apiBase}/${providerId}/authorize`, window.location.origin);
     authorizeUrl.searchParams.set("redirect_uri", startData.callbackUrl);
-    const authRes = await fetch(authorizeUrl);
-    const authData = await authRes.json();
-    if (!authRes.ok) throw new Error(authData.error);
+    let authRes;
+    let authData;
+    try {
+      authRes = await fetch(authorizeUrl);
+      authData = await authRes.json();
+    } catch (error) {
+      stopProxyBestEffort();
+      throw error;
+    }
+    if (!authRes.ok) {
+      stopProxyBestEffort();
+      throw new Error(authData.error);
+    }
     // 3. Register the session so the proxy can match the incoming callback.
     //    Zed also passes code_verifier (encodes the RSA private key for decrypt);
     //    sent via POST body so the private key never lands in URL/query logs.
     const regBody = { state: authData.state };
     if (authData.codeVerifier) regBody.codeVerifier = authData.codeVerifier;
-    await fetch(`${apiBase}/${providerId}/register-session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(regBody),
-    });
+    let regRes;
+    try {
+      regRes = await fetch(`${apiBase}/${providerId}/register-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(regBody),
+      });
+    } catch (error) {
+      stopProxyBestEffort();
+      throw error;
+    }
+    let regData = null;
+    try {
+      regData = await regRes.json();
+    } catch {
+      // Handled by the strict response check below.
+    }
+    if (!regRes.ok || regData?.success !== true) {
+      stopProxyBestEffort();
+      throw new Error(
+        regData?.error
+        || regData?.reason
+        || `Failed to register ${providerId} callback session`,
+      );
+    }
     // 4. Open popup; proxy auto-exchanges on callback, modal polls poll-status.
-    setAuthData({ ...authData, proxyProvider: providerId });
+    setAuthData({ ...authData, redirectUri: startData.callbackUrl, proxyProvider: providerId });
     setStep("waiting");
     popupRef.current = window.open(authData.authUrl, "oauth_popup", "width=600,height=700");
     if (!popupRef.current) setStep("input"); // popup blocked → fall back to manual paste
@@ -305,9 +349,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       // Build authorize URL first to get codeVerifier/state for codex server-side mode
       const authorizeUrl = new URL(`${apiBase}/${provider}/authorize`, window.location.origin);
       authorizeUrl.searchParams.set("redirect_uri", redirectUri);
-      if (oauthMeta) {
-        Object.entries(oauthMeta).forEach(([k, v]) => { if (v) authorizeUrl.searchParams.set(k, v); });
-      }
+      appendSafeOAuthAuthorizeMeta(authorizeUrl, provider, oauthMeta);
       const res = await fetch(authorizeUrl.toString());
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
@@ -316,17 +358,34 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       let codexProxyActive = false;
       let codexServerSide = false;
       if (provider === "codex" && isLocalhost) {
+        let ambiguousCodexStart = true;
         try {
-          const proxyUrl = new URL(`${apiBase}/codex/start-proxy`, window.location.origin);
-          proxyUrl.searchParams.set("app_port", appPort);
-          proxyUrl.searchParams.set("state", data.state);
-          proxyUrl.searchParams.set("code_verifier", data.codeVerifier);
-          proxyUrl.searchParams.set("redirect_uri", redirectUri);
-          const proxyRes = await fetch(proxyUrl.toString());
+          const proxyRes = await fetch(`${apiBase}/codex/start-proxy`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              appPort,
+              state: data.state,
+              codeVerifier: data.codeVerifier,
+              redirectUri,
+            }),
+          });
           const proxyData = await proxyRes.json();
+          if (!proxyRes.ok) {
+            ambiguousCodexStart = false;
+            throw new Error(proxyData?.error || "Failed to start Codex callback server");
+          }
+          if (
+            typeof proxyData?.success !== "boolean"
+            || typeof proxyData?.serverSide !== "boolean"
+          ) throw new Error("Malformed Codex callback server response");
+          ambiguousCodexStart = false;
           codexProxyActive = proxyData.success;
           codexServerSide = !!proxyData.serverSide;
         } catch {
+          if (ambiguousCodexStart) {
+            fetch(`${apiBase}/codex/stop-proxy`).catch(() => {});
+          }
           codexProxyActive = false;
         }
       }
@@ -335,20 +394,37 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       let xaiProxyActive = false;
       let xaiServerSide = false;
       if (provider === "xai" && isLocalhost) {
+        let ambiguousXaiStart = true;
         try {
-          const proxyUrl = new URL(`${apiBase}/xai/start-proxy`, window.location.origin);
-          proxyUrl.searchParams.set("app_port", appPort);
-          proxyUrl.searchParams.set("state", data.state);
-          proxyUrl.searchParams.set("code_verifier", data.codeVerifier);
-          proxyUrl.searchParams.set("redirect_uri", redirectUri);
-          const proxyRes = await fetch(proxyUrl.toString());
+          const proxyRes = await fetch(`${apiBase}/xai/start-proxy`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              appPort,
+              state: data.state,
+              codeVerifier: data.codeVerifier,
+              redirectUri,
+            }),
+          });
           const proxyData = await proxyRes.json();
+          if (!proxyRes.ok) {
+            ambiguousXaiStart = false;
+            throw new Error(proxyData?.error || "Failed to start xAI callback server");
+          }
+          if (
+            typeof proxyData?.success !== "boolean"
+            || typeof proxyData?.serverSide !== "boolean"
+          ) throw new Error("Malformed xAI callback server response");
+          ambiguousXaiStart = false;
           xaiProxyActive = proxyData.success;
           xaiServerSide = !!proxyData.serverSide;
           if (!xaiProxyActive && proxyData.reason === "port_busy") {
             throw new Error("Port 56121 in use; close the conflicting process and retry");
           }
         } catch (e) {
+          if (ambiguousXaiStart) {
+            fetch(`${apiBase}/xai/stop-proxy`).catch(() => {});
+          }
           if (e?.message) throw e;
           xaiProxyActive = false;
         }
@@ -499,8 +575,14 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     // Handler for callback data - only process once
     const handleCallback = async (data) => {
       if (callbackProcessedRef.current) return; // Already processed
+      if (!data || typeof data !== "object") return;
 
       const { code, token, state, error: callbackError, errorDescription } = data;
+
+      // All automatic callback transports are untrusted shared channels.
+      // Ignore stale/foreign flows unless the provider echoed this modal's
+      // high-entropy state exactly.
+      if (typeof authData.state !== "string" || !authData.state || state !== authData.state) return;
 
       if (callbackError) {
         callbackProcessedRef.current = true;
@@ -517,12 +599,12 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
 
     // Method 1: postMessage from popup
     const handleMessage = (event) => {
-      // Allow messages from same origin or localhost (any port)
-      const isLocalhost = event.origin.includes("localhost") || event.origin.includes("127.0.0.1");
-      const isSameOrigin = event.origin === window.location.origin;
-      if (!isLocalhost && !isSameOrigin) return;
-      
-      if (event.data?.type === "oauth_callback") {
+      if (event.data?.type === "oauth_callback" && isTrustedOAuthMessageEvent(event, {
+        applicationOrigin: window.location.origin,
+        expectedCallbackOrigin: authData.redirectUri,
+        expectedPopup: popupRef.current,
+        expectedState: authData.state,
+      })) {
         handleCallback(event.data.data);
       }
     };
@@ -630,6 +712,10 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       const token = url.searchParams.get("token");
       const state = url.searchParams.get("state");
       const errorParam = url.searchParams.get("error");
+
+      if (authData?.state && state !== authData.state) {
+        throw new Error("OAuth callback state does not match this login attempt");
+      }
 
       if (errorParam) {
         throw new Error(url.searchParams.get("error_description") || errorParam);

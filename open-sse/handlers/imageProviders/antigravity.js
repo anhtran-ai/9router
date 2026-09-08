@@ -1,6 +1,6 @@
 // Antigravity image adapter - delegates to the executor for correct request
 // envelope (project, model, requestType, sessionId) and auth headers.
-import { nowSec } from "./_base.js";
+import { nowSec, sizeToAspectRatio } from "./_base.js";
 import { getExecutor } from "../../executors/index.js";
 
 // Convert image input (data URI or raw base64) to Gemini inlineData part
@@ -27,9 +27,22 @@ export default {
   buildHeaders: () => ({}),
   buildBody: () => ({}),
 
-  async executeViaExecutor(model, body, credentials, log) {
+  async executeViaExecutor(model, body, credentials, log, { signal, readJson, readText }) {
     const executor = getExecutor("antigravity");
     if (!executor) throw new Error("Antigravity executor not found");
+
+    // Ensure we use an image model for image generation
+    const isImageModel = (m) => /image|imagen|image-generation/i.test(m || "");
+    let targetModel = isImageModel(model) ? model : "gemini-3.1-flash-image";
+
+    // If body.size is provided, resolve aspect ratio and append to model
+    if (body.size && typeof body.size === "string") {
+      const ratio = sizeToAspectRatio(body.size);
+      const suffix = ratio.replace(":", "x");
+      if (!targetModel.includes(suffix)) {
+        targetModel = `${targetModel}-${suffix}`;
+      }
+    }
 
     // Build parts: text prompt + optional input image for editing
     const parts = [{ text: body.prompt }];
@@ -44,19 +57,20 @@ export default {
     };
 
     const result = await executor.execute({
-      model,
+      model: targetModel,
       body: chatBody,
       stream: false,
       credentials,
+      signal,
       log,
     });
 
     if (!result.response.ok) {
-      const text = await result.response.text();
+      const text = await readText(result.response);
       throw new Error(text || `HTTP ${result.response.status}`);
     }
 
-    return result.response.json();
+    return readJson(result.response);
   },
 
   normalize: (responseBody, prompt) => {
@@ -67,7 +81,7 @@ export default {
     }));
     return {
       created: nowSec(),
-      data: images.length > 0 ? images : [{ b64_json: "", revised_prompt: prompt }],
+      data: images.map((image) => ({ ...image, revised_prompt: prompt })),
     };
   },
 };

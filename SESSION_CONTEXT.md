@@ -1,10 +1,84 @@
 # 9Router customization context
 
-Last updated: 2026-08-26
+Last updated: 2026-09-09
 
 This is the safe handoff file for continuing the customized 9Router work in a
 new session. It intentionally contains no admin password, API key, OAuth token,
 provider credential, Docker environment value, private key, or host address.
+
+## v0.5.69 source candidate
+
+Issue #43 integrates the exact upstream tag `v0.5.69` at
+`eb712ca821f0ba6bc41043fbd14494c5af5daba5` into AZOX base
+`9754c491500550cb4385212b98a0c3b6e2338fbe`, preserving upstream history and
+the customization registry. The histories meet in merge commit
+`05b9f25d2c1fe345d7d42e460de6bf71d95aec01`; the source hardening commit is
+`24f817fd86f115a58eb1168ef8af499b634f7802`; full-suite Xquik coverage was
+aligned with the guarded-fetch boundary in `9a3025d434fb44ed297db7e582d2d2752deed727`.
+The final multi-pass post-audit source repair is
+`5ccb4540673160c405f03d213cbf826bb040cd7c`. It preserves the v0.5.69
+history while closing standalone SQL.js packaging, half-open Qoder and
+CommandCode streams, provider-scoped model capability collisions, stale
+provider-cache writes, unbounded model/token/OAuth responses, OAuth
+owner/generation races, and raw upstream error reflection.
+From the shared `v0.5.55`
+ancestor, the input histories contain 36 AZOX commits and 91 upstream commits,
+and the merge resolved 11 conflicted files. The candidate branch is
+`codex/upgrade-v0.5.69-20260908`; it is source-only until review and rollout
+approval. It does not change the currently deployed image or persistent data.
+
+The merge keeps all prior compatibility contracts and records the issue #43
+stability additions in `docs/CUSTOMIZATIONS.yaml`. These cover unread
+CommandCode lines in coalesced chunks, cancellation during Antigravity quota
+refresh, session-scoped Gemini thought signatures, Responses tool-name clamp
+collisions, OpenAI reasoning and tool-input conversion to Claude, and Kiro
+system/developer instruction mirroring. Golden snapshots now reject hidden
+translator exceptions and normalize only documented dynamic fields. The root
+dependency lock was refreshed within declared ranges: the inherited audit
+baseline changed from four high plus three moderate findings to two moderate
+Monaco/DOMPurify findings that require a separate breaking dependency review.
+
+The post-audit focused gate passes 31 Vitest files / 541 assertions plus 30/30
+Kimchi assertions under their native `node:test` runner. All 56 changed
+JavaScript/MJS files parse, the customization guard covers 340 fork files, and
+the final dependency audit remains two moderate with zero high or critical.
+An isolated production build passes; its standalone artifact includes the
+658,410-byte SQL.js WASM runtime and passes nine loopback health, catalog,
+authentication and dashboard-redirect checks using the sql.js fallback. The
+separate CLI build also includes that WASM asset and completes after installing
+its declared `esbuild` development dependency without changing the lock or
+package manifest. No live provider request was made.
+
+The final focused source gate covers 49 files and passes 974 tests with two
+documented expected failures. Independent review matrices pass `150/150` and
+`87/87`; static parsing passes for all 47 source/test JavaScript files changed
+by the hardening commit. The added stability coverage exercises fail-closed
+SSRF/DNS validation and redirect
+handling, request-log redaction, GitLab OAuth origin policy, project-ID and
+provider cancellation, combo quorum cleanup, credential mutation guards, and
+ordered Antigravity success/failure accounting so stale requests cannot change
+newer account state.
+
+The guarded full-suite candidate run at source commit `9a3025d4` contains 2,820
+tests: 2,726 pass, 63 inherited assertions fail, and 31 skip; collection errors
+are 3, suite errors are 4, run errors are 0, and run evidence is complete. The
+same Node 20.20.2/Vitest 4.1.11/dependency graph on fork base `9754c491` contains
+2,436 tests: 2,330 pass, 75 assertions fail, and 31 skip, with 4 collection, 6
+suite, and 0 run errors. The identity comparator reports zero new candidate
+failure and 14 base failures absent from the candidate. Final production build
+passes with an isolated profile, data directory, npm cache, and fresh dist
+directory; its standalone server passes all seven loopback smoke checks. The
+Windows build emits a non-fatal optional Tailscale trace-copy warning; the
+standalone health, models, contributor/admin authorization, and dashboard login
+boundaries still pass. The first build attempt inherited an inaccessible host
+npm-cache log and failed `EPERM`; it is superseded by the isolated passing run.
+
+No live provider call, image publication, production migration, or deployment
+is part of issue #43. Because this candidate changes authentication and security
+boundaries, merging the reviewed source requires its explicit Confirmation.
+That source-merge approval does not authorize a release image, publication,
+migration, or production change; rollout requires a separate explicit approval
+after source acceptance and deployment evidence are ready.
 
 ## Source repair, separate from deployment
 
@@ -56,13 +130,22 @@ snapshots; production has not been re-inspected or changed in this repair.
 
 - Canonical customized repository: `https://github.com/azox-ai/azox-9router`
 - Upstream repository: `https://github.com/decolua/9router`
-- Current reviewed branch: `main`
-- Upstream integration commit: `ab0de796`.
-- Pre-upgrade deployed source commit:
+- Current reviewed branch: `main`; source candidate:
+  `codex/upgrade-v0.5.69-20260908` (issue `#43`).
+- Last merged upstream integration commit: `ab0de796`.
+- Historical pre-`v0.5.55` reviewed source commit:
   `a3ec8af4c9e6243e860e163d535f3af6dec324a5`
-- Target upstream tag: `v0.5.55` at
-  `699edac3273e13d4744bc46f6082618f08560702`
-- Candidate package version inherited from upstream: `0.5.55`
+- Candidate upstream tag: `v0.5.69` at
+  `eb712ca821f0ba6bc41043fbd14494c5af5daba5`
+- Candidate upstream merge commit:
+  `05b9f25d2c1fe345d7d42e460de6bf71d95aec01`
+- Candidate source hardening commit:
+  `24f817fd86f115a58eb1168ef8af499b634f7802`
+- Candidate guarded-fetch test alignment commit:
+  `9a3025d434fb44ed297db7e582d2d2752deed727`
+- Candidate final post-audit source repair commit:
+  `5ccb4540673160c405f03d213cbf826bb040cd7c`
+- Candidate package version inherited from upstream: `0.5.69`
 - Reviewed/deployed source commit:
   `fcf4300e6e0b263ad28a8a475a18702cb7c6774c` (PR `#21`, Codex Responses
   `additional_tools.content` compatibility fix), including PR `#20` at

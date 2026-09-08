@@ -27,10 +27,11 @@ function baseBody() {
   };
 }
 
-// Khử field động: toolNameMap, kiro conversationId (uuid), timestamp trong content.
+// Khử field động while preserving the presence of Kiro UUID fields.
 function clean(body) {
   const s = JSON.stringify(body, (k, v) => {
-    if (k === "_toolNameMap" || k === "conversationId") return undefined;
+    if (k === "_toolNameMap") return undefined;
+    if (k === "conversationId" || k === "agentContinuationId") return "<UUID>";
     return v;
   }).replace(/Current time is [^"\\]+/g, "Current time is <TS>");
   return JSON.parse(s);

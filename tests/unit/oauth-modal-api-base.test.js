@@ -39,7 +39,22 @@ describe("OAuthModal apiBase seam", () => {
     );
   });
 
+  it("keeps fixed-proxy session material in POST bodies and validates dynamic registration", () => {
+    expect(oauthModalSource).not.toMatch(/searchParams\.set\(["'](?:state|code_verifier|codeVerifier|token)["']/);
+    expect(oauthModalSource).toMatch(
+      /fetch\(`\$\{apiBase\}\/codex\/start-proxy`,\s*\{[\s\S]*?method:\s*["']POST["'][\s\S]*?codeVerifier:\s*data\.codeVerifier/,
+    );
+    expect(oauthModalSource).toMatch(
+      /fetch\(`\$\{apiBase\}\/xai\/start-proxy`,\s*\{[\s\S]*?method:\s*["']POST["'][\s\S]*?codeVerifier:\s*data\.codeVerifier/,
+    );
+    expect(oauthModalSource).toMatch(/!regRes\.ok\s*\|\|\s*regData\?\.success\s*!==\s*true/);
+    expect(oauthModalSource).toMatch(/stopProxyBestEffort\(\)/);
+    expect(oauthModalSource).toMatch(/startData\?\.success\s*!==\s*true[\s\S]*?stopProxyBestEffort\(\)/);
+    expect(oauthModalSource).toMatch(/Malformed Codex callback server response[\s\S]*?codex\/stop-proxy/);
+    expect(oauthModalSource).toMatch(/Malformed xAI callback server response[\s\S]*?xai\/stop-proxy/);
+  });
+
   it("keeps the OAuth service barrel identical to upstream formatting", () => {
-    expect(oauthServicesIndexSource).toMatch(/export \{ CursorService \} from "\.\/cursor\.js";\n\n$/);
+    expect(oauthServicesIndexSource).toMatch(/export \{ CursorService \} from "\.\/cursor\.js";\r?\n\r?\n$/);
   });
 });

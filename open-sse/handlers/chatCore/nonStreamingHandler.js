@@ -1,13 +1,30 @@
 import { FORMATS } from "../../translator/formats.js";
 import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTracking.js";
-import { createErrorResult } from "../../utils/error.js";
-import { HTTP_STATUS } from "../../config/runtimeConfig.js";
-import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
+import { createErrorResult, readUpstreamBodyText } from "../../utils/error.js";
+import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { convertChatStreamToOpenAIResponse } from "./sseToJsonHandler.js";
 import { convertResponsesStreamToJson } from "../../transformer/streamToJsonConverter.js";
 import { InvalidResponseError, normalizeNonStreamingResponse } from "../../translator/concerns/responseContract.js";
 import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
+
+const MAX_NON_STREAMING_RESPONSE_BYTES = 64 * 1024 * 1024;
+
+async function readJsonResponse(providerResponse, signal) {
+  const text = await readUpstreamBodyText(providerResponse, {
+    signal,
+    maxBytes: MAX_NON_STREAMING_RESPONSE_BYTES,
+    stallTimeoutMs: STREAM_STALL_TIMEOUT_MS,
+    fatalUtf8: true,
+  });
+  if (!text.trim()) throw new InvalidResponseError("empty upstream JSON response");
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new InvalidResponseError("invalid upstream JSON response");
+  }
+}
 
 // Retain the exported entry point used by existing callers and tests.
 export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null, options = {}) {
@@ -17,7 +34,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
 /**
  * Handle non-streaming response from provider.
  */
-export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log }) {
+export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log, signal = null }) {
   trackDone();
   const contentType = (providerResponse.headers.get("content-type") || "").toLowerCase();
   let responseBody;
@@ -25,14 +42,20 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   try {
     if (contentType.includes("text/event-stream")) {
       responseBody = targetFormat === FORMATS.OPENAI_RESPONSES
-        ? await convertResponsesStreamToJson(providerResponse.body)
-        : parseSSEToOpenAIResponse(await providerResponse.text(), model);
+        ? await convertResponsesStreamToJson(providerResponse.body, { signal })
+        : await convertChatStreamToOpenAIResponse(providerResponse.body, model, { signal });
     } else {
-      responseBody = await providerResponse.json();
+      responseBody = await readJsonResponse(providerResponse, signal);
     }
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw signal.reason ?? new DOMException("Request aborted", "AbortError");
     appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
-    return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid upstream response body", undefined, "invalid_upstream_response");
+    return createErrorResult(
+      HTTP_STATUS.BAD_GATEWAY,
+      error instanceof InvalidResponseError ? error.message : "Invalid upstream response body",
+      undefined,
+      "invalid_upstream_response",
+    );
   }
 
   reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
@@ -49,9 +72,15 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     return createErrorResult(error.status, error.message, undefined, error.code);
   }
   if (onRequestSuccess) {
-    Promise.resolve().then(onRequestSuccess).catch(err => {
+    // Publish the in-memory success watermark before returning while keeping
+    // any asynchronous account-state persistence best-effort.
+    try {
+      Promise.resolve(onRequestSuccess()).catch(err => {
+        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+      });
+    } catch (err) {
       console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
-    });
+    }
   }
 
   const usage = extractUsageFromResponse(responseBody);

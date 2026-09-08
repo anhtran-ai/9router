@@ -8,6 +8,25 @@ import { TTS_PROVIDER_CONFIG } from "../../src/shared/constants/ttsProviders.js"
 
 const originalFetch = global.fetch;
 
+function validWav() {
+  const audio = Buffer.alloc(46);
+  audio.write("RIFF", 0);
+  audio.writeUInt32LE(38, 4);
+  audio.write("WAVE", 8);
+  audio.write("fmt ", 12);
+  audio.writeUInt32LE(16, 16);
+  audio.writeUInt16LE(1, 20);
+  audio.writeUInt16LE(1, 22);
+  audio.writeUInt32LE(24000, 24);
+  audio.writeUInt32LE(48000, 28);
+  audio.writeUInt16LE(2, 32);
+  audio.writeUInt16LE(16, 34);
+  audio.write("data", 36);
+  audio.writeUInt32LE(2, 40);
+  audio.writeInt16LE(1, 44);
+  return audio;
+}
+
 function mockMiMoAudioResponse() {
   global.fetch.mockResolvedValueOnce(
     new Response(
@@ -17,7 +36,7 @@ function mockMiMoAudioResponse() {
             message: {
               role: "assistant",
               audio: {
-                data: Buffer.from([0, 1, 2, 3]).toString("base64"),
+                data: validWav().toString("base64"),
                 format: "wav",
                 transcript: "Hello from MiMo",
               },

@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { getProviderConnections } from "@/lib/localDb";
+import {
+  VoiceListInvalidResponseError,
+  VoiceListUpstreamError,
+  assertVoiceListSuccessEnvelope,
+  fetchVoiceListJson,
+  voiceListErrorStatus,
+} from "open-sse/handlers/ttsProviders/voiceList.js";
 
 const langNames = new Intl.DisplayNames(["en"], { type: "language" });
 
@@ -17,15 +24,23 @@ export async function GET(request) {
     const apiKey = connections[0]?.apiKey;
     if (!apiKey) return NextResponse.json({ error: "No Deepgram connection found" }, { status: 400 });
 
-    const res = await fetch("https://api.deepgram.com/v1/models", {
-      headers: { "Authorization": `Token ${apiKey}` },
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      return NextResponse.json({ error: `Deepgram API ${res.status}: ${text || "Failed"}` }, { status: 502 });
+    const { response, data } = await fetchVoiceListJson(
+      "https://api.deepgram.com/v1/models",
+      { headers: { "Authorization": `Token ${apiKey}` } },
+      { signal: request.signal },
+    );
+    if (!response.ok) throw new VoiceListUpstreamError("Deepgram", response.status);
+    assertVoiceListSuccessEnvelope(data, "Deepgram");
+    if (!Array.isArray(data.tts) || data.tts.some((model) =>
+      !model || typeof model !== "object" || Array.isArray(model) ||
+      (typeof model.canonical_name !== "string" && typeof model.name !== "string") ||
+      (model.languages != null && (
+        !Array.isArray(model.languages) || model.languages.some((lang) => typeof lang !== "string" || !lang)
+      ))
+    )) {
+      throw new VoiceListInvalidResponseError("Deepgram returned an invalid voice catalog");
     }
-    const data = await res.json();
-    const ttsModels = data.tts || [];
+    const ttsModels = data.tts;
 
     const byLang = {};
     for (const m of ttsModels) {
@@ -60,6 +75,7 @@ export async function GET(request) {
     }
     return NextResponse.json({ languages, byLang });
   } catch (err) {
-    return NextResponse.json({ error: err.message || "Failed to fetch voices" }, { status: 502 });
+    const status = request.signal?.aborted ? 499 : voiceListErrorStatus(err);
+    return NextResponse.json({ error: err.message || "Failed to fetch voices" }, { status });
   }
 }

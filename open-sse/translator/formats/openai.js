@@ -86,6 +86,12 @@ export function filterToOpenAIFormat(body, opts = {}) {
     if (msg.role === ROLE.TOOL) return true;
     // Always keep assistant messages with tool_calls
     if (msg.role === ROLE.ASSISTANT && msg.tool_calls) return true;
+    // A reasoning-only assistant turn is valid bridge state. Dropping it loses
+    // Claude thinking text or Responses encrypted continuity before the next hop.
+    if (msg.role === ROLE.ASSISTANT && (
+      (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) ||
+      (typeof msg.encrypted_content === "string" && msg.encrypted_content.length > 0)
+    )) return true;
     
     if (typeof msg.content === "string") return msg.content.trim() !== "";
     if (Array.isArray(msg.content)) {

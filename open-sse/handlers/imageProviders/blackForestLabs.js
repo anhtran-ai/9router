@@ -1,5 +1,5 @@
 // Black Forest Labs (FLUX) — async submit + polling_url
-import { sleep, nowSec, POLL_INTERVAL_MS, POLL_TIMEOUT_MS } from "./_base.js";
+import { cancelResponseBody, nowSec, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, requireProviderUrl } from "./_base.js";
 import { PROVIDER_MEDIA } from "../../providers/index.js";
 
 const BASE_URL = PROVIDER_MEDIA["black-forest-labs"]?.imageConfig?.baseUrl;
@@ -21,16 +21,22 @@ export default {
     if (body.image) req.image_prompt = body.image;
     return req;
   },
-  async parseResponse(response, { headers }) {
-    const data = await response.json();
-    const pollingUrl = data.polling_url;
+  async parseResponse(response, { headers, fetch, sleep, readJson, signal }) {
+    const data = await readJson(response);
+    const pollingUrl = requireProviderUrl(data.polling_url, BASE_URL, "BFL polling URL");
     if (!pollingUrl) throw new Error("BFL: no polling_url returned");
     const deadline = Date.now() + POLL_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      await sleep(POLL_INTERVAL_MS);
-      const r = await fetch(pollingUrl, { headers: { "x-key": headers["x-key"], "Accept": "application/json" } });
-      if (!r.ok) throw new Error(`BFL status ${r.status}`);
-      const s = await r.json();
+      await sleep(POLL_INTERVAL_MS, signal);
+      const r = await fetch(pollingUrl, {
+        headers: { "x-key": headers["x-key"], "Accept": "application/json" },
+        redirect: "error",
+      });
+      if (!r.ok) {
+        cancelResponseBody(r);
+        throw new Error(`BFL status ${r.status}`);
+      }
+      const s = await readJson(r);
       if (s.status === "Ready") return s;
       if (s.status === "Error" || s.status === "Failed") throw new Error(s.error || "BFL generation failed");
     }

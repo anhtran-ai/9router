@@ -4,17 +4,29 @@ import "./registerAll.js";
 import { translateRequest } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
 import { prepareClaudeRequest } from "../../open-sse/translator/formats/claude.js";
+import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 
 // anthropic-compatible provider so prepareClaudeRequest runs the openai→claude path
 const T = (body) =>
   translateRequest(FORMATS.OPENAI, FORMATS.CLAUDE, "m", body, true, null, "anthropic-compatible-x");
 
 describe("OpenAI → Claude context mapping", () => {
-  // openai-to-claude.js:124-134 — always injects CLAUDE_SYSTEM_PROMPT ("You are Claude Code")
-  // KNOWN BUG: pollutes requests for non-official Claude-compatible providers
-  it.fails("does not inject Claude Code system prompt for compatible providers", () => {
+  it("does not inject Claude Code system prompt for compatible providers", () => {
     const out = T({ messages: [{ role: "user", content: "hi" }] });
-    expect(JSON.stringify(out.system), "Claude Code prompt injected").not.toContain("Claude Code");
+    expect(JSON.stringify(out.system ?? []), "Claude Code prompt injected").not.toContain("Claude Code");
+  });
+
+  it("keeps Claude Code identity scoped to the official Claude provider", () => {
+    const out = translateRequest(
+      FORMATS.OPENAI,
+      FORMATS.CLAUDE,
+      "m",
+      { messages: [{ role: "user", content: "hi" }] },
+      true,
+      null,
+      "claude",
+    );
+    expect(JSON.stringify(out.system)).toContain("You are Claude Code");
   });
 
   it("assistant reasoning_content becomes a thinking block", () => {
@@ -33,6 +45,38 @@ describe("OpenAI → Claude context mapping", () => {
     }));
   });
 
+  it("preserves developer instructions in Claude's top-level system channel", () => {
+    const out = T({
+      messages: [
+        { role: "system", content: "System rule" },
+        { role: "developer", content: "Developer rule" },
+        { role: "user", content: "Question" },
+      ],
+    });
+    const systemText = out.system.map(block => block.text || "").join("\n");
+
+    expect(systemText).toContain("System rule");
+    expect(systemText).toContain("Developer rule");
+    expect(systemText.indexOf("System rule")).toBeLessThan(systemText.indexOf("Developer rule"));
+    expect(out.messages).toEqual([
+      expect.objectContaining({ role: "user" }),
+    ]);
+  });
+
+  it("drops empty developer instructions instead of emitting invalid system text", () => {
+    const out = T({
+      messages: [
+        { role: "developer", content: [{ type: "text", text: "   " }] },
+        { role: "user", content: "Question" },
+      ],
+    });
+
+    expect((out.system || []).every(block => typeof block.text !== "string" || block.text.trim())).toBe(true);
+    expect(out.messages).toEqual([
+      expect.objectContaining({ role: "user" }),
+    ]);
+  });
+
   it("tool_choice=none is not turned into auto", () => {
     const out = T({
       messages: [{ role: "user", content: "hi" }],
@@ -42,16 +86,13 @@ describe("OpenAI → Claude context mapping", () => {
     expect(out.tool_choice).toEqual({ type: "none" });
   });
 
-  // getContentBlocksFromMessage — no input_audio branch → audio dropped
-  // KNOWN BUG
-  it.fails("input_audio content is preserved", () => {
-    const out = T({
+  it("fails closed because Claude Messages cannot represent input_audio", () => {
+    expect(() => T({
       messages: [{ role: "user", content: [
         { type: "text", text: "transcribe" },
         { type: "input_audio", input_audio: { data: "AUDIO_B64", format: "wav" } },
       ] }],
-    });
-    expect(JSON.stringify(out), "audio dropped").toContain("AUDIO_B64");
+    })).toThrowError(ToolCompatibilityError);
   });
 
   // openai-to-claude.js:235-251 — remote http image_url is kept (regression guard)

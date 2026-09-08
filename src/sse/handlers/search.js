@@ -2,6 +2,9 @@ import {
   getProviderCredentials,
   markAccountUnavailable,
   clearAccountError,
+  beginAccountMutationAttempt,
+  endAccountMutationAttempt,
+  recordAccountMutationSuccess,
   extractApiKey,
   isValidApiKey,
 } from "../services/auth.js";
@@ -14,6 +17,16 @@ import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
 
+function observeAccountCleanup(cleanup, connectionId) {
+  try {
+    Promise.resolve(cleanup()).catch((error) => {
+      log.warn("SEARCH", `Failed to clear account state after successful search (${connectionId}): ${error?.message || error}`);
+    });
+  } catch (error) {
+    log.warn("SEARCH", `Failed to start account-state cleanup after successful search (${connectionId}): ${error?.message || error}`);
+  }
+}
+
 /**
  * Handle web search request for the SSE/Next.js server.
  * Provider IS the model (no model field). Mirrors handleEmbeddings auth + fallback flow.
@@ -21,6 +34,9 @@ import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo
  * @param {Request} request
  */
 export async function handleSearch(request) {
+  if (request.signal?.aborted) {
+    return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+  }
   let body;
   try {
     body = await request.json();
@@ -137,7 +153,8 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       provider: resolvedProvider,
       providerConfig,
       credentials: null,
-      log
+      log,
+      signal: request.signal,
     });
     if (result.success) return result.response;
     return result.response;
@@ -148,8 +165,33 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
   let lastError = null;
   let lastStatus = null;
 
+  // Credential fallback: some search providers reuse the API key of a related
+  // chat provider (e.g. ollama-search reuses the `ollama` chat key, zai-search
+  // reuses the `glm` chat key). When the search provider has no own connection,
+  // fall back to the linked provider's credentials.
+  const fallbackProviderId = resolvedProvider.credentialFallback;
+
+  // Lock scope for this handler. Without it markAccountUnavailable would write
+  // an account-wide `__all` lock, which on the credentialFallback path takes
+  // the shared chat key (e.g. glm) offline for chat as well. Must be passed to
+  // getProviderCredentials too, so the lock is read back under the same key.
+  const searchLockKey = `websearch:${providerId}`;
+
   while (true) {
-    const credentials = await getProviderCredentials(providerId, excludeConnectionIds);
+    // Provider that actually owns the connection in use — differs from
+    // providerId once we fall back, and error locks must be attributed to it.
+    let credentialProviderId = providerId;
+    let credentials = await getProviderCredentials(providerId, excludeConnectionIds, searchLockKey);
+
+    // Fall back to the related chat provider's credentials when this search
+    // provider has none of its own (one key, chat + search).
+    if (!credentials && fallbackProviderId) {
+      credentials = await getProviderCredentials(fallbackProviderId, excludeConnectionIds, searchLockKey);
+      if (credentials) {
+        credentialProviderId = fallbackProviderId;
+        log.info("AUTH", `\x1b[32m${providerId} reusing ${fallbackProviderId} credentials\x1b[0m`);
+      }
+    }
 
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
@@ -170,37 +212,61 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
 
     const refreshedCredentials = await checkAndRefreshToken(providerId, credentials);
 
-    const result = await handleSearchCore({
-      body: coreBody,
-      provider: resolvedProvider,
-      providerConfig,
-      credentials: refreshedCredentials,
-      log,
-      onCredentialsRefreshed: async (newCreds) => {
-        await updateProviderCredentials(credentials.connectionId, {
-          accessToken: newCreds.accessToken,
-          refreshToken: newCreds.refreshToken,
-          providerSpecificData: newCreds.providerSpecificData,
-          testStatus: "active"
-        });
-      },
-      onRequestSuccess: async () => {
-        await clearAccountError(credentials.connectionId, credentials);
+    const mutationAttempt = beginAccountMutationAttempt(credentials.connectionId, searchLockKey);
+    try {
+      const result = await handleSearchCore({
+        body: coreBody,
+        provider: resolvedProvider,
+        providerConfig,
+        credentials: refreshedCredentials,
+        log,
+        signal: request.signal,
+        onCredentialsRefreshed: async (newCreds) => {
+          await updateProviderCredentials(credentials.connectionId, {
+            accessToken: newCreds.accessToken,
+            refreshToken: newCreds.refreshToken,
+            providerSpecificData: newCreds.providerSpecificData,
+            testStatus: "active"
+          });
+        },
+      });
+
+      if (result.success) {
+        recordAccountMutationSuccess(mutationAttempt);
+        // Account bookkeeping must never replace a verified provider result
+        // with a gateway error or keep the client waiting on a stuck database.
+        observeAccountCleanup(
+          () => clearAccountError(credentials.connectionId, credentials, searchLockKey, { mutationAttempt }),
+          credentials.connectionId,
+        );
+        return result.response;
       }
-    });
 
-    if (result.success) return result.response;
+      if (request.signal?.aborted || result.status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) {
+        return result.response || errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
 
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, providerId);
+      const { shouldFallback } = await markAccountUnavailable(
+        credentials.connectionId,
+        result.status,
+        result.error,
+        credentialProviderId,
+        searchLockKey,
+        null,
+        { mutationAttempt },
+      );
 
-    if (shouldFallback) {
-      log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
-      excludeConnectionIds.add(credentials.connectionId);
-      lastError = result.error;
-      lastStatus = result.status;
-      continue;
+      if (shouldFallback) {
+        log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
+        excludeConnectionIds.add(credentials.connectionId);
+        lastError = result.error;
+        lastStatus = result.status;
+        continue;
+      }
+
+      return result.response;
+    } finally {
+      endAccountMutationAttempt(mutationAttempt);
     }
-
-    return result.response;
   }
 }

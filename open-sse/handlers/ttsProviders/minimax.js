@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { readTtsResponseText, TtsUpstreamError } from "./_base.js";
 
 function hexToBase64(audioHex) {
   const clean = typeof audioHex === "string" ? audioHex.trim() : "";
@@ -10,7 +11,16 @@ function hexToBase64(audioHex) {
 }
 
 // MiniMax T2A HTTP: returns hex-encoded audio in non-streaming mode.
-export default async function minimaxTts({ baseUrl, apiKey, text, modelId, voiceId }) {
+export default async function minimaxTts({
+  baseUrl,
+  apiKey,
+  text,
+  modelId,
+  voiceId,
+  signal,
+  maxResponseBytes,
+  stallTimeoutMs,
+}) {
   const res = await fetch(baseUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
@@ -33,9 +43,10 @@ export default async function minimaxTts({ baseUrl, apiKey, text, modelId, voice
         channel: 1,
       },
     }),
+    signal,
   });
 
-  const rawText = await res.text();
+  const rawText = await readTtsResponseText(res, { signal, maxResponseBytes, stallTimeoutMs });
   let data = {};
   if (rawText) {
     try { data = JSON.parse(rawText); } catch { data = {}; }
@@ -46,10 +57,15 @@ export default async function minimaxTts({ baseUrl, apiKey, text, modelId, voice
   const statusMessage = baseResp.status_msg || baseResp.statusMsg || data.message || "";
 
   if (!res.ok) {
-    throw new Error(statusMessage || rawText || `MiniMax TTS error (${res.status})`);
+    throw new TtsUpstreamError(res.status, statusMessage || rawText || `MiniMax TTS error (${res.status})`);
   }
-  if (statusCode !== 0) {
-    throw new Error(statusMessage || "MiniMax TTS upstream error");
+  const topLevelStatus = typeof data.status === "string" ? data.status.trim().toLowerCase() : "";
+  const explicitFailure = data.error != null || data.errors != null || data.success === false ||
+    ["error", "failed", "failure", "cancelled", "canceled", "expired"].includes(topLevelStatus);
+  if (statusCode !== 0 || explicitFailure) {
+    const message = data.error?.message || data.errors?.[0]?.message ||
+      (explicitFailure ? data.message : null) || statusMessage || data.message;
+    throw new Error(typeof message === "string" && message ? message : "MiniMax TTS upstream error");
   }
 
   return {

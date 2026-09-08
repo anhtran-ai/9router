@@ -26,6 +26,32 @@ const originalFetch = global.fetch;
 const jsonResponse = (body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
+const streamResponse = (chunks, { status = 200, headers = {}, cancel = vi.fn() } = {}) => {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
+      controller.close();
+    },
+    cancel,
+  });
+  return {
+    response: new Response(body, {
+      status,
+      headers: { "Content-Type": "application/json", ...headers },
+    }),
+    cancel,
+  };
+};
+
+async function expectInvalidUpstream(result) {
+  expect(result.success).toBe(false);
+  expect(result.status).toBe(502);
+  expect(await result.response.json()).toMatchObject({
+    error: { code: "invalid_upstream_response" },
+  });
+}
+
 describe("registry wiring", () => {
   it("exposes videoConfig for xai", () => {
     expect(getVideoConfig("xai")).toEqual({ baseUrl: "https://api.x.ai/v1/videos" });
@@ -90,6 +116,81 @@ describe("handleVideoProxyCore", () => {
     expect(await result.response.json()).toEqual({ request_id: "req-123" });
   });
 
+  it("accepts the alternate valid id field on creation", async () => {
+    global.fetch.mockResolvedValueOnce(jsonResponse({ id: "req-by-id" }));
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(await result.response.json()).toEqual({ id: "req-by-id" });
+  });
+
+  it.each([
+    ["empty", new Response("", { status: 200, headers: { "Content-Type": "application/json" } })],
+    ["malformed JSON", new Response('{"request_id":', { status: 200, headers: { "Content-Type": "application/json" } })],
+    ["non-JSON content type", new Response('{"request_id":"req-1"}', { status: 200, headers: { "Content-Type": "text/html" } })],
+    ["missing creation id", jsonResponse({ status: "pending" })],
+    ["embedded creation error", jsonResponse({ error: { code: "bad_request", message: "rejected" } })],
+    ["explicit creation failure", jsonResponse({ success: false, request_id: "must-not-pass" })],
+    ["terminal creation status", jsonResponse({ status: "failed", request_id: "must-not-pass" })],
+    ["invalid preferred id beside a valid alternate", jsonResponse({ request_id: 42, id: "req-valid" })],
+    ["conflicting creation ids", jsonResponse({ request_id: "req-a", id: "req-b" })],
+  ])("fails closed on a %s HTTP-200 creation response", async (_label, upstream) => {
+    global.fetch.mockResolvedValueOnce(upstream);
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+    });
+
+    await expectInvalidUpstream(result);
+  });
+
+  it("rejects invalid UTF-8 in an otherwise valid HTTP-200 creation envelope", async () => {
+    const prefix = new TextEncoder().encode('{"request_id":"job-');
+    const suffix = new TextEncoder().encode('"}');
+    const body = new Uint8Array(prefix.length + 1 + suffix.length);
+    body.set(prefix, 0);
+    body[prefix.length] = 0xff;
+    body.set(suffix, prefix.length + 1);
+    global.fetch.mockResolvedValueOnce(new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+    });
+
+    await expectInvalidUpstream(result);
+  });
+
+  it("parses a valid creation response split across transport chunks", async () => {
+    const { response } = streamResponse(['{"request_', 'id":"req-split"}']);
+    global.fetch.mockResolvedValueOnce(response);
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(response.body.locked).toBe(false);
+    expect(await result.response.json()).toEqual({ request_id: "req-split" });
+  });
+
   it("forwards multipart bodies untouched with the original boundary header", async () => {
     global.fetch.mockResolvedValueOnce(jsonResponse({ request_id: "req-mp" }));
 
@@ -144,6 +245,156 @@ describe("handleVideoProxyCore", () => {
 
     expect(result.success).toBe(true);
     expect(await result.response.json()).toEqual(payload);
+  });
+
+  it.each([
+    ["unknown status", { status: "complete", video: { url: "https://cdn.x.ai/v.mp4" } }],
+    ["missing status", { error: { code: "render_failed", message: "boom" } }],
+    ["pending with embedded error", { status: "pending", error: { message: "boom" } }],
+    ["done without video", { status: "done" }],
+    ["done with an insecure URL", { status: "done", video: { url: "http://cdn.x.ai/v.mp4" } }],
+    ["failed without a valid error", { status: "failed", error: {} }],
+    ["expired with a malformed error", { status: "expired", error: 42 }],
+    ["pending with a false success flag", { status: "pending", success: false }],
+    ["done with a false success flag", { status: "done", success: false, video: { url: "https://cdn.x.ai/v.mp4" } }],
+    ["failed with a true success flag", { status: "failed", success: true, error: "render failed" }],
+    ["non-boolean success flag", { status: "pending", success: "true" }],
+  ])("fails closed on a poll response with %s", async (_label, payload) => {
+    global.fetch.mockResolvedValueOnce(jsonResponse(payload));
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      requestId: "req-invalid",
+      credentials: { accessToken: "tok" },
+    });
+
+    await expectInvalidUpstream(result);
+  });
+
+  it("passes a recognized expired job through", async () => {
+    const payload = { status: "expired", error: { code: "expired", message: "result expired" } };
+    global.fetch.mockResolvedValueOnce(jsonResponse(payload));
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      requestId: "req-expired",
+      credentials: { accessToken: "tok" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(await result.response.json()).toEqual(payload);
+  });
+
+  it("rejects an oversized HTTP-200 body and cancels it without waiting for cancellation", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const { response } = streamResponse(["{}"], {
+      headers: { "Content-Length": "4096" },
+      cancel,
+    });
+    global.fetch.mockResolvedValueOnce(response);
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+      maxResponseBytes: 64,
+    });
+
+    await expectInvalidUpstream(result);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(response.body.locked).toBe(false);
+  });
+
+  it("enforces the response cap when content-length is absent", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"request_id":"too-long"}'));
+      },
+      cancel,
+    });
+    const response = new Response(body, { headers: { "Content-Type": "application/json" } });
+    global.fetch.mockResolvedValueOnce(response);
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+      maxResponseBytes: 8,
+    });
+
+    await expectInvalidUpstream(result);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(response.body.locked).toBe(false);
+  });
+
+  it("times out a stalled HTTP-200 body, cancels it, and releases the reader", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream({ cancel });
+    const upstream = new Response(body, { headers: { "Content-Type": "application/json" } });
+    global.fetch.mockResolvedValueOnce(upstream);
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+      timeoutMs: 1_000,
+      bodyStallTimeoutMs: 15,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(504);
+    expect(await result.response.json()).toMatchObject({ error: { code: "video_upstream_timeout" } });
+    expect(cancel).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(upstream.body.locked).toBe(false));
+  });
+
+  it("maps an actual caller abort during the response body to 499 and releases it", async () => {
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    const body = new ReadableStream({ cancel });
+    const upstream = new Response(body, { headers: { "Content-Type": "application/json" } });
+    global.fetch.mockResolvedValueOnce(upstream);
+
+    const pending = handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+      signal: controller.signal,
+      timeoutMs: 1_000,
+      bodyStallTimeoutMs: 500,
+    });
+    await vi.waitFor(() => expect(upstream.body.locked).toBe(true));
+    controller.abort(new DOMException("client disconnected", "AbortError"));
+    const result = await pending;
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(499);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(upstream.body.locked).toBe(false));
+  });
+
+  it("enforces the full-operation deadline while waiting for response headers", async () => {
+    global.fetch.mockImplementationOnce((_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+    }));
+
+    const result = await handleVideoProxyCore({
+      provider: "xai",
+      action: "generations",
+      rawBody: "{}",
+      credentials: { accessToken: "tok" },
+      timeoutMs: 15,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(504);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 
   it("url-encodes the request id when polling", async () => {
@@ -265,7 +516,7 @@ describe("handleVideoProxyCore", () => {
     expect(result.error).toContain("[redacted]");
   });
 
-  it("maps client aborts to 408 without retrying", async () => {
+  it("does not misclassify an upstream AbortError as a caller abort", async () => {
     const abortError = new Error("This operation was aborted");
     abortError.name = "AbortError";
     global.fetch.mockRejectedValueOnce(abortError);
@@ -279,7 +530,7 @@ describe("handleVideoProxyCore", () => {
     });
 
     expect(result.success).toBe(false);
-    expect(result.status).toBe(408);
+    expect(result.status).toBe(502);
     expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 });

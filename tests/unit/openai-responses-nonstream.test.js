@@ -489,6 +489,107 @@ describe("actual nonstream response contracts (#36 / #38)", () => {
     expect(stream.locked).toBe(false);
   });
 
+  it.each([
+    ["response.completed", "completed"],
+    ["response.incomplete", "incomplete"],
+    ["response.done", "completed"],
+  ])("finishes a non-closing Responses stream at %s", async (type, status) => {
+    const cancel = vi.fn();
+    const response = {
+      ...responsesResult,
+      status,
+      ...(status === "incomplete" ? { output: [], incomplete_details: { reason: "max_output_tokens" } } : {}),
+    };
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sse([{ type, response }])));
+        // Deliberately keep the transport open after the protocol terminal.
+      },
+      cancel,
+    });
+
+    await expect(convertResponsesStreamToJson(stream)).resolves.toMatchObject(response);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(stream.locked).toBe(false);
+  });
+
+  it.each([["CRLF", "\r\n"], ["CR", "\r"]])(
+    "finishes Responses SSE with %s separators split at every byte",
+    async (_label, eol) => {
+      const cancel = vi.fn();
+      const response = {
+        id: "resp_line_endings", object: "response", model: "fixture-model",
+        status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      };
+      const bytes = new TextEncoder().encode([
+        "event: response.completed",
+        `data: ${JSON.stringify({ type: "response.completed", response })}`,
+        "",
+        "",
+      ].join(eol));
+      const stream = new ReadableStream({
+        start(controller) {
+          for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+        },
+        cancel,
+      });
+
+      await expect(convertResponsesStreamToJson(stream)).resolves.toMatchObject(response);
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(stream.locked).toBe(false);
+    }
+  );
+
+  it.each(["response.failed", "error"])("rejects and cancels a non-closing Responses %s stream", async (type) => {
+    const cancel = vi.fn();
+    const event = type === "error"
+      ? { type, error: { message: "fixture failure" } }
+      : { type, response: { id: "resp_failed", status: "failed", error: { message: "fixture failure" } } };
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sse([event])));
+      },
+      cancel,
+    });
+
+    await expect(convertResponsesStreamToJson(stream)).rejects.toMatchObject({
+      name: "InvalidResponseError", status: 502, code: "invalid_upstream_response",
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(stream.locked).toBe(false);
+  });
+
+  it.each([
+    ["bytes", { maxBytes: 8 }, "exceeded 8 bytes"],
+    ["events", { maxEvents: 1 }, "exceeded 1 events"],
+  ])("cancels Responses SSE that exceeds the collection %s cap", async (_kind, options, message) => {
+    const cancel = vi.fn();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode([
+          'event: response.created\ndata: {"type":"response.created","response":{"id":"r1"}}',
+          'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}',
+          "",
+        ].join("\n\n")));
+      },
+      cancel,
+    });
+
+    await expect(convertResponsesStreamToJson(stream, options)).rejects.toThrow(message);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(stream.locked).toBe(false);
+  });
+
+  it("cancels a stalled Responses SSE collector", async () => {
+    const cancel = vi.fn();
+    const stream = new ReadableStream({ pull: () => new Promise(() => {}), cancel });
+
+    await expect(convertResponsesStreamToJson(stream, { stallTimeoutMs: 10 }))
+      .rejects.toThrow(/stalled/);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(stream.locked).toBe(false);
+  });
+
   it("returns a typed 502 when the standalone Responses handler cannot collect its SSE fallback", async () => {
     const core = vi.spyOn(chatCore, "handleChatCore").mockResolvedValue({
       success: true,

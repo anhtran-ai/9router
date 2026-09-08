@@ -92,3 +92,6 @@ graphify-out/*
 .code-review-graph/
 .PR/
 .next-analyze/*
+
+# Kiro local workspace state
+.kiro/

@@ -48,6 +48,7 @@ describe("GOLDEN buildUrl (default executor providers)", () => {
         stream: safe(() => ex.buildUrl(model, true, 0, cred)),
         nonStream: safe(() => ex.buildUrl(model, false, 0, cred)),
       };
+      expect(JSON.stringify(snap)).not.toContain("THROW:");
       expect(snap).toMatchSnapshot();
     });
   }
@@ -62,11 +63,19 @@ describe("GOLDEN buildHeaders (default executor providers)", () => {
         oauth: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : OAUTH_CRED, true))),
         nonStream: safe(() => sanitize(ex.buildHeaders(PROVIDERS[pid].noAuth ? {} : API_KEY_CRED, false))),
       };
+      expect(JSON.stringify(snap)).not.toContain("THROW:");
       expect(snap).toMatchSnapshot();
     });
   }
 });
 
 function safe(fn) {
-  try { return fn(); } catch (e) { return `THROW: ${e.message}`; }
+  return fn();
 }
+
+describe("GOLDEN harness", () => {
+  it("fails a probe instead of recording a THROW marker", () => {
+    expect(() => safe(() => { throw new Error("fixture probe failure"); }))
+      .toThrow("fixture probe failure");
+  });
+});

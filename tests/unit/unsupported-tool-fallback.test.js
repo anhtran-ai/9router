@@ -96,7 +96,11 @@ describe("unsupported hosted tool classification", () => {
       autoSwitch: false,
     });
 
-    expect(response).toBe(response400);
+    expect(response.status).toBe(response400.status);
+    expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(await response.json()).toEqual({
+      error: { message: "max_tokens must be positive" },
+    });
     expect(handleSingleModel).toHaveBeenCalledTimes(1);
   });
 });
@@ -179,7 +183,8 @@ describe("exhausted combo error selection", () => {
   it("still stops at an ordinary terminal 400 after a retryable failure", async () => {
     const invalid = new Response(JSON.stringify({ error: { message: "max_tokens must be positive" } }), { status: 400 });
     const { response, handleSingleModel } = await runComboOutcomes([rateLimited, invalid, unavailable]);
-    expect(response).toBe(invalid);
+    expect(response.status).toBe(invalid.status);
+    expect(await response.json()).toEqual({ error: { message: "max_tokens must be positive" } });
     expect(handleSingleModel).toHaveBeenCalledTimes(2);
   });
 

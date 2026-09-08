@@ -1,6 +1,7 @@
 // Gemini TTS — generateContent with AUDIO modality returns PCM L16, wrap as WAV
 import { Buffer } from "node:buffer";
 import { PROVIDER_MEDIA, PROVIDER_MODELS } from "../../providers/index.js";
+import { decodeBase64Audio, readTtsJson, throwUpstreamError } from "./_base.js";
 
 const TTS_CFG = PROVIDER_MEDIA["gemini"]?.ttsConfig || {};
 const TTS_BASE = TTS_CFG.baseUrl;
@@ -73,18 +74,17 @@ export default {
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceId } } },
         },
       }),
+      signal: opts.signal,
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err?.error?.message || `Gemini TTS failed: ${res.status}`);
-    }
-    const data = await res.json();
+    if (!res.ok) await throwUpstreamError(res, opts);
+    const data = await readTtsJson(res, opts);
     const b64 = data?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData?.data)?.inlineData?.data;
     if (!b64) {
       const reason = data?.candidates?.[0]?.finishReason || data?.promptFeedback?.blockReason || "unknown";
       throw new Error(`Gemini TTS returned no audio (finishReason: ${reason}, voice: ${voiceId}, model: ${modelId})`);
     }
-    const wav = pcmToWav(Buffer.from(b64, "base64"));
+    const pcm = decodeBase64Audio(b64, "pcm", opts.maxResponseBytes).bytes;
+    const wav = pcmToWav(Buffer.from(pcm));
     return { base64: wav.toString("base64"), format: "wav" };
   },
 };

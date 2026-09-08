@@ -6,7 +6,19 @@ import {
   clearAccountError,
   extractApiKey,
   isValidApiKey,
+  beginAccountMutationAttempt,
+  endAccountMutationAttempt,
+  recordAccountMutationSuccess,
 } from "../services/auth.js";
+import {
+  handleAntigravityQuotaError,
+  clearAntigravityStrikes,
+  beginAntigravityQuotaAttempt,
+  endAntigravityQuotaAttempt,
+  isAntigravityQuotaAttemptSuperseded,
+  canAntigravityQuotaAttemptClearFailure,
+  recordAntigravityQuotaAttemptFailure,
+} from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
@@ -23,6 +35,7 @@ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
+import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
 
 /**
  * Handle chat completion request
@@ -49,7 +62,11 @@ export async function handleChat(request, clientRawRequest = null) {
       headers: Object.fromEntries(request.headers.entries())
     };
   }
-  const modelStr = body.model;
+  // Claude Code marks a 1M-context request as `<model>[1m]`; the marker matches
+  // no combo, alias or provider/model pair, so it must not reach resolution.
+  // The capability travels in the anthropic-beta header, forwarded as-is.
+  const { model: modelStr, contextMarker } = stripModelContextMarker(body.model);
+  if (contextMarker) body.model = modelStr;
 
   // Request summary is emitted as the unified "▶" line in chatCore (has fmt/thinking/account)
 
@@ -104,13 +121,16 @@ export async function handleChat(request, clientRawRequest = null) {
       return handleFusionChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m, isPanel) => {
+        handleSingleModel: (b, m, isPanel, panelSignal) => {
           let cleanRawReq = clientRawRequest;
           if (isPanel && clientRawRequest) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+          const callRequest = panelSignal
+            ? { url: request?.url, headers: request?.headers, signal: panelSignal }
+            : request;
+          return handleSingleModelChat(b, m, cleanRawReq, callRequest, apiKey);
         },
         log,
         comboName: modelStr,
@@ -185,13 +205,16 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         return handleFusionChat({
           body,
           models: comboModels,
-          handleSingleModel: (b, m, isPanel) => {
+          handleSingleModel: (b, m, isPanel, panelSignal) => {
             let cleanRawReq = clientRawRequest;
             if (isPanel && clientRawRequest) {
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+            const callRequest = panelSignal
+              ? { url: request?.url, headers: request?.headers, signal: panelSignal }
+              : request;
+            return handleSingleModelChat(b, m, cleanRawReq, callRequest, apiKey);
           },
           log,
           comboName: modelStr,
@@ -235,13 +258,23 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
   while (true) {
     if (request?.signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    let credentials;
+    try {
+      credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { signal: request?.signal });
+    } catch (error) {
+      if (isAbortError(error, request?.signal)) {
+        return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
+      throw error;
+    }
     if (request?.signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
         const errorMsg = lastError || credentials.lastError || "Unavailable";
+        // Preserve the real provider failure for combo arbitration and clients
+        // that distinguish quota exhaustion from a generic outage.
         const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
         log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
         return unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman);
@@ -259,7 +292,23 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {
-      const pid = await getProjectIdForConnection(credentials.connectionId, refreshedCredentials.accessToken, provider);
+      let pid;
+      try {
+        pid = await getProjectIdForConnection(
+          credentials.connectionId,
+          refreshedCredentials.accessToken,
+          provider,
+          { signal: request?.signal },
+        );
+      } catch (error) {
+        if (isAbortError(error, request?.signal)) {
+          return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+        }
+        throw error;
+      }
+      if (request?.signal?.aborted) {
+        return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
       if (pid) {
         refreshedCredentials.projectId = pid;
         // Persist to DB in background so subsequent requests have it immediately
@@ -269,6 +318,25 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Use shared chatCore
     const chatSettings = await getSettings();
+    const pxpipeTransform = chatSettings.pxpipeEnabled ? await getPxpipeTransform() : null;
+    if (request?.signal?.aborted) {
+      return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+    }
+    // Capture ordering immediately before dispatch. Assigning an attempt before
+    // awaited setup could make a request that dispatches later look older.
+    const quotaAttempt = provider === "antigravity"
+      ? beginAntigravityQuotaAttempt(credentials.connectionId, model)
+      : null;
+    const mutationAttempt = beginAccountMutationAttempt(credentials.connectionId, model);
+    let streamOwnsAttempts = false;
+    let attemptsReleased = false;
+    const releaseAttempts = () => {
+      if (attemptsReleased) return;
+      attemptsReleased = true;
+      endAccountMutationAttempt(mutationAttempt);
+      endAntigravityQuotaAttempt(quotaAttempt);
+    };
+    try {
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
     const result = await handleChatCore({
       body: { ...body, model: `${provider}/${model}` },
@@ -285,6 +353,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       headroomEnabled: !!chatSettings.headroomEnabled,
       headroomUrl: chatSettings.headroomUrl || DEFAULT_HEADROOM_URL,
       headroomCompressUserMessages: !!chatSettings.headroomCompressUserMessages,
+      headroomTimeoutMs: chatSettings.headroomTimeoutMs,
       cavemanEnabled: !!chatSettings.cavemanEnabled,
       cavemanLevel: chatSettings.cavemanLevel || "full",
       ponytailEnabled: !!chatSettings.ponytailEnabled,
@@ -293,7 +362,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       pxpipeMinChars: chatSettings.pxpipeMinChars,
       pxpipeTimeoutMs: chatSettings.pxpipeTimeoutMs,
       // Lazily warms the in-process module on first use; null when not installed (fail-open)
-      pxpipeTransform: chatSettings.pxpipeEnabled ? await getPxpipeTransform() : null,
+      pxpipeTransform,
       onPxpipeEvent: appendPxpipeEvent,
       providerThinking,
       // Detect source format by endpoint + body
@@ -305,19 +374,141 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
           testStatus: "active"
         });
       },
-      onRequestSuccess: async () => {
-        await clearAccountError(credentials.connectionId, credentials, model);
-      }
+      onRequestSuccess: () => {
+        try {
+          // Publish success ordering synchronously, before any fallible DB read.
+          // A failure from an older request must not commit while cleanup waits.
+          recordAccountMutationSuccess(mutationAttempt);
+          // "Consecutive" strikes: a success clears the breaker for this pair.
+          // This must happen before the fallible DB cleanup so a delayed/rejected
+          // write cannot let older quota-error evaluators restore stale strikes.
+          clearAntigravityStrikes(credentials.connectionId, model, quotaAttempt);
+          if (quotaAttempt && !canAntigravityQuotaAttemptClearFailure(quotaAttempt)) return;
+          // A verified provider success owns this cleanup even if the client
+          // disconnects immediately afterward; keep the DB commit observed.
+          const cleanupGuard = quotaAttempt
+            ? () => canAntigravityQuotaAttemptClearFailure(quotaAttempt)
+            : null;
+          return clearAccountError(
+            credentials.connectionId,
+            credentials,
+            model,
+            {
+              mutationAttempt,
+              ...(cleanupGuard ? { reloadCurrent: true, shouldCommit: cleanupGuard } : {}),
+            },
+          );
+        } finally {
+          // The stream terminal owns the attempt lifetime. Releasing after the
+          // guarded mutation starts keeps older live streams visible to newer
+          // success/failure watermarks without waiting on database cleanup.
+          releaseAttempts();
+        }
+      },
+      onRequestFailure: (streamError) => {
+        let failureMutation;
+        try {
+          // Streaming headers have already been returned, so this request cannot
+          // safely retry. Persist a model-scoped cooldown for future requests,
+          // guarded by the same ordering attempt as pre-header failures.
+          failureMutation = markAccountUnavailable(
+            credentials.connectionId,
+            streamError?.status || HTTP_STATUS.BAD_GATEWAY,
+            streamError?.message || "Invalid upstream response stream",
+            provider,
+            model,
+            null,
+            {
+              mutationAttempt,
+              ...(quotaAttempt ? {
+                shouldCommit: () => !isAntigravityQuotaAttemptSuperseded(quotaAttempt),
+                beforeCommit: () => recordAntigravityQuotaAttemptFailure(quotaAttempt),
+              } : {}),
+            },
+          );
+        } catch (error) {
+          releaseAttempts();
+          throw error;
+        }
+        // Keep the failed attempt active until the DB-boundary predicate has
+        // been evaluated. Releasing it earlier would discard a newer success
+        // watermark and let this late streaming failure overwrite that success.
+        return Promise.resolve(failureMutation).finally(releaseAttempts);
+      },
+      onDisconnect: releaseAttempts,
     });
+
+    if (result.success && result.streaming === true) streamOwnsAttempts = true;
+
+    // Non-streaming success cleanup is normally queued by chatCore. Record the
+    // success here as well before releasing the attempt; token-based recording
+    // is idempotent and closes the success-before-error-handler race.
+    if (result.success && result.streaming !== true) {
+      recordAccountMutationSuccess(mutationAttempt);
+      if (quotaAttempt) clearAntigravityStrikes(credentials.connectionId, model, quotaAttempt);
+    }
 
     if (request?.signal?.aborted) {
       result.response?.body?.cancel().catch(() => {});
+      releaseAttempts();
       return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
     }
     if (result.success || result.status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) return result.response;
 
-    // Mark account unavailable (auto-calculates cooldown with exponential backoff, or precise resetsAtMs)
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, result.resetsAtMs);
+    // Antigravity 409/429: refresh live quota to get exact resetAt before locking
+    let quotaResetMs = null;
+    let resetsAtMs = result.resetsAtMs;
+    if (provider === "antigravity" && (result.status === 409 || result.status === 429)) {
+      try {
+        quotaResetMs = await handleAntigravityQuotaError(
+          credentials.connectionId, result.status, model,
+          refreshedCredentials.accessToken, credentials.providerSpecificData,
+          request?.signal, quotaAttempt,
+        );
+      } catch (error) {
+        if (isAbortError(error, request?.signal)) {
+          return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+        }
+        throw error;
+      }
+      if (request?.signal?.aborted) {
+        return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
+      if (quotaResetMs) resetsAtMs = quotaResetMs;
+    }
+
+    // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
+    // Do not persist a modelLock_* for this path.
+    let shouldFallback;
+    if (provider === "antigravity" && quotaResetMs) {
+      shouldFallback = true;
+    } else {
+      try {
+        const markResult = await markAccountUnavailable(
+          credentials.connectionId, result.status, result.error, provider, model, resetsAtMs,
+          {
+            signal: request?.signal,
+            mutationAttempt,
+            ...(quotaAttempt ? {
+              shouldCommit: () => !isAntigravityQuotaAttemptSuperseded(quotaAttempt),
+              // Record ordering at the actual DB boundary for every AG
+              // failure that persists a lock, including non-quota 4xx/5xx.
+              beforeCommit: () => recordAntigravityQuotaAttemptFailure(quotaAttempt),
+            } : {}),
+          },
+        );
+        shouldFallback = markResult.shouldFallback;
+      } catch (error) {
+        if (isAbortError(error, request?.signal)) {
+          return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+        }
+        throw error;
+      }
+    }
+
+    if (request?.signal?.aborted) {
+      return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+    }
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);
@@ -328,5 +519,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     }
 
     return result.response;
+    } finally {
+      if (!streamOwnsAttempts) releaseAttempts();
+    }
   }
 }

@@ -3,6 +3,7 @@ import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { buildErrorBody } from "./error.js";
 import { formatSSE } from "./streamHelpers.js";
 import { SSE_DONE } from "./sseConstants.js";
+import { MAX_STREAM_FRAME_CHARS } from "./reader.js";
 import { validateResponseEnvelope } from "../translator/concerns/responseContract.js";
 
 const encoder = new TextEncoder();
@@ -50,7 +51,7 @@ export function formatStreamFailure(error, clientFormat) {
 export function createStreamContract(format) {
   const expected = DECODED_CHAT_FORMATS.has(format) ? FORMATS.OPENAI : format;
   const decoder = new TextDecoder("utf-8", { fatal: true });
-  let buffer = ""; let dataLines = []; let eventName = "";
+  let buffer = ""; let dataLines = []; let dataChars = 0; let eventName = "";
   let semantic = false; let terminal = false; let stopped = false;
   let claudeStarted = false; let claudeFinish = null;
   const claudeBlocks = new Set();
@@ -258,17 +259,23 @@ export function createStreamContract(format) {
   const dispatch = controller => {
     const text = dataLines.join("\n"); const event = eventName;
     const hasData = dataLines.length > 0;
-    dataLines = []; eventName = "";
+    dataLines = []; dataChars = 0; eventName = "";
     if (hasData) consume(text, event, controller);
   };
   const line = (text, controller) => {
+    if (text.length > MAX_STREAM_FRAME_CHARS) fail("stream event exceeds size limit");
     if (expected === FORMATS.OLLAMA) { if (text.trim()) consume(text.trim(), "", controller); return; }
     if (!text) { dispatch(controller); return; }
     if (text.startsWith(":")) return;
     const colon = text.indexOf(":");
     const field = colon < 0 ? text : text.slice(0, colon);
     const value = colon < 0 ? "" : text.slice(colon + 1).replace(/^ /, "");
-    if (field === "data") dataLines.push(value);
+    if (field === "data") {
+      const nextSize = dataChars + value.length + (dataLines.length ? 1 : 0);
+      if (nextSize > MAX_STREAM_FRAME_CHARS) fail("stream event exceeds size limit");
+      dataChars = nextSize;
+      dataLines.push(value);
+    }
     else if (field === "event") eventName = value;
     // SSE extension/unknown fields are ignored, including fields with no colon.
     // Raw JSON mislabeled as SSE still fails because it never establishes a
@@ -298,6 +305,10 @@ export function createStreamContract(format) {
       try { buffer += decoder.decode(chunk, { stream: true }); }
       catch { fail("invalid stream encoding"); }
       drain(controller);
+      // Check after draining so a large transport chunk containing many small,
+      // complete events is accepted while an unterminated line cannot grow the
+      // retained parser buffer without bound.
+      if (buffer.length > MAX_STREAM_FRAME_CHARS) fail("stream event exceeds size limit");
     },
     flush(controller) {
       if (stopped) return;

@@ -33,6 +33,7 @@ export async function POST(request) {
       alias,
       allowedProviders,
       expiresInMinutes: body.expiresInMinutes,
+      providerBaseUrls: body.providerBaseUrls,
     });
     // Behind a reverse proxy, request.url can contain the container bind address
     // (for example 0.0.0.0:20128). POST requests from the dashboard carry the

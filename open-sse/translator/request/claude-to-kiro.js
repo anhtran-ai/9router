@@ -31,6 +31,7 @@ import {
 } from "../../config/kiroConstants.js";
 import { DEFAULT_IMAGE_MIME } from "../schema/index.js";
 import { ROLE, CLAUDE_BLOCK } from "../schema/index.js";
+import { ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
 import {
   canonicalizeKiroConversation,
   normalizeKiroToolSpecs,
@@ -86,6 +87,9 @@ function convertClaudeMessagesToKiro(messages, model) {
         pendingUserContent.push(msg.content);
       } else if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
+          if (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) {
+            throw new ToolCompatibilityError("Kiro transport cannot preserve Claude thinking history");
+          }
           if (block.type === CLAUDE_BLOCK.TEXT) {
             pendingUserContent.push(block.text);
           } else if (block.type === CLAUDE_BLOCK.IMAGE && block.source?.type === "base64") {
@@ -120,6 +124,9 @@ function convertClaudeMessagesToKiro(messages, model) {
         textContent = msg.content;
       } else if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
+          if (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) {
+            throw new ToolCompatibilityError("Kiro transport cannot preserve Claude thinking history");
+          }
           if (block.type === CLAUDE_BLOCK.TEXT) {
             textContent += block.text;
           } else if (block.type === CLAUDE_BLOCK.TOOL_USE) {
@@ -327,7 +334,6 @@ export function claudeToKiroRequest(model, body, stream, credentials) {
   };
 
   if (profileArn) payload.profileArn = profileArn;
-  if (systemPrompt) payload.systemPrompt = systemPrompt;
   if (additionalModelRequestFields) {
     payload.additionalModelRequestFields = additionalModelRequestFields;
   }

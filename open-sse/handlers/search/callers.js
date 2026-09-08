@@ -64,31 +64,44 @@ export function getProviderSetting(params, key) {
 }
 
 /**
- * Resolve base URL with optional override from providerOptions.baseUrl.
+ * Resolve base URL with optional override.
  *
- * The override is client-controlled and therefore SSRF-hardened: only public
- * http(s) URLs are accepted (internal/private/loopback/metadata addresses are
- * rejected via assertPublicUrl). The provider's own configured baseUrl is
- * trusted as-is (admin-controlled).
+ * A providerOptions override is client-controlled. It may be used only by an
+ * unauthenticated provider (for example a public SearXNG instance); otherwise
+ * it could redirect the stored provider token to an attacker. The persisted
+ * providerSpecificData override is admin-controlled and remains supported.
  *
  * @param {SearchProviderConfig} config
  * @param {SearchRequestParams} params
  * @returns {string}
  */
 export function resolveBaseUrl(config, params) {
-  const override = getProviderSetting(params, "baseUrl");
-  if (override) {
+  const requestedBaseUrl = params.providerOptions?.baseUrl;
+  const clientOverride = typeof requestedBaseUrl === "string" && requestedBaseUrl.trim()
+    ? requestedBaseUrl.trim()
+    : undefined;
+  if (clientOverride && params.token) {
+    throw new Error("provider_options.baseUrl is not allowed for authenticated providers");
+  }
+
+  const persistedBaseUrl = params.providerSpecificData?.baseUrl;
+  const persistedOverride = typeof persistedBaseUrl === "string" && persistedBaseUrl.trim()
+    ? persistedBaseUrl.trim()
+    : undefined;
+  const override = clientOverride || persistedOverride;
+
+  if (clientOverride) {
     // SSRF guard: client-supplied base URLs must be public http(s) only.
     let parsed;
     try {
-      parsed = new URL(override);
+      parsed = new URL(clientOverride);
     } catch {
-      throw new Error(`Invalid baseUrl: ${override}`);
+      throw new Error(`Invalid baseUrl: ${clientOverride}`);
     }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       throw new Error(`Invalid baseUrl protocol: ${parsed.protocol}`);
     }
-    assertPublicUrl(override);
+    assertPublicUrl(clientOverride);
   }
   return (override || config.baseUrl).replace(/\/+$/, "");
 }
@@ -347,6 +360,81 @@ function buildSearxngRequest(config, params) {
   };
 }
 
+function buildXquikRequest(config, params) {
+  const apiKey = params.token;
+  if (!apiKey) throw new Error("Xquik requires an API key");
+
+  const queryType = getProviderSetting(params, "queryType");
+  if (queryType && !["Latest", "Top"].includes(queryType)) {
+    throw new Error("Xquik queryType must be Latest or Top");
+  }
+
+  const qp = new URLSearchParams({
+    q: params.query,
+    limit: String(params.maxResults),
+  });
+  const cursor = getProviderSetting(params, "cursor");
+  if (cursor) qp.set("cursor", cursor);
+  if (queryType) qp.set("queryType", queryType);
+  if (params.language) qp.set("language", params.language);
+
+  return {
+    url: `${resolveBaseUrl(config, params)}?${qp}`,
+    init: {
+      method: "GET",
+      headers: { Accept: "application/json", "x-api-key": apiKey },
+    },
+  };
+}
+
+// ── Ollama Cloud web_search ──────────────────────────────────────────────
+// POST https://ollama.com/api/web_search { query, max_results }
+// Response: { results: [{ title, url, content, published_at? }] }
+function buildOllamaSearchRequest(config, params) {
+  const body = { query: params.query, max_results: params.maxResults };
+  if (params.country) body.country = params.country;
+  if (params.language) body.language = params.language;
+  return {
+    url: resolveBaseUrl(config, params),
+    init: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(params.token ? { Authorization: `Bearer ${params.token}` } : {}),
+      },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+// ── GLM Coding plan MCP web_search_prime ──────────────────────────────────
+// POST https://api.z.ai/api/mcp/web_search_prime/mcp
+// JSON-RPC envelope: { jsonrpc, id, method: "tools/call",
+//   params: { name: "web_search_prime", arguments: { search_query, count } } }
+// Response: { result: { content: [{ type: "text", text: "<json>" }] } }
+function buildGlmSearchRequest(config, params) {
+  const body = {
+    jsonrpc: "2.0",
+    id: `9r-${Date.now()}`,
+    method: "tools/call",
+    params: {
+      name: "web_search_prime",
+      arguments: { search_query: params.query, count: params.maxResults },
+    },
+  };
+  return {
+    url: resolveBaseUrl(config, params),
+    init: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(params.token ? { Authorization: `Bearer ${params.token}` } : {}),
+      },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
 // ── Dispatcher ──────────────────────────────────────────────────────────
 
 const BUILDERS = {
@@ -360,6 +448,9 @@ const BUILDERS = {
   "searchapi": buildSearchApiRequest,
   "youcom": buildYouComRequest,
   "searxng": buildSearxngRequest,
+  "xquik": buildXquikRequest,
+  "ollama-search": buildOllamaSearchRequest,
+  "glm": buildGlmSearchRequest,
 };
 
 /**

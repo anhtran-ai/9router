@@ -183,17 +183,28 @@ export function openaiToClaudeResponse(chunk, state) {
   if (delta?.tool_calls) {
     for (const tc of delta.tool_calls) {
       const idx = tc.index ?? 0;
+      let openedToolBlock = false;
+
+      // Compatible providers may split id and name across different chunks.
+      // Keep metadata pending until both are known; Anthropic rejects a
+      // content_block_start whose tool name is blank.
+      state.pendingToolCalls ||= new Map();
+      const pendingTool = state.pendingToolCalls.get(idx) || { id: "", name: "" };
+      if (tc.id) pendingTool.id = tc.id;
+      if (tc.function?.name) pendingTool.name = tc.function.name;
+      state.pendingToolCalls.set(idx, pendingTool);
 
       // GLM/fireworks repeats id+null-name on every arg chunk; open block once per idx
-      if (tc.id && !state.toolCalls.has(idx)) {
+      if (pendingTool.id && pendingTool.name && !state.toolCalls.has(idx)) {
         stopThinkingBlock(state, results);
         stopTextBlock(state, results);
 
         const toolBlockIndex = state.nextBlockIndex++;
-        state.toolCalls.set(idx, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
+        state.toolCalls.set(idx, { id: pendingTool.id, name: pendingTool.name, blockIndex: toolBlockIndex });
+        openedToolBlock = true;
 
         // Strip prefix from tool name for response
-        let toolName = tc.function?.name || "";
+        let toolName = pendingTool.name;
         if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
           toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
         }
@@ -203,7 +214,7 @@ export function openaiToClaudeResponse(chunk, state) {
           index: toolBlockIndex,
           content_block: {
             type: CLAUDE_BLOCK.TOOL_USE,
-            id: tc.id,
+            id: pendingTool.id,
             name: toolName,
             input: {}
           }
@@ -212,10 +223,23 @@ export function openaiToClaudeResponse(chunk, state) {
 
       if (tc.function?.arguments) {
         const toolInfo = state.toolCalls.get(idx);
-        if (toolInfo) {
-          // Buffer args instead of streaming — sanitize at finish to fix bad params
-          if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
-          state.toolArgBuffers.set(idx, (state.toolArgBuffers.get(idx) || "") + tc.function.arguments);
+        if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
+        const buffered = state.toolArgBuffers.get(idx) || "";
+
+        // A complete tool call delivered in one chunk can be sanitized and
+        // emitted immediately. Keep buffering split arguments, including
+        // fragments received before both id and name are available.
+        if (toolInfo && openedToolBlock && !buffered && isCompleteJson(tc.function.arguments)) {
+          results.push({
+            type: "content_block_delta",
+            index: toolInfo.blockIndex,
+            delta: {
+              type: "input_json_delta",
+              partial_json: sanitizeToolArgs(toolInfo.name, tc.function.arguments)
+            }
+          });
+        } else {
+          state.toolArgBuffers.set(idx, buffered + tc.function.arguments);
         }
       }
     }
@@ -260,6 +284,15 @@ export function openaiToClaudeResponse(chunk, state) {
 }
 
 const convertFinishReason = (reason) => fromOpenAIFinish(reason, "claude");
+
+function isCompleteJson(value) {
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // Register
 register(FORMATS.OPENAI, FORMATS.CLAUDE, null, openaiToClaudeResponse);

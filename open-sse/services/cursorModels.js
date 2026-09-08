@@ -11,6 +11,10 @@ import http2 from "http2";
 import { PROVIDER_OAUTH } from "../providers/index.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
 import { decodeMessage } from "../utils/cursorProtobuf.js";
+import {
+  MODEL_CATALOG_BODY_LIMIT_BYTES,
+  ModelCatalogBodyTooLargeError,
+} from "./modelCatalogResponse.js";
 
 const FETCH_TIMEOUT_MS = 10_000;
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -24,6 +28,47 @@ const RESPONSE_MODELS_FIELD = 1;
 
 /** @type {Map<string, { expiresAt: number, models: { id: string, name: string }[] }>} */
 const catalogCache = new Map();
+/** @type {Map<string, { controller: AbortController, promise: Promise<object | null>, waiters: number, settled: boolean }>} */
+const catalogInflight = new Map();
+let catalogCacheEpoch = 0;
+
+function callerAbortReason(signal) {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new DOMException("Cursor catalog request aborted", "AbortError");
+}
+
+function awaitWithCallerSignal(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(callerAbortReason(signal));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(reject, callerAbortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+async function waitForCatalog(entry, signal) {
+  entry.waiters += 1;
+  try {
+    return await awaitWithCallerSignal(entry.promise, signal);
+  } finally {
+    entry.waiters -= 1;
+    if (entry.waiters === 0 && !entry.settled && !entry.controller.signal.aborted) {
+      entry.controller.abort(new DOMException("Cursor catalog has no active callers", "AbortError"));
+    }
+  }
+}
 
 function getCursorModelsUrl() {
   const config = PROVIDER_OAUTH.cursor;
@@ -83,52 +128,96 @@ function http2PostProto(url, headers, body, signal, timeoutMs) {
     const urlObj = new URL(url);
     const client = http2.connect(`https://${urlObj.host}`);
     const chunks = [];
+    let totalBytes = 0;
     let responseHeaders = {};
     let settled = false;
+    let req = null;
+    let onAbort = null;
+    let timeoutId = null;
 
-    const finish = (fn) => (...args) => {
+    const finish = (fn, value, destroyTransport = false) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutId);
-      try { client.close(); } catch {}
-      fn(...args);
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      if (destroyTransport) {
+        try { req?.close?.(http2.constants.NGHTTP2_CANCEL); } catch {}
+        try { req?.destroy?.(); } catch {}
+        try { client.destroy(); } catch {}
+      } else {
+        try { client.close(); } catch {}
+      }
+      fn(value);
     };
 
-    const timeoutId = setTimeout(finish(() => {
-      reject(new Error("Cursor GetUsableModels timed out"));
-    }), timeoutMs);
+    timeoutId = setTimeout(() => {
+      finish(
+        reject,
+        new DOMException("Cursor GetUsableModels timed out", "TimeoutError"),
+        true,
+      );
+    }, timeoutMs);
 
-    client.on("error", finish(reject));
+    client.on("error", (error) => finish(reject, error, true));
 
-    const req = client.request({
-      ":method": "POST",
-      ":path": urlObj.pathname,
-      ":authority": urlObj.host,
-      ":scheme": "https",
-      ...headers,
-    });
+    try {
+      req = client.request({
+        ":method": "POST",
+        ":path": urlObj.pathname,
+        ":authority": urlObj.host,
+        ":scheme": "https",
+        ...headers,
+      });
+    } catch (error) {
+      finish(reject, error, true);
+      return;
+    }
 
     req.on("response", (hdrs) => { responseHeaders = hdrs; });
-    req.on("data", (chunk) => { chunks.push(chunk); });
-    req.on("end", finish(() => {
-      resolve({
+    req.on("data", (chunk) => {
+      if (settled) return;
+      totalBytes += chunk.byteLength;
+      if (totalBytes > MODEL_CATALOG_BODY_LIMIT_BYTES) {
+        finish(
+          reject,
+          new ModelCatalogBodyTooLargeError(MODEL_CATALOG_BODY_LIMIT_BYTES, totalBytes),
+          true,
+        );
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      finish(resolve, {
         status: Number(responseHeaders[":status"] || 0),
         body: Buffer.concat(chunks),
       });
-    }));
-    req.on("error", finish(reject));
+    });
+    req.on("error", (error) => finish(reject, error, true));
 
     if (signal) {
-      const onAbort = finish(() => reject(new Error("Request aborted")));
+      onAbort = () => finish(
+        reject,
+        signal.reason ?? new DOMException("Request aborted", "AbortError"),
+        true,
+      );
       if (signal.aborted) onAbort();
       else signal.addEventListener("abort", onAbort, { once: true });
     }
 
-    req.end(body && body.length ? Buffer.from(body) : undefined);
+    if (!settled) {
+      try {
+        req.end(body && body.length ? Buffer.from(body) : undefined);
+      } catch (error) {
+        finish(reject, error, true);
+      }
+    }
   });
 }
 
-async function fetchCursorCatalog(credentials, signal) {
+export const __test__ = { http2PostProto };
+
+async function fetchCursorCatalog(credentials, signal, requestFn = http2PostProto) {
   const accessToken = credentials?.accessToken;
   const machineId = credentials?.providerSpecificData?.machineId;
   const url = getCursorModelsUrl();
@@ -144,7 +233,7 @@ async function fetchCursorCatalog(credentials, signal) {
   delete headers["connect-accept-encoding"];
   delete headers["connect-protocol-version"];
 
-  const response = await http2PostProto(url, headers, new Uint8Array(), signal, FETCH_TIMEOUT_MS);
+  const response = await requestFn(url, headers, new Uint8Array(), signal, FETCH_TIMEOUT_MS);
   if (response.status !== 200) {
     const error = new Error(`Cursor GetUsableModels returned ${response.status}`);
     error.status = response.status;
@@ -165,23 +254,74 @@ export async function resolveCursorModels(credentials, options = {}) {
   }
 
   const key = cacheKey(credentials);
-  const now = Date.now();
   if (!options.forceRefresh) {
     const cached = catalogCache.get(key);
-    if (cached?.expiresAt > now) return { models: cached.models };
+    if (cached?.expiresAt > Date.now()) return { models: cached.models };
   }
 
+  const existing = catalogInflight.get(key);
+  if (existing && !existing.controller.signal.aborted && !options.forceRefresh) {
+    try {
+      return await waitForCatalog(existing, options.signal);
+    } catch (error) {
+      if (!options.signal?.aborted) {
+        options.log?.warn?.("CURSOR_MODELS", "Live model fetch failed");
+      }
+      return null;
+    }
+  }
+
+  const controller = new AbortController();
+  const requestEpoch = catalogCacheEpoch;
+  const entry = {
+    controller,
+    promise: null,
+    waiters: 0,
+    settled: false,
+  };
+  entry.promise = Promise.resolve().then(async () => {
+    try {
+      const models = await fetchCursorCatalog(credentials, controller.signal, options.requestFn);
+      if (!models?.length) return null;
+      const result = { models };
+      if (
+        requestEpoch === catalogCacheEpoch
+        && catalogInflight.get(key) === entry
+        && !controller.signal.aborted
+      ) {
+        catalogCache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, models });
+      }
+      return result;
+    } catch (error) {
+      options.log?.warn?.("CURSOR_MODELS", "Live model fetch failed");
+      return null;
+    }
+  });
+  catalogInflight.set(key, entry);
+  entry.promise.then(
+    () => {
+      entry.settled = true;
+      if (catalogInflight.get(key) === entry) catalogInflight.delete(key);
+    },
+    () => {
+      entry.settled = true;
+      if (catalogInflight.get(key) === entry) catalogInflight.delete(key);
+    },
+  );
+
   try {
-    const models = await fetchCursorCatalog(credentials, options.signal);
-    if (!models?.length) return null;
-    catalogCache.set(key, { expiresAt: now + CACHE_TTL_MS, models });
-    return { models };
+    return await waitForCatalog(entry, options.signal);
   } catch (error) {
-    options.log?.warn?.("CURSOR_MODELS", `Live model fetch failed: ${error?.message || error}`);
+    if (!options.signal?.aborted) {
+      options.log?.warn?.("CURSOR_MODELS", "Live model fetch failed");
+    }
     return null;
   }
 }
 
 export function clearCursorModelCache() {
+  catalogCacheEpoch += 1;
+  if (!Number.isSafeInteger(catalogCacheEpoch)) catalogCacheEpoch = 1;
   catalogCache.clear();
+  catalogInflight.clear();
 }

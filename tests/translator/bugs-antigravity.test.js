@@ -6,9 +6,63 @@ import { FORMATS } from "../../open-sse/translator/formats.js";
 import { AntigravityExecutor } from "../../open-sse/executors/antigravity.js";
 import { openaiToAntigravityRequest } from "../../open-sse/translator/request/openai-to-gemini.js";
 import { ANTIGRAVITY_DEFAULT_SYSTEM } from "../../open-sse/config/appConstants.js";
+import { toNumericSessionId } from "../../open-sse/utils/sessionManager.js";
+import {
+  getGeminiThoughtSignature,
+  getGeminiThoughtSignatureSync,
+  storeGeminiThoughtSignature,
+} from "../../open-sse/services/thoughtSignatureStore.js";
 
 const AG2O = (req) =>
   translateRequest(FORMATS.ANTIGRAVITY, FORMATS.OPENAI, "m", { request: req }, true, null, null);
+
+function recordThoughtSignature(callId, sessionId, signature) {
+  const state = initState(FORMATS.OPENAI);
+  state.sessionId = sessionId;
+  const events = translateResponse(FORMATS.ANTIGRAVITY, FORMATS.OPENAI, {
+    response: {
+      responseId: `response-${sessionId}`,
+      modelVersion: "gemini-3.8-flash-low",
+      candidates: [{
+        content: {
+          role: "model",
+          parts: [
+            { thoughtSignature: signature },
+            { functionCall: { id: callId, name: "lookup", args: { query: sessionId } } },
+          ],
+        },
+        finishReason: "STOP",
+        index: 0,
+      }],
+    },
+  }, state);
+
+  expect(events.some((event) => event.choices?.[0]?.delta?.tool_calls?.[0]?.id === callId)).toBe(true);
+}
+
+function toolHistory(callId) {
+  return {
+    messages: [
+      { role: "user", content: "Use the lookup tool" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: callId,
+          type: "function",
+          function: { name: "lookup", arguments: "{\"query\":\"value\"}" },
+        }],
+      },
+      { role: "tool", tool_call_id: callId, content: "result" },
+    ],
+  };
+}
+
+function findFunctionCall(envelope, callId) {
+  return envelope.request.contents
+    .flatMap((content) => content.parts || [])
+    .find((part) => part.functionCall?.id === callId);
+}
 
 describe("Antigravity → OpenAI", () => {
   // antigravity-to-openai.js — content with BOTH functionResponse and functionCall/text
@@ -28,7 +82,7 @@ describe("Antigravity → OpenAI", () => {
   });
 
   // antigravity-to-openai.js:167 — functionCall without id gets a random Date.now() id
-  // KNOWN BUG: unstable id breaks matching with its functionResponse
+  // Regression guard: generated ids must remain stable through functionResponse matching.
   it("functionCall without id keeps a stable matchable id", () => {
     const out = AG2O({
       contents: [
@@ -78,6 +132,100 @@ describe("Antigravity → Claude", () => {
     );
     expect(jsonDelta).toMatchObject({ index: expect.any(Number) });
     expect(JSON.parse(jsonDelta.delta.partial_json)).toEqual({ command: "git status" });
+  });
+});
+
+describe("registered OpenAI → Gemini session forwarding", () => {
+  it("never falls back to another session or the legacy global namespace", async () => {
+    const callId = "call-session-isolation";
+    storeGeminiThoughtSignature(callId, "signature-session-a", "session-a");
+
+    expect(getGeminiThoughtSignatureSync(callId, "session-a")).toBe("signature-session-a");
+    expect(getGeminiThoughtSignatureSync(callId, "session-b")).toBeNull();
+    expect(getGeminiThoughtSignatureSync(callId)).toBeNull();
+    await expect(getGeminiThoughtSignature(callId, "session-b")).resolves.toBeNull();
+
+    const globalCallId = "call-legacy-unscoped";
+    storeGeminiThoughtSignature(globalCallId, "signature-global");
+    expect(getGeminiThoughtSignatureSync(globalCallId)).toBe("signature-global");
+    expect(getGeminiThoughtSignatureSync(globalCallId, "session-a")).toBeNull();
+    await expect(getGeminiThoughtSignature(globalCallId, "session-a")).resolves.toBeNull();
+  });
+
+  it("uses disjoint, injective keys for scoped and legacy signatures", () => {
+    const forgedLegacyId = "scope-collision:call";
+    storeGeminiThoughtSignature(forgedLegacyId, "signature-legacy-collision");
+    expect(getGeminiThoughtSignatureSync("call", "scope-collision")).toBeNull();
+
+    storeGeminiThoughtSignature("call", "signature-scoped-collision", "scope-collision");
+    expect(getGeminiThoughtSignatureSync(forgedLegacyId)).toBe("signature-legacy-collision");
+    expect(getGeminiThoughtSignatureSync("call", "scope-collision")).toBe("signature-scoped-collision");
+
+    // Both pairs used to flatten to the same `session:call` string.
+    storeGeminiThoughtSignature("b:c", "signature-first-pair", "scope-a");
+    storeGeminiThoughtSignature("c", "signature-second-pair", "scope-a:b");
+    expect(getGeminiThoughtSignatureSync("b:c", "scope-a")).toBe("signature-first-pair");
+    expect(getGeminiThoughtSignatureSync("c", "scope-a:b")).toBe("signature-second-pair");
+  });
+
+  it("forwards the captured client session through Gemini CLI and replays its signature", () => {
+    const callId = "call-gemini-cli-session";
+    const wantedSession = "client-session-gemini-cli-a";
+    const otherSession = "client-session-gemini-cli-b";
+    recordThoughtSignature(callId, wantedSession, "signature-gemini-cli-a");
+    recordThoughtSignature(callId, otherSession, "signature-gemini-cli-b");
+
+    const credentials = {
+      connectionId: "gemini-cli-connection",
+      projectId: "gemini-cli-project",
+      rawHeaders: { "x-session-id": wantedSession },
+    };
+    const out = translateRequest(
+      FORMATS.OPENAI,
+      FORMATS.GEMINI_CLI,
+      "gemini-3.8-flash-low",
+      toolHistory(callId),
+      true,
+      credentials,
+      "gemini-cli",
+      null,
+      [],
+      credentials.connectionId,
+    );
+
+    expect(credentials._clientSessionId).toBe(wantedSession);
+    expect(out.request.sessionId).toBe(toNumericSessionId(wantedSession));
+    expect(findFunctionCall(out, callId)?.thoughtSignature).toBe("signature-gemini-cli-a");
+  });
+
+  it("forwards the captured client session through non-Claude Antigravity and replays its signature", () => {
+    const callId = "call-antigravity-session";
+    const wantedSession = "client-session-antigravity-a";
+    const otherSession = "client-session-antigravity-b";
+    recordThoughtSignature(callId, wantedSession, "signature-antigravity-a");
+    recordThoughtSignature(callId, otherSession, "signature-antigravity-b");
+
+    const credentials = {
+      connectionId: "antigravity-connection",
+      projectId: "antigravity-project",
+    };
+    const out = translateRequest(
+      FORMATS.OPENAI,
+      FORMATS.ANTIGRAVITY,
+      "gemini-3.8-flash-low",
+      { ...toolHistory(callId), prompt_cache_key: wantedSession },
+      true,
+      credentials,
+      "antigravity",
+      null,
+      [],
+      credentials.connectionId,
+    );
+
+    expect(out.userAgent).toBe("antigravity");
+    expect(credentials._clientSessionId).toBe(wantedSession);
+    expect(out.request.sessionId).toBe(toNumericSessionId(wantedSession));
+    expect(findFunctionCall(out, callId)?.thoughtSignature).toBe("signature-antigravity-a");
   });
 });
 

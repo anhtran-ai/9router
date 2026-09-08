@@ -17,6 +17,7 @@ const require = createRequire(import.meta.url);
 const {
   assertRequiredApiArtifacts,
   copyStandaloneBuild,
+  ensureSqlJsWasmInBundle,
   mergeServerArtifacts,
 } = require("../../cli/scripts/build-cli.js");
 
@@ -136,6 +137,33 @@ describe("CLI build server artifacts", () => {
         cliAppDir,
         ".next-cli-build/server/app/api/v1/messages/route.js",
       )),
+    );
+  });
+
+  it("repairs a partially traced sql.js package by adding its required WASM asset", () => {
+    const root = createTempDir();
+    const appDir = path.join(root, "9router");
+    const workspaceRoot = path.join(root, "workspace");
+    const cliAppDir = path.join(root, "cli-app");
+
+    writeFixture(cliAppDir, "node_modules/sql.js/dist/sql-wasm.js", "loader");
+    writeFixture(appDir, "node_modules/sql.js/dist/sql-wasm.wasm", "wasm asset");
+
+    const packagedAsset = ensureSqlJsWasmInBundle(appDir, workspaceRoot, cliAppDir);
+
+    assert.equal(fs.readFileSync(packagedAsset, "utf8"), "wasm asset");
+  });
+
+  it("rejects a CLI package when no SQL.js WASM source is available", () => {
+    const root = createTempDir();
+
+    assert.throws(
+      () => ensureSqlJsWasmInBundle(
+        path.join(root, "9router"),
+        path.join(root, "workspace"),
+        path.join(root, "cli-app"),
+      ),
+      /Required CLI SQL\.js runtime asset is missing/,
     );
   });
 });

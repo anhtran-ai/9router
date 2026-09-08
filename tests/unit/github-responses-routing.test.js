@@ -85,4 +85,71 @@ describe("GithubExecutor.execute cached-route guard (#1062)", () => {
     })).rejects.toBeInstanceOf(ToolCompatibilityError);
     expect(mocked.fetch).not.toHaveBeenCalled();
   });
+
+  it("consumes a 400 diagnostic once and preserves it when no endpoint switch applies", async () => {
+    const exec = new GithubExecutor();
+    mocked.fetch.mockResolvedValueOnce(new Response(JSON.stringify({ error: "ordinary bad request" }), {
+      status: 400,
+      headers: {
+        "content-type": "application/json",
+        "content-encoding": "gzip",
+        "x-upstream": "yes",
+      },
+    }));
+
+    const result = await exec.execute({
+      model: "gpt-4.1",
+      body: { messages: [{ role: "user", content: "fixture" }] },
+      stream: false,
+      credentials: { copilotToken: "fixture" },
+    });
+
+    expect(result.response.status).toBe(400);
+    expect(result.response.headers.get("content-encoding")).toBeNull();
+    expect(result.response.headers.get("x-upstream")).toBe("yes");
+    expect(await result.response.json()).toEqual({ error: "ordinary bad request" });
+    expect(mocked.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("switches to /responses from a bounded chat diagnostic without cloning it", async () => {
+    const exec = new GithubExecutor();
+    const switchResult = { via: "responses" };
+    vi.spyOn(exec, "executeWithResponsesEndpoint").mockResolvedValueOnce(switchResult);
+    mocked.fetch.mockResolvedValueOnce(new Response(
+      "The requested model is not supported by the chat endpoint",
+      { status: 400 },
+    ));
+
+    const result = await exec.execute({
+      model: "gpt-5.5-codex",
+      body: { messages: [{ role: "user", content: "fixture" }] },
+      stream: false,
+      credentials: { copilotToken: "fixture" },
+    });
+
+    expect(result).toBe(switchResult);
+    expect(exec.knownCodexModels.has("gpt-5.5-codex")).toBe(true);
+    expect(exec.executeWithResponsesEndpoint).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a stalled endpoint diagnostic when the caller disconnects", async () => {
+    const exec = new GithubExecutor();
+    const client = new AbortController();
+    const cancel = vi.fn();
+    mocked.fetch.mockResolvedValueOnce(new Response(new ReadableStream({ cancel }), { status: 400 }));
+
+    const pending = exec.execute({
+      model: "gpt-4.1",
+      body: { messages: [{ role: "user", content: "fixture" }] },
+      stream: false,
+      credentials: { copilotToken: "fixture" },
+      signal: client.signal,
+    });
+    await vi.waitFor(() => expect(mocked.fetch).toHaveBeenCalledTimes(1));
+    client.abort(new DOMException("client left", "AbortError"));
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await Promise.resolve();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
 });

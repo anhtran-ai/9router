@@ -1,4 +1,5 @@
 import { BaseExecutor } from "./base.js";
+import { cancelReaderBestEffort } from "../utils/reader.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { PROVIDERS } from "../config/providers.js";
 
@@ -47,7 +48,7 @@ export default class TraeExecutor extends BaseExecutor {
   }
 
   base() {
-    return (this.config.baseUrl || "https://core-normal.trae.ai/api/remote/v1").replace(/\/$/, "");
+    return (this.config?.baseUrl || "https://core-normal.trae.ai/api/remote/v1").replace(/\/$/, "");
   }
 
   buildHeaders(credentials, stream = true) {
@@ -132,41 +133,79 @@ export default class TraeExecutor extends BaseExecutor {
   }
 
   // GET /events SSE → invoke onEvent(eventType, dataObj) per frame.
-  // Resolves when `done`/`error` arrives, the stream ends, or timeout fires.
+  // Resolves only when an explicit `done`/`error` frame arrives.
   async streamEvents(headers, sessionId, replyTo, onEvent, signal) {
     const url = `${this.base()}/chat_sessions/${sessionId}/events?reply_to_message_id=${encodeURIComponent(replyTo)}`;
     const ctrl = new AbortController();
-    if (signal?.aborted) ctrl.abort();
+    if (signal?.aborted) ctrl.abort(signal.reason);
     const timer = setTimeout(() => ctrl.abort(new Error("trae stream timeout")), STREAM_TIMEOUT_MS);
-    const onAbort = () => ctrl.abort();
-    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    const onAbort = () => ctrl.abort(signal?.reason);
+    if (signal && !signal.aborted) signal.addEventListener("abort", onAbort, { once: true });
+    let reader = null;
     try {
       const res = await proxyAwareFetch(url, { method: "GET", headers, signal: ctrl.signal }, null);
       if (!res.ok || !res.body) throw new Error(`[${res.status}] events stream failed`);
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
+      reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
       let buf = "";
       let ev = null;
+      let dataLines = [];
+      let terminalSeen = false;
+
+      const dispatch = () => {
+        if (dataLines.length === 0) {
+          ev = null;
+          return false;
+        }
+        const payload = dataLines.join("\n");
+        dataLines = [];
+        let data;
+        try { data = JSON.parse(payload); } catch {
+          throw new Error("Trae event stream contained malformed JSON");
+        }
+        const terminal = onEvent(ev, data) === true;
+        ev = null;
+        if (terminal) terminalSeen = true;
+        return terminal;
+      };
+
+      const processLine = (line) => {
+        const normalized = line.replace(/\r$/, "");
+        if (normalized === "") return dispatch();
+        if (normalized.startsWith(":")) return false;
+        if (normalized.startsWith("event:")) ev = normalized.slice(6).trim();
+        else if (normalized.startsWith("data:")) dataLines.push(normalized.slice(5).trimStart());
+        return false;
+      };
+
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
+        if (done) {
+          buf += decoder.decode();
+          // Trae frames are expected to be blank-line delimited. Accepting an
+          // unterminated tail makes a truncated HTTP 200 look successful.
+          if (buf || dataLines.length > 0) {
+            throw new Error("Trae event stream ended with an incomplete frame");
+          }
+          if (!terminalSeen) throw new Error("Trae event stream ended without a terminal event");
+          return;
+        }
+        try { buf += decoder.decode(value, { stream: true }); } catch {
+          throw new Error("Trae event stream contained invalid UTF-8");
+        }
         let nl;
         while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).replace(/\r$/, "");
+          const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
-          if (line.startsWith("event:")) ev = line.slice(6).trim();
-          else if (line.startsWith("data:")) {
-            const payload = line.slice(5).trim();
-            let data;
-            try { data = JSON.parse(payload); } catch { data = { _raw: payload }; }
-            if (onEvent(ev, data)) {
-              await reader.cancel().catch(() => {});
-              return;
-            }
-          } else if (line === "") ev = null;
+          if (processLine(line)) {
+            cancelReaderBestEffort(reader, "Trae terminal event");
+            return;
+          }
         }
       }
+    } catch (error) {
+      cancelReaderBestEffort(reader, error);
+      throw error;
     } finally {
       clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
@@ -212,17 +251,25 @@ export default class TraeExecutor extends BaseExecutor {
 
     if (stream !== false) {
       const enc = new TextEncoder();
+      const streamAbort = new AbortController();
+      const abortStream = () => streamAbort.abort(signal?.reason);
+      if (signal?.aborted) abortStream();
+      else signal?.addEventListener?.("abort", abortStream, { once: true });
       const sse = new ReadableStream({
-        start: async (controller) => {
+        start: (controller) => {
           const emit = (obj) => controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
-          emit({
-            id: responseId,
-            object: "chat.completion.chunk",
-            created,
-            model,
-            choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-          });
-          try {
+          const run = async () => {
+            if (streamAbort.signal.aborted) {
+              controller.close();
+              return;
+            }
+            emit({
+              id: responseId,
+              object: "chat.completion.chunk",
+              created,
+              model,
+              choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+            });
             await this.streamEvents(headers, session.sessionId, session.messageId, (ev, data) => {
               if (ev === "error") { errorEvent = data; return true; }
               if (ev === "token_usage") usage = data;
@@ -239,7 +286,8 @@ export default class TraeExecutor extends BaseExecutor {
                 }
               }
               return ev === "done";
-            }, signal);
+            }, streamAbort.signal);
+            if (streamAbort.signal.aborted) return;
             if (errorEvent) {
               emit({
                 id: responseId,
@@ -274,9 +322,18 @@ export default class TraeExecutor extends BaseExecutor {
             }
             controller.enqueue(enc.encode("data: [DONE]\n\n"));
             controller.close();
-          } catch (err) {
-            controller.error(err);
-          }
+          };
+          run().catch((err) => {
+            if (!streamAbort.signal.aborted) {
+              try { controller.error(err); } catch { /* downstream already cancelled */ }
+            }
+          }).finally(() => {
+            signal?.removeEventListener?.("abort", abortStream);
+          });
+        },
+        cancel(reason) {
+          streamAbort.abort(reason);
+          signal?.removeEventListener?.("abort", abortStream);
         },
       });
       return {

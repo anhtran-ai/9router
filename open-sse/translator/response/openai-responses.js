@@ -131,22 +131,36 @@ function collectOutputItem(state, event, data) {
   }
 }
 
+// Chat Completions reuses index 0 for the first choice and for the first tool
+// call. Responses output_index instead identifies a single output item, so each
+// reasoning/message/tool item needs its own stable index.
+function getOutputItemIndex(state, kind, sourceIndex) {
+  state.outputItemIndices ||= new Map();
+  const key = `${kind}:${sourceIndex}`;
+  if (!state.outputItemIndices.has(key)) {
+    const nextIndex = state.nextOutputItemIndex ?? 0;
+    state.outputItemIndices.set(key, nextIndex);
+    state.nextOutputItemIndex = nextIndex + 1;
+  }
+  return state.outputItemIndices.get(key);
+}
+
 // Helper functions
 function startReasoning(state, emit, idx) {
   if (!state.reasoningId) {
     state.reasoningId = `rs_${state.responseId}_${idx}`;
-    state.reasoningIndex = idx;
+    state.reasoningIndex = getOutputItemIndex(state, "reasoning", idx);
     
     emit("response.output_item.added", {
       type: "response.output_item.added",
-      output_index: idx,
+      output_index: state.reasoningIndex,
       item: { id: state.reasoningId, type: RESPONSES_ITEM.REASONING, summary: [] }
     });
 
     emit("response.reasoning_summary_part.added", {
       type: "response.reasoning_summary_part.added",
       item_id: state.reasoningId,
-      output_index: idx,
+      output_index: state.reasoningIndex,
       summary_index: 0,
       part: { type: RESPONSES_ITEM.SUMMARY_TEXT, text: "" }
     });
@@ -199,13 +213,14 @@ function closeReasoning(state, emit) {
 }
 
 function emitTextContent(state, emit, idx, content) {
+  const outputIndex = getOutputItemIndex(state, "message", idx);
   if (!state.msgItemAdded[idx]) {
     state.msgItemAdded[idx] = true;
     const msgId = `msg_${state.responseId}_${idx}`;
     
     emit("response.output_item.added", {
       type: "response.output_item.added",
-      output_index: idx,
+      output_index: outputIndex,
       item: { id: msgId, type: RESPONSES_ITEM.MESSAGE, content: [], role: ROLE.ASSISTANT }
     });
   }
@@ -216,7 +231,7 @@ function emitTextContent(state, emit, idx, content) {
     emit("response.content_part.added", {
       type: "response.content_part.added",
       item_id: `msg_${state.responseId}_${idx}`,
-      output_index: idx,
+      output_index: outputIndex,
       content_index: 0,
       part: { type: RESPONSES_ITEM.OUTPUT_TEXT, annotations: [], logprobs: [], text: "" }
     });
@@ -225,7 +240,7 @@ function emitTextContent(state, emit, idx, content) {
   emit("response.output_text.delta", {
     type: "response.output_text.delta",
     item_id: `msg_${state.responseId}_${idx}`,
-    output_index: idx,
+    output_index: outputIndex,
     content_index: 0,
     delta: content,
     logprobs: []
@@ -240,11 +255,12 @@ function closeMessage(state, emit, idx) {
     state.msgItemDone[idx] = true;
     const fullText = state.msgTextBuf[idx] || "";
     const msgId = `msg_${state.responseId}_${idx}`;
+    const outputIndex = getOutputItemIndex(state, "message", idx);
 
     emit("response.output_text.done", {
       type: "response.output_text.done",
       item_id: msgId,
-      output_index: parseInt(idx),
+      output_index: outputIndex,
       content_index: 0,
       text: fullText,
       logprobs: []
@@ -253,14 +269,14 @@ function closeMessage(state, emit, idx) {
     emit("response.content_part.done", {
       type: "response.content_part.done",
       item_id: msgId,
-      output_index: parseInt(idx),
+      output_index: outputIndex,
       content_index: 0,
       part: { type: RESPONSES_ITEM.OUTPUT_TEXT, annotations: [], logprobs: [], text: fullText }
     });
 
     emit("response.output_item.done", {
       type: "response.output_item.done",
-      output_index: parseInt(idx),
+      output_index: outputIndex,
       item: {
         id: msgId,
         type: RESPONSES_ITEM.MESSAGE,
@@ -299,10 +315,11 @@ function emitToolCall(state, emit, tc) {
   if (!state.funcItemAdded[tcIdx] && callId && state.funcNames[tcIdx]) {
     state.funcItemAdded[tcIdx] = true;
     const custom = isCustomTool(state, state.funcNames[tcIdx]);
+    const outputIndex = getOutputItemIndex(state, "tool", tcIdx);
 
     emit("response.output_item.added", {
       type: "response.output_item.added",
-      output_index: tcIdx,
+      output_index: outputIndex,
       item: {
         id: `${custom ? "ctc" : "fc"}_${callId}`,
         type: custom ? RESPONSES_ITEM.CUSTOM_TOOL_CALL : RESPONSES_ITEM.FUNCTION_CALL,
@@ -321,7 +338,7 @@ function emitToolCall(state, emit, tc) {
       emit("response.function_call_arguments.delta", {
         type: "response.function_call_arguments.delta",
         item_id: `fc_${refCallId}`,
-        output_index: tcIdx,
+        output_index: getOutputItemIndex(state, "tool", tcIdx),
         delta: tc.function.arguments
       });
     }
@@ -334,36 +351,37 @@ function emitToolCall(state, emit, tc) {
 
 function closeToolCall(state, emit, idx) {
   const callId = state.funcCallIds[idx];
-  if (callId && !state.funcItemDone[idx]) {
+  if (callId && state.funcItemAdded[idx] && !state.funcItemDone[idx]) {
     const args = state.funcArgsBuf[idx] || "{}";
     const custom = isCustomTool(state, state.funcNames[idx]);
+    const outputIndex = getOutputItemIndex(state, "tool", idx);
 
     if (custom) {
       const input = extractCustomToolInput(args);
       emit("response.custom_tool_call_input.delta", {
         type: "response.custom_tool_call_input.delta",
         item_id: `ctc_${callId}`,
-        output_index: parseInt(idx),
+        output_index: outputIndex,
         delta: input
       });
       emit("response.custom_tool_call_input.done", {
         type: "response.custom_tool_call_input.done",
         item_id: `ctc_${callId}`,
-        output_index: parseInt(idx),
+        output_index: outputIndex,
         input
       });
     } else {
       emit("response.function_call_arguments.done", {
         type: "response.function_call_arguments.done",
         item_id: `fc_${callId}`,
-        output_index: parseInt(idx),
+        output_index: outputIndex,
         arguments: args
       });
     }
 
     emit("response.output_item.done", {
       type: "response.output_item.done",
-      output_index: parseInt(idx),
+      output_index: outputIndex,
       item: {
         id: `${custom ? "ctc" : "fc"}_${callId}`,
         type: custom ? RESPONSES_ITEM.CUSTOM_TOOL_CALL : RESPONSES_ITEM.FUNCTION_CALL,
@@ -534,13 +552,18 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     return null;
   }
 
-  // Function call started (standard function_call or custom_tool_call)
+  // Function call started (standard function_call or custom_tool_call).
+  // Index is assigned here (not on done): attributing deltas by stream position
+  // merges parallel calls into index 0 whenever upstream emits all addeds
+  // before dones — the client then concatenates N JSON payloads into one
+  // tool input and fails validation. The server item id is the correlator.
   if (eventType === "response.output_item.added" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
     const item = data.item;
     state.currentToolCallId = item.call_id || fallbackToolCallId();
     state.responsesTools ||= new Map();
     state.responsesItemCalls ||= new Map();
-    if (item.id) state.responsesItemCalls.set(item.id, state.currentToolCallId);
+    const itemId = item.id || data.item_id;
+    if (itemId) state.responsesItemCalls.set(itemId, state.currentToolCallId);
     if (state.responsesTools.has(state.currentToolCallId)) return null;
     const progress = { index: state.responsesTools.size, argsSent: "", rawInput: "", custom: item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL };
     state.responsesTools.set(state.currentToolCallId, progress);
@@ -558,7 +581,8 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     );
   }
 
-  // Function call arguments delta (standard or custom_tool_call variant)
+  // Function call arguments delta (standard or custom_tool_call variant).
+  // Routed by item_id so interleaved parallel fragments stay on their own call.
   if (eventType === "response.function_call_arguments.delta" || eventType === "response.custom_tool_call_input.delta") {
     const argsDelta = data.delta || "";
     if (!argsDelta) return null;
@@ -576,12 +600,14 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     );
   }
 
-  // Function call done (standard or custom_tool_call variant)
+  // Function call done (standard or custom_tool_call variant).
+  // Index was assigned at added-time; nothing to advance. Some upstreams send
+  // complete arguments only here (no deltas) — emit them once in that case.
   if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
     const item = data.item;
-    const callId = item.call_id || state.responsesItemCalls?.get(item.id) || state.currentToolCallId;
+    const callId = item.call_id || state.responsesItemCalls?.get(item.id || data.item_id) || state.currentToolCallId;
     const progress = state.responsesTools?.get(callId);
-    state.toolCallIndex = Math.max(state.toolCallIndex + 1, (progress?.index ?? -1) + 1);
+    state.toolCallIndex = Math.max(state.toolCallIndex, (progress?.index ?? -1) + 1);
     if (progress) {
       const args = progress.custom ? JSON.stringify({ input: item.input ?? progress.rawInput }) : item.arguments;
       const missing = remainingTerminalValue(args, progress.argsSent);

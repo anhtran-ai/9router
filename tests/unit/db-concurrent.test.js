@@ -151,6 +151,22 @@ describe("DB Concurrency — atomic safety", () => {
     }
   });
 
+  it("persists routing settings for a combo named __proto__ as ordinary data", async () => {
+    const [result] = await db.importComboItems([{
+      index: 0,
+      name: "__proto__",
+      kind: "chat",
+      models: ["fixture/model"],
+      strategy: { fallbackStrategy: "round-robin" },
+      strategyProvided: true,
+    }]);
+
+    const settings = await db.getSettings();
+    expect(result.action).toMatch(/created|updated/);
+    expect(Object.prototype.hasOwnProperty.call(settings.comboStrategies, "__proto__")).toBe(true);
+    expect(settings.comboStrategies.__proto__).toEqual({ fallbackStrategy: "round-robin" });
+  });
+
   it("OAuth refresh race: parallel updateProviderConnection on same id", async () => {
     const conn = await db.createProviderConnection({
       provider: "oauth-test", authType: "oauth", email: "x@y.com",

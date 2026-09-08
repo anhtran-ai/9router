@@ -54,9 +54,14 @@ describe("wrapQoderSSE billing detection", () => {
   }
 
   it("returns 403 response when first frame is billing block (code 112)", async () => {
+    const reflectedSecret = "SENSITIVE_QODER_BILLING_MESSAGE";
     const billingEnv = JSON.stringify({
       statusCodeValue: 403,
-      body: '{"code":"112","message":"Quota exhausted","pricingUrl":"https://qoder.sh/pricing"}',
+      body: JSON.stringify({
+        code: "112",
+        message: reflectedSecret,
+        pricingUrl: "https://qoder.sh/pricing",
+      }),
     });
     const upstream = `data: ${billingEnv}\n\n`;
 
@@ -67,6 +72,7 @@ describe("wrapQoderSSE billing detection", () => {
     const json = await wrapped.json();
     expect(json.error).toBeDefined();
     expect(json.error.message).toContain("112");
+    expect(JSON.stringify(json)).not.toContain(reflectedSecret);
   });
 
   it("returns 403 response when first frame is billing block (code 10605)", async () => {
@@ -94,7 +100,7 @@ describe("wrapQoderSSE billing detection", () => {
     expect(wrapped.status).toBe(403);
   });
 
-  it("passes through normal errors (non-billing) as wrapped SSE", async () => {
+  it("reports normal non-billing failures as protocol errors", async () => {
     const errorEnv = JSON.stringify({
       statusCodeValue: 500,
       body: "Internal server error",
@@ -103,7 +109,8 @@ describe("wrapQoderSSE billing detection", () => {
 
     const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/ultimate");
 
-    // Normal error: still 200 response, error text in SSE body
+    // The HTTP stream is already established, so the failure is carried in a
+    // typed SSE error envelope for chatCore to reject and cool down/fail over.
     expect(wrapped.status).toBe(200);
     expect(wrapped.ok).toBe(true);
 
@@ -117,14 +124,16 @@ describe("wrapQoderSSE billing detection", () => {
     }
     buf += decoder.decode();
 
-    expect(buf).toContain("[qoder error 500");
+    expect(buf).toContain('"code":"qoder_upstream_error"');
+    expect(buf).not.toContain('"finish_reason":"stop"');
     expect(buf).toContain("data: [DONE]");
   });
 
   it("passes through successful responses unchanged", async () => {
     const inner = JSON.stringify({ choices: [{ delta: { content: "hello" } }] });
     const successEnv = JSON.stringify({ statusCodeValue: 200, body: inner });
-    const upstream = `data: ${successEnv}\n\n`;
+    const doneEnv = JSON.stringify({ statusCodeValue: 200, body: "[DONE]" });
+    const upstream = `data: ${successEnv}\n\ndata: ${doneEnv}\n\n`;
 
     const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/ultimate");
 
@@ -143,5 +152,6 @@ describe("wrapQoderSSE billing detection", () => {
 
     expect(buf).toContain(`data: ${inner}`);
     expect(buf).toContain("data: [DONE]");
+    expect(buf).not.toContain('"type":"upstream_error"');
   });
 });

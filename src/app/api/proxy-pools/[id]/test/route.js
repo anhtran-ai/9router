@@ -7,8 +7,9 @@ async function testVercelRelay(relayUrl, timeoutMs = 10000) {
   const controller = new AbortController();
   const startedAt = Date.now();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
   try {
-    const res = await undiciFetch(relayUrl, {
+    res = await undiciFetch(relayUrl, {
       method: "GET",
       headers: {
         "x-relay-target": "https://httpbin.org",
@@ -29,6 +30,9 @@ async function testVercelRelay(relayUrl, timeoutMs = 10000) {
       error: err?.name === "AbortError" ? "Relay test timed out" : (err?.message || String(err)),
     };
   } finally {
+    // This probe needs only status/headers; release the pooled connection
+    // instead of leaving an unread relay body attached to it.
+    try { Promise.resolve(res?.body?.cancel()).catch(() => {}); } catch { /* best effort */ }
     clearTimeout(timer);
   }
 }

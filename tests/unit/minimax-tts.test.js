@@ -3,6 +3,14 @@ import { handleTtsCore } from "../../open-sse/handlers/ttsCore.js";
 
 const originalFetch = global.fetch;
 
+function validMp3() {
+  const audio = Buffer.alloc(417);
+  audio.set([0xff, 0xfb, 0x90, 0x64]);
+  return audio;
+}
+
+const VALID_MP3_HEX = validMp3().toString("hex");
+
 describe("MiniMax TTS", () => {
   beforeEach(() => {
     global.fetch = vi.fn();
@@ -16,7 +24,7 @@ describe("MiniMax TTS", () => {
     global.fetch.mockResolvedValueOnce(
       new Response(
         JSON.stringify({
-          data: { audio: "00010203", status: 2 },
+          data: { audio: VALID_MP3_HEX, status: 2 },
           extra_info: { audio_format: "mp3" },
           base_resp: { status_code: 0, status_msg: "success" },
         }),
@@ -66,14 +74,14 @@ describe("MiniMax TTS", () => {
     });
 
     const body = await result.response.json();
-    expect(body).toEqual({ audio: "AAECAw==", format: "mp3" });
+    expect(body).toEqual({ audio: validMp3().toString("base64"), format: "mp3" });
   });
 
   it("uses the default MiniMax voice when no voice is provided", async () => {
     global.fetch.mockResolvedValueOnce(
       new Response(
         JSON.stringify({
-          data: { audio: "00010203", status: 2 },
+          data: { audio: VALID_MP3_HEX, status: 2 },
           base_resp: { status_code: 0, status_msg: "success" },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } }
@@ -116,5 +124,27 @@ describe("MiniMax TTS", () => {
     expect(result.success).toBe(false);
     expect(result.status).toBe(502);
     expect(result.error).toContain("insufficient quota");
+  });
+
+  it("rejects a top-level failure flag even when valid audio is present", async () => {
+    global.fetch.mockResolvedValueOnce(new Response(JSON.stringify({
+      success: false,
+      message: "generation rejected",
+      data: { audio: VALID_MP3_HEX, status: 2 },
+      base_resp: { status_code: 0, status_msg: "success" },
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    const result = await handleTtsCore({
+      provider: "minimax",
+      model: "speech-2.8-hd/English_expressive_narrator",
+      input: "Hello",
+      credentials: { apiKey: "test-key" },
+    });
+
+    expect(result).toMatchObject({ success: false, status: 502 });
+    expect(result.error).toContain("generation rejected");
   });
 });

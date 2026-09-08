@@ -2,6 +2,9 @@ import {
   getProviderCredentials,
   markAccountUnavailable,
   clearAccountError,
+  beginAccountMutationAttempt,
+  endAccountMutationAttempt,
+  recordAccountMutationSuccess,
   extractApiKey,
   isValidApiKey,
 } from "../services/auth.js";
@@ -12,6 +15,7 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat } from "open-sse/services/combo.js";
+import { awaitWithSignal, isAbortError } from "open-sse/utils/abort.js";
 import * as log from "../utils/logger.js";
 
 // Providers that don't require credentials (noAuth)
@@ -22,10 +26,16 @@ const NO_AUTH_PROVIDERS = new Set(["sdwebui", "comfyui"]);
  * @param {Request} request
  */
 export async function handleImageGeneration(request) {
+  if (request.signal?.aborted) {
+    return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+  }
   let body;
   try {
-    body = await request.json();
-  } catch {
+    body = await awaitWithSignal(request.json(), request.signal);
+  } catch (error) {
+    if (isAbortError(error, request.signal)) {
+      return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+    }
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body");
   }
 
@@ -56,18 +66,35 @@ export async function handleImageGeneration(request) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m) => handleSingleModelImage(b, m, { wantsStream, binaryOutput, preferredConnectionId }),
+      handleSingleModel: (b, m) => handleSingleModelImage(b, m, {
+        wantsStream,
+        binaryOutput,
+        preferredConnectionId,
+        signal: request.signal,
+      }),
       log,
       comboName: modelStr,
       comboStrategy,
       comboStickyLimit,
+      signal: request.signal,
     });
   }
 
-  return handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId });
+  return handleSingleModelImage(body, modelStr, {
+    wantsStream,
+    binaryOutput,
+    preferredConnectionId,
+    signal: request.signal,
+  });
 }
 
-async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutput, preferredConnectionId } = {}) {
+async function handleSingleModelImage(body, modelStr, {
+  wantsStream,
+  binaryOutput,
+  preferredConnectionId,
+  signal,
+} = {}) {
+  if (signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
   const modelInfo = await getModelInfo(modelStr);
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
@@ -80,6 +107,7 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
       modelInfo: { provider, model },
       credentials: null,
       binaryOutput,
+      signal,
     });
     if (result.success) return result.response;
     return errorResponse(result.status || HTTP_STATUS.BAD_GATEWAY, result.error || "Image generation failed");
@@ -91,7 +119,19 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { preferredConnectionId });
+    if (signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+    let credentials;
+    try {
+      credentials = await getProviderCredentials(provider, excludeConnectionIds, model, {
+        preferredConnectionId,
+        signal,
+      });
+    } catch (error) {
+      if (isAbortError(error, signal)) {
+        return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
+      throw error;
+    }
 
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
@@ -105,38 +145,69 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
       return errorResponse(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable");
     }
 
-    const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
-
-    const result = await handleImageGenerationCore({
-      body,
-      modelInfo: { provider, model },
-      credentials: refreshedCredentials,
-      streamToClient: wantsStream,
-      binaryOutput,
-      onCredentialsRefreshed: async (newCreds) => {
-        await updateProviderCredentials(credentials.connectionId, {
-          accessToken: newCreds.accessToken,
-          refreshToken: newCreds.refreshToken,
-          providerSpecificData: newCreds.providerSpecificData,
-          testStatus: "active"
-        });
-      },
-      onRequestSuccess: async () => {
-        await clearAccountError(credentials.connectionId, credentials, model);
+    if (signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+    let refreshedCredentials;
+    try {
+      refreshedCredentials = await awaitWithSignal(checkAndRefreshToken(provider, credentials), signal);
+    } catch (error) {
+      if (isAbortError(error, signal)) {
+        return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
       }
-    });
-
-    if (result.success) return result.response;
-
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);
-
-    if (shouldFallback) {
-      excludeConnectionIds.add(credentials.connectionId);
-      lastError = result.error;
-      lastStatus = result.status;
-      continue;
+      throw error;
     }
 
-    return result.response;
+    const mutationAttempt = beginAccountMutationAttempt(credentials.connectionId, model);
+    try {
+      const result = await handleImageGenerationCore({
+        body,
+        modelInfo: { provider, model },
+        credentials: refreshedCredentials,
+        streamToClient: wantsStream,
+        binaryOutput,
+        signal,
+        onCredentialsRefreshed: async (newCreds) => {
+          await updateProviderCredentials(credentials.connectionId, {
+            accessToken: newCreds.accessToken,
+            refreshToken: newCreds.refreshToken,
+            providerSpecificData: newCreds.providerSpecificData,
+            testStatus: "active"
+          });
+        },
+        onRequestSuccess: async () => {
+          recordAccountMutationSuccess(mutationAttempt);
+          await clearAccountError(credentials.connectionId, credentials, model, { mutationAttempt });
+        }
+      });
+
+      // Non-streaming image adapters have consumed and validated the complete
+      // upstream response before returning. Streaming adapters publish success
+      // only from onRequestSuccess when their terminal event arrives.
+      if (result.success) {
+        if (!wantsStream) recordAccountMutationSuccess(mutationAttempt);
+        return result.response;
+      }
+      if (result.status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) return result.response;
+
+      const { shouldFallback } = await markAccountUnavailable(
+        credentials.connectionId,
+        result.status,
+        result.error,
+        provider,
+        model,
+        null,
+        { mutationAttempt },
+      );
+
+      if (shouldFallback) {
+        excludeConnectionIds.add(credentials.connectionId);
+        lastError = result.error;
+        lastStatus = result.status;
+        continue;
+      }
+
+      return result.response;
+    } finally {
+      endAccountMutationAttempt(mutationAttempt);
+    }
   }
 }
