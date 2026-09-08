@@ -1,14 +1,19 @@
 "use server";
 
 import { NextResponse } from "next/server";
-import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
+import { assertPublicUrlResolved, fetchPublic } from "@/shared/utils/ssrfGuard.js";
 import { isLocalRequest } from "@/dashboardGuard";
 
 const TIMEOUT_MS = 8000;
 
+async function discardResponseBody(response) {
+  if (!response?.body || response.bodyUsed === true) return;
+  try { await response?.body?.cancel(); } catch { /* best-effort connection release */ }
+}
+
 // Probe MCP server: initialize + tools/list. No auth header — works for authless servers.
 // OAuth servers return 401, signal client to skip tool listing.
-async function probeMcp(url) {
+async function probeMcp(url, fetchImpl = fetch) {
   const headers = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
@@ -18,7 +23,7 @@ async function probeMcp(url) {
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
   try {
     // Step 1: initialize
-    const initRes = await fetch(url, {
+    const initRes = await fetchImpl(url, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -28,9 +33,11 @@ async function probeMcp(url) {
       signal: ac.signal,
     });
     if (initRes.status === 401 || initRes.status === 403) {
+      await discardResponseBody(initRes);
       return { requiresAuth: true, tools: [] };
     }
     if (!initRes.ok) {
+      await discardResponseBody(initRes);
       return { error: `init ${initRes.status}`, tools: [] };
     }
     const sessionId = initRes.headers.get("mcp-session-id") || "";
@@ -40,21 +47,25 @@ async function probeMcp(url) {
     if (sessionId) listHeaders["mcp-session-id"] = sessionId;
 
     // Step 2: notifications/initialized (required by spec before tools/list)
-    await fetch(url, {
-      method: "POST",
-      headers: listHeaders,
-      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
-      signal: ac.signal,
-    }).catch(() => {});
+    try {
+      const notifyRes = await fetchImpl(url, {
+        method: "POST",
+        headers: listHeaders,
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
+        signal: ac.signal,
+      });
+      await discardResponseBody(notifyRes);
+    } catch { /* notification failure is non-fatal */ }
 
     // Step 3: tools/list
-    const listRes = await fetch(url, {
+    const listRes = await fetchImpl(url, {
       method: "POST",
       headers: listHeaders,
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
       signal: ac.signal,
     });
     if (listRes.status === 401 || listRes.status === 403) {
+      await discardResponseBody(listRes);
       return { requiresAuth: true, tools: [] };
     }
     const ct = listRes.headers.get("content-type") || "";
@@ -90,14 +101,15 @@ export async function POST(request) {
       return NextResponse.json({ error: "url required" }, { status: 400 });
     }
     // SSRF guard for remote callers; local host keeps self-hosted MCP servers.
-    if (!isLocalRequest(request)) {
+    const isRemote = !isLocalRequest(request);
+    if (isRemote) {
       try {
-        assertPublicUrl(url);
+        await assertPublicUrlResolved(url);
       } catch {
         return NextResponse.json({ error: "URL not allowed" }, { status: 400 });
       }
     }
-    const result = await probeMcp(url);
+    const result = await probeMcp(url, isRemote ? fetchPublic : fetch);
     return NextResponse.json(result);
   } catch (e) {
     return NextResponse.json({ error: e.message, tools: [] }, { status: 500 });

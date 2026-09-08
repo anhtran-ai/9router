@@ -35,6 +35,11 @@ function sanitizeHeaders(headers) {
   return out;
 }
 
+async function discardResponseBody(response) {
+  if (!response?.body || response.bodyUsed === true) return;
+  try { await response.body.cancel(); } catch { /* best-effort connection release */ }
+}
+
 /** Build a JSON Response wrapper used by the auth layer. */
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -100,8 +105,9 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
 
   log?.info?.("SEARCH", `${provider.id} | "${params.query.slice(0, 80)}" | type=${params.searchType}`);
 
+  let resp;
   try {
-    const resp = await fetchPublic(url, { ...init, headers: sanitizeHeaders(init.headers), signal: controller.signal });
+    resp = await fetchPublic(url, { ...init, headers: sanitizeHeaders(init.headers), signal: controller.signal });
     clearTimeout(timer);
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
@@ -134,6 +140,7 @@ async function tryDedicatedProvider({ provider, providerConfig, body, credential
       }
     };
   } catch (err) {
+    await discardResponseBody(resp);
     clearTimeout(timer);
     const isTimeout = err.name === "AbortError";
     const status = isTimeout ? 504 : 502;

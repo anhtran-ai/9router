@@ -4,7 +4,13 @@
  * Remote callers must not be able to force server-side fetches to
  * internal URLs; local-host use (self-hosted MCP servers) keeps working.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
+
+const { lookupMock } = vi.hoisted(() => ({ lookupMock: vi.fn() }));
+vi.mock("node:dns", () => ({
+  default: { promises: { lookup: lookupMock } },
+  promises: { lookup: lookupMock },
+}));
 
 vi.mock("next/server", () => ({
   NextResponse: {
@@ -19,6 +25,7 @@ vi.mock("next/server", () => ({
 const { POST } = await import(
   "../../src/app/api/cli-tools/cowork-mcp-tools/route.js"
 );
+const originalFetch = globalThis.fetch;
 
 function remoteRequest(url) {
   return new Request("http://gateway.example.com/api/cli-tools/cowork-mcp-tools", {
@@ -31,6 +38,12 @@ function remoteRequest(url) {
 describe("cowork-mcp-tools SSRF guard", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    lookupMock.mockReset();
+    lookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
   });
 
   it("rejects loopback URLs from remote callers without fetching", async () => {
@@ -48,6 +61,27 @@ describe("cowork-mcp-tools SSRF guard", () => {
     }
   });
 
+  it("rejects a public-looking hostname that DNS resolves to a private address", async () => {
+    lookupMock.mockResolvedValue([{ address: "10.20.30.40", family: 4 }]);
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const res = await POST(remoteRequest("https://mcp.attacker.example/rpc"));
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "URL not allowed" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when DNS resolution is unavailable", async () => {
+    lookupMock.mockRejectedValue(new Error("resolver unavailable"));
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const res = await POST(remoteRequest("https://unresolved.example/rpc"));
+
+    expect(res.status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("still requires a url", async () => {
     const res = await POST(
       new Request("http://gateway.example.com/api/cli-tools/cowork-mcp-tools", {
@@ -57,5 +91,17 @@ describe("cowork-mcp-tools SSRF guard", () => {
       })
     );
     expect(res.status).toBe(400);
+  });
+
+  it("cancels an unused auth-error body so its pinned Agent can close", async () => {
+    const upstream = new Response("authenticate", { status: 401 });
+    const cancel = vi.spyOn(upstream.body, "cancel");
+    globalThis.fetch = vi.fn().mockResolvedValue(upstream);
+
+    const res = await POST(remoteRequest("https://public-mcp.example/rpc"));
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ requiresAuth: true, tools: [] });
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });

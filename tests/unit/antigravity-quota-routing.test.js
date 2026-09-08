@@ -27,7 +27,14 @@ vi.mock("open-sse/services/usage/google.js", () => ({
 }));
 vi.mock("@/sse/utils/logger.js", () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn() }));
 
-const { getAntigravityQuotaCache, handleAntigravityQuotaError, refreshAntigravityQuota, clearAntigravityStrikes } = await import("@/sse/services/antigravityQuota.js");
+const {
+  getAntigravityQuotaCache,
+  handleAntigravityQuotaError,
+  refreshAntigravityQuota,
+  clearAntigravityStrikes,
+  beginAntigravityQuotaAttempt,
+  endAntigravityQuotaAttempt,
+} = await import("@/sse/services/antigravityQuota.js");
 const { getProviderCredentials } = await import("@/sse/services/auth.js");
 
 const MODEL = "claude-opus-4-6-thinking";
@@ -297,6 +304,114 @@ describe("Antigravity quota-aware routing", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("ignores concurrent stale 429 evaluations after a newer success", async () => {
+    let resolveUsage;
+    let markUsageStarted;
+    const usageStarted = new Promise((resolve) => { markUsageStarted = resolve; });
+    mocks.getAntigravityUsage.mockImplementation(() => new Promise((resolve) => {
+      resolveUsage = resolve;
+      markUsageStarted();
+    }));
+
+    const staleErrors = [1, 2, 3].map(() =>
+      handleAntigravityQuotaError("ag-stale-success", 429, MODEL, "token", {})
+    );
+    await usageStarted;
+    expect(mocks.getAntigravityUsage).toHaveBeenCalledTimes(1);
+
+    // The success lands while all three older 429 handlers are suspended on
+    // the coalesced quota refresh. None may restore a cleared strike afterward.
+    clearAntigravityStrikes("ag-stale-success", MODEL);
+    resolveUsage({ quotas: {
+      [MODEL]: { remainingPercentage: 90, resetAt: FUTURE_RESET },
+    } });
+
+    await expect(Promise.all(staleErrors)).resolves.toEqual([null, null, null]);
+    expect(getAntigravityQuotaCache().get("ag-stale-success")?.[MODEL]?.remainingPercentage).toBe(90);
+
+    // A fresh post-success episode still starts at strike one and requires all
+    // three new failures to open the circuit.
+    await expect(handleAntigravityQuotaError("ag-stale-success", 429, MODEL, "token", {})).resolves.toBeNull();
+    await expect(handleAntigravityQuotaError("ag-stale-success", 429, MODEL, "token", {})).resolves.toBeNull();
+    await expect(handleAntigravityQuotaError("ag-stale-success", 429, MODEL, "token", {}))
+      .resolves.toBeGreaterThan(Date.now());
+  });
+
+  it("ignores an older request whose 429 handler starts after a newer request succeeds", async () => {
+    const connectionId = "ag-success-before-handler";
+    mocks.getAntigravityUsage.mockResolvedValue({ quotas: {
+      [MODEL]: { remainingPercentage: 90, resetAt: FUTURE_RESET },
+    } });
+    const older = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    const newer = beginAntigravityQuotaAttempt(connectionId, MODEL);
+
+    clearAntigravityStrikes(connectionId, MODEL, newer);
+    endAntigravityQuotaAttempt(newer);
+    await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, older)).resolves.toBeNull();
+    endAntigravityQuotaAttempt(older);
+
+    // The stale error above contributed no strike: three genuinely newer
+    // failures are still required to open the circuit.
+    for (let i = 0; i < 2; i += 1) {
+      const attempt = beginAntigravityQuotaAttempt(connectionId, MODEL);
+      await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, attempt)).resolves.toBeNull();
+      endAntigravityQuotaAttempt(attempt);
+    }
+    const third = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, third))
+      .resolves.toBeGreaterThan(Date.now());
+    endAntigravityQuotaAttempt(third);
+  });
+
+  it("does not let a delayed older success erase a newer request strike", async () => {
+    const connectionId = "ag-delayed-old-success";
+    mocks.getAntigravityUsage.mockResolvedValue({ quotas: {
+      [MODEL]: { remainingPercentage: 90, resetAt: FUTURE_RESET },
+    } });
+    const olderSuccess = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    const newerFailure = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, newerFailure)).resolves.toBeNull();
+    endAntigravityQuotaAttempt(newerFailure);
+
+    clearAntigravityStrikes(connectionId, MODEL, olderSuccess);
+    endAntigravityQuotaAttempt(olderSuccess);
+
+    const second = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, second)).resolves.toBeNull();
+    endAntigravityQuotaAttempt(second);
+    const third = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, third))
+      .resolves.toBeGreaterThan(Date.now());
+    endAntigravityQuotaAttempt(third);
+  });
+
+  it("records a middle success watermark while retaining a newer failure", async () => {
+    const connectionId = "ag-error-1-failure-3-success-2";
+    mocks.getAntigravityUsage.mockResolvedValue({ quotas: {
+      [MODEL]: { remainingPercentage: 90, resetAt: FUTURE_RESET },
+    } });
+    const olderError = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    const middleSuccess = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    const newerFailure = beginAntigravityQuotaAttempt(connectionId, MODEL);
+
+    await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, newerFailure)).resolves.toBeNull();
+    endAntigravityQuotaAttempt(newerFailure);
+    clearAntigravityStrikes(connectionId, MODEL, middleSuccess);
+    endAntigravityQuotaAttempt(middleSuccess);
+    await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, olderError)).resolves.toBeNull();
+    endAntigravityQuotaAttempt(olderError);
+
+    // Failure 3 survived success 2, while error 1 was ignored. Exactly two
+    // later failures therefore remain necessary to reach the threshold.
+    const fourth = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, fourth)).resolves.toBeNull();
+    endAntigravityQuotaAttempt(fourth);
+    const fifth = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, fifth))
+      .resolves.toBeGreaterThan(Date.now());
+    endAntigravityQuotaAttempt(fifth);
   });
 
   it("anchors the window at the first strike: 3 strikes spread over 90s do not trip", async () => {

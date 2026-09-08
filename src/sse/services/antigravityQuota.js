@@ -28,6 +28,82 @@ const STRIKE_THRESHOLD = 3;
 const STRIKE_BLOCK_MS = 15 * 60_000;
 const strikeCounts = new Map(); // "connectionId|model" → { count, windowStart (anchored at first strike) }
 const strikeBlocks = new Map(); // "connectionId|model" → blockedUntil ms
+// Bounded ordering watermark for failed attempts. It prevents a delayed success
+// callback from clearing newer failure state, and expires after the longest
+// in-process straggler window rather than growing with every observed model.
+const strikeFailureAttempts = new Map(); // key → { id, expiresAt }
+// Success generations exist only while one or more error handlers are waiting
+// on an async quota refresh. A success advances the generation, making every
+// earlier 409/429 result stale before it can mutate strike state.
+const pendingStrikeEvaluations = new Map(); // key → number of waiting handlers
+const strikeSuccessGenerations = new Map(); // key → success generation while pending
+// Request attempts cover the wider race where an older upstream request has
+// started but does not enter quota-error handling until after a newer request
+// succeeds. State exists only while attempts for the pair are active.
+const activeStrikeAttempts = new Map(); // key → { active, latestSuccessId }
+let nextStrikeAttemptId = 0;
+
+export function beginAntigravityQuotaAttempt(connectionId, model) {
+  const key = `${connectionId}|${model}`;
+  const state = activeStrikeAttempts.get(key) || { active: 0, latestSuccessId: 0 };
+  const attempt = { key, id: ++nextStrikeAttemptId };
+  state.active += 1;
+  activeStrikeAttempts.set(key, state);
+  return attempt;
+}
+
+export function endAntigravityQuotaAttempt(attempt) {
+  if (!attempt?.key) return;
+  const state = activeStrikeAttempts.get(attempt.key);
+  if (!state) return;
+  state.active = Math.max(0, state.active - 1);
+  if (state.active === 0) activeStrikeAttempts.delete(attempt.key);
+}
+
+export function isAntigravityQuotaAttemptSuperseded(attempt) {
+  if (!attempt?.key || !Number.isFinite(attempt.id)) return false;
+  const state = activeStrikeAttempts.get(attempt.key);
+  return Boolean(state && state.latestSuccessId > attempt.id);
+}
+
+export function canAntigravityQuotaAttemptClearFailure(attempt) {
+  if (!attempt?.key || !Number.isFinite(attempt.id)) return true;
+  return attempt.id >= getLatestFailureAttemptId(attempt.key);
+}
+
+function getLatestFailureAttemptId(key) {
+  const watermark = strikeFailureAttempts.get(key);
+  if (!watermark) return 0;
+  if (watermark.expiresAt <= Date.now()) {
+    strikeFailureAttempts.delete(key);
+    return 0;
+  }
+  return watermark.id;
+}
+
+export function recordAntigravityQuotaAttemptFailure(attempt) {
+  if (!attempt?.key || !Number.isFinite(attempt.id)) return;
+  const currentId = getLatestFailureAttemptId(attempt.key);
+  strikeFailureAttempts.set(attempt.key, {
+    id: Math.max(currentId, attempt.id),
+    expiresAt: Date.now() + STRIKE_BLOCK_MS,
+  });
+}
+
+function beginStrikeEvaluation(key) {
+  pendingStrikeEvaluations.set(key, (pendingStrikeEvaluations.get(key) || 0) + 1);
+  return strikeSuccessGenerations.get(key) || 0;
+}
+
+function endStrikeEvaluation(key) {
+  const remaining = (pendingStrikeEvaluations.get(key) || 1) - 1;
+  if (remaining > 0) {
+    pendingStrikeEvaluations.set(key, remaining);
+    return;
+  }
+  pendingStrikeEvaluations.delete(key);
+  strikeSuccessGenerations.delete(key);
+}
 
 /**
  * Re-apply active strike blocks onto a fresh quotas snapshot so the auth
@@ -40,6 +116,7 @@ function applyActiveStrikeBlocks(connectionId, quotas) {
     if (!key.startsWith(`${connectionId}|`)) continue;
     if (until <= now) {
       strikeBlocks.delete(key);
+      if (!strikeCounts.has(key)) strikeFailureAttempts.delete(key);
       continue;
     }
     quotas[key.slice(connectionId.length + 1)] = {
@@ -55,9 +132,28 @@ function applyActiveStrikeBlocks(connectionId, quotas) {
  * "consecutive" strikes means consecutive. Only removes a synthesized cache
  * entry (resetAt == our block deadline); a real upstream 0% reading stays.
  */
-export function clearAntigravityStrikes(connectionId, model) {
+export function clearAntigravityStrikes(connectionId, model, attempt = null) {
   const key = `${connectionId}|${model}`;
+  const attemptState = activeStrikeAttempts.get(key);
+  const attemptMatches = attempt?.key === key && Number.isFinite(attempt.id);
+  const newerFailureId = getLatestFailureAttemptId(key);
+  const recordsNewAttemptSuccess = attemptMatches
+    && (!attemptState || attempt.id > attemptState.latestSuccessId);
+  // Attempt-aware callbacks may arrive late (especially stream completion).
+  // Always advance the success watermark, even when a newer failure must be
+  // retained: that newer failure does not make still-older errors current.
+  if (attempt && !recordsNewAttemptSuccess) return;
+  if (recordsNewAttemptSuccess) {
+    if (attemptState) attemptState.latestSuccessId = attempt.id;
+    if (attempt.id < newerFailureId) return;
+  }
+  // Legacy callers without attempt tokens use the coarse generation guard.
+  // Token-aware errors compare their own ID with latestSuccessId instead.
+  if (!attempt && pendingStrikeEvaluations.has(key)) {
+    strikeSuccessGenerations.set(key, (strikeSuccessGenerations.get(key) || 0) + 1);
+  }
   strikeCounts.delete(key);
+  strikeFailureAttempts.delete(key);
   const until = strikeBlocks.get(key);
   if (until === undefined) return;
   strikeBlocks.delete(key);
@@ -136,7 +232,19 @@ async function _doRefresh(connectionId, accessToken, providerSpecificData, now) 
  * Called from chat handler error path.
  * @returns {number|null} resetAt timestamp ms (for resetsAtMs passthrough) or null
  */
-export async function handleAntigravityQuotaError(connectionId, status, model, accessToken, providerSpecificData, signal = null) {
+export async function handleAntigravityQuotaError(connectionId, status, model, accessToken, providerSpecificData, signal = null, attempt = null) {
+  const key = `${connectionId}|${model}`;
+  const observedSuccessGeneration = beginStrikeEvaluation(key);
+  return evaluateAntigravityQuotaError(
+    connectionId, status, model, accessToken, providerSpecificData, signal,
+    key, observedSuccessGeneration, attempt,
+  ).finally(() => endStrikeEvaluation(key));
+}
+
+async function evaluateAntigravityQuotaError(
+  connectionId, status, model, accessToken, providerSpecificData, signal,
+  key, observedSuccessGeneration, attempt,
+) {
   log.info("AG_QUOTA", `${connectionId.slice(0, 8)} | ${status} on ${model} — refreshing quota`);
 
   // Throttle applies to error paths too: one quota request per account/30s.
@@ -157,8 +265,17 @@ export async function handleAntigravityQuotaError(connectionId, status, model, a
   // retry" was motivated by 409/429 pairs), and poisoning by transient 409s
   // requires 3 of them inside 60 seconds on the same pair.
   if (!quota || quota.remainingPercentage > 0) {
-    const key = `${connectionId}|${model}`;
+    const supersededAttempt = attempt?.key === key && isAntigravityQuotaAttemptSuperseded(attempt);
+    const supersededLegacyEvaluation = !attempt
+      && (strikeSuccessGenerations.get(key) || 0) !== observedSuccessGeneration;
+    if (supersededAttempt || supersededLegacyEvaluation) {
+      log.debug("AG_QUOTA", `${connectionId.slice(0, 8)} | ignore stale ${status} strike on ${model} after newer success`);
+      return null;
+    }
     const now = Date.now();
+    if (attempt?.key === key && Number.isFinite(attempt.id)) {
+      recordAntigravityQuotaAttemptFailure(attempt);
+    }
     const strike = strikeCounts.get(key);
     // Fixed window anchored at the FIRST qualifying strike: three 429s must
     // all land within 60s of that first one, not within 60s of each other.
@@ -183,7 +300,8 @@ export async function handleAntigravityQuotaError(connectionId, status, model, a
   }
 
   // Healthy-but-exhausted reading: clear strikes and use the exact resetAt.
-  strikeCounts.delete(`${connectionId}|${model}`);
+  strikeCounts.delete(key);
+  if (!strikeBlocks.has(key)) strikeFailureAttempts.delete(key);
   if (!quota.resetAt) return null;
 
   const resetMs = new Date(quota.resetAt).getTime();

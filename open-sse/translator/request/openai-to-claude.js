@@ -39,15 +39,22 @@ export function openaiToClaudeRequest(model, body, stream) {
   const systemParts = [];
 
   if (body.messages && Array.isArray(body.messages)) {
-    // Extract system messages
+    // Claude has one top-level instruction channel. OpenAI developer messages
+    // have system-level precedence, so preserve them there instead of silently
+    // treating them as assistant turns with no representable content blocks.
     for (const msg of body.messages) {
-      if (msg.role === ROLE.SYSTEM) {
-        systemParts.push(typeof msg.content === "string" ? msg.content : extractTextContent(msg.content, "\n"));
+      if (msg.role === ROLE.SYSTEM || msg.role === ROLE.DEVELOPER) {
+        const instruction = typeof msg.content === "string"
+          ? msg.content
+          : extractTextContent(msg.content, "\n");
+        if (typeof instruction === "string" && instruction.trim()) systemParts.push(instruction);
       }
     }
 
-    // Filter out system messages for separate processing
-    const nonSystemMessages = body.messages.filter(m => m.role !== ROLE.SYSTEM);
+    // Filter out instruction messages after moving them to top-level system.
+    const nonSystemMessages = body.messages.filter(
+      m => m.role !== ROLE.SYSTEM && m.role !== ROLE.DEVELOPER,
+    );
 
     // Process messages with merging logic
     // CRITICAL: tool_result must be in separate message immediately after tool_use

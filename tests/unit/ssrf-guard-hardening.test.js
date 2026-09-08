@@ -57,6 +57,40 @@ describe("assertPublicUrl: literal hostname/IP bypasses from #3714", () => {
     expect(() => assertPublicUrl("http://8.8.8.8/")).not.toThrow();
     expect(() => assertPublicUrl("https://[2001:4860:4860::8888]/")).not.toThrow();
   });
+
+  it("blocks all non-globally-reachable IPv4 ranges, not only RFC1918", () => {
+    for (const url of [
+      "http://192.0.0.1/",
+      "http://192.0.2.1/",
+      "http://198.18.0.1/",
+      "http://198.51.100.1/",
+      "http://203.0.113.1/",
+      "http://224.0.0.1/",
+      "http://255.255.255.255/",
+    ]) {
+      expect(() => assertPublicUrl(url), url).toThrow();
+    }
+  });
+
+  it("blocks non-global IPv6 special-purpose and documentation space", () => {
+    for (const url of [
+      "http://[::ffff:8.8.8.8]/",
+      "http://[64:ff9b::808:808]/",
+      "http://[100::1]/",
+      "http://[2001:db8::1]/",
+      "http://[2002:0808:0808::1]/",
+      "http://[3fff::1]/",
+      "http://[ff02::1]/",
+    ]) {
+      expect(() => assertPublicUrl(url), url).toThrow();
+    }
+  });
+
+  it("rejects non-http protocols before any fetch can occur", () => {
+    for (const url of ["file:///etc/passwd", "ftp://example.com/file", "gopher://example.com/"]) {
+      expect(() => assertPublicUrl(url), url).toThrow(/http/i);
+    }
+  });
 });
 
 describe("assertPublicUrlResolved: DNS-resolving hostname bypass from #3714", () => {
@@ -68,7 +102,7 @@ describe("assertPublicUrlResolved: DNS-resolving hostname bypass from #3714", ()
   });
 
   it("blocks a hostname that resolves to a private range even if one of several addresses is public", async () => {
-    lookupMock.mockResolvedValue([{ address: "203.0.113.5", family: 4 }, { address: "10.0.0.5", family: 4 }]);
+    lookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }, { address: "10.0.0.5", family: 4 }]);
     await expect(assertPublicUrlResolved("http://multi-a-record.example.test/")).rejects.toThrow();
   });
 
@@ -82,14 +116,10 @@ describe("assertPublicUrlResolved: DNS-resolving hostname bypass from #3714", ()
     await expect(assertPublicUrlResolved("https://example.com/")).resolves.not.toThrow();
   });
 
-  // Note: "fails open when the DNS lookup itself rejects" is deliberately not
-  // covered here as a vitest case — a mocked node:dns rejection in this file
-  // trips what looks like a vitest 4 / rolldown-transform source-map bug
-  // (the same rejection pattern passes in an isolated single-function probe
-  // module; only reproduces once mocked against this larger file). Verified
-  // instead with a standalone Node script exercising the real try/catch
-  // directly: dns.promises.lookup rejecting resolves assertPublicUrlResolved
-  // with undefined rather than propagating, exactly as the source shows.
+  it("fails closed when DNS returns no addresses", async () => {
+    lookupMock.mockResolvedValue([]);
+    await expect(assertPublicUrlResolved("https://empty.example.test/")).rejects.toThrow(/no addresses/i);
+  });
 
   it("skips DNS lookup entirely for literal IP hosts (already covered by the sync check)", async () => {
     await expect(assertPublicUrlResolved("http://127.0.0.1/")).rejects.toThrow();
@@ -106,7 +136,7 @@ describe("fetchPublic: redirect-target re-validation from #3714", () => {
     // synthetic *.example.test hostname a default public resolution so it
     // doesn't get blocked (or throw on an unmocked undefined return) before
     // reaching the redirect logic under test.
-    lookupMock.mockResolvedValue([{ address: "203.0.113.10", family: 4 }]);
+    lookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
   });
 
   it("blocks a redirect from a validated public URL to an internal target", async () => {
@@ -128,6 +158,45 @@ describe("fetchPublic: redirect-target re-validation from #3714", () => {
     expect(await res.text()).toBe("ok");
     expect(global.fetch).toHaveBeenCalledTimes(2);
     expect(global.fetch.mock.calls[1][0]).toBe("https://hop2.example.test/");
+    expect(global.fetch.mock.calls[0][1].dispatcher).toBeDefined();
+    expect(global.fetch.mock.calls[1][1].dispatcher).toBeDefined();
+  });
+
+  it("strips credentials before following a cross-origin redirect", async () => {
+    global.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 307, headers: { Location: "https://other.example.test/next" } }))
+      .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+
+    await fetchPublic("https://origin.example.test/start", {
+      headers: {
+        Authorization: "Bearer stored-provider-token",
+        Cookie: "session=secret",
+        "X-API-Key": "stored-api-key",
+        "Mcp-Session-Id": "mcp-session-secret",
+        "X-Custom-Token": "provider-custom-token",
+        Accept: "application/json",
+      },
+    });
+
+    const redirectedHeaders = global.fetch.mock.calls[1][1].headers;
+    expect(redirectedHeaders.get("authorization")).toBeNull();
+    expect(redirectedHeaders.get("cookie")).toBeNull();
+    expect(redirectedHeaders.get("x-api-key")).toBeNull();
+    expect(redirectedHeaders.get("mcp-session-id")).toBeNull();
+    expect(redirectedHeaders.get("x-custom-token")).toBeNull();
+    expect(redirectedHeaders.get("accept")).toBe("application/json");
+  });
+
+  it("keeps credentials on a same-origin redirect", async () => {
+    global.fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 307, headers: { Location: "/next" } }))
+      .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+
+    await fetchPublic("https://same.example.test/start", {
+      headers: { Authorization: "Bearer provider-token" },
+    });
+
+    expect(global.fetch.mock.calls[1][1].headers.get("authorization")).toBe("Bearer provider-token");
   });
 
   it("bounds the redirect chain instead of looping forever", async () => {

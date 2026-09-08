@@ -20,6 +20,12 @@ function hasText(content) {
   );
 }
 
+function hasServerToolUse(content) {
+  return Array.isArray(content) && content.some(block =>
+    block?.type === CLAUDE_BLOCK.SERVER_TOOL_USE && block.id
+  );
+}
+
 export function applyAssistantPrefillPolicy(body, rawHeaders = null) {
   if (!Array.isArray(body?.messages)) return body;
   // Explicit compatibility escape hatch: preserving assistant prefill bypasses
@@ -41,6 +47,16 @@ export function applyAssistantPrefillPolicy(body, rawHeaders = null) {
         is_error: true,
         content: INCOMPLETE_TOOL_RESULT,
       })),
+    });
+    return body;
+  }
+
+  // A valid Anthropic server tool block is provider-owned history. Keep it,
+  // but still restore the terminal-user invariant used for the next request.
+  if (hasServerToolUse(trailingAssistant.content)) {
+    body.messages.push({
+      role: ROLE.USER,
+      content: [{ type: CLAUDE_BLOCK.TEXT, text: ASSISTANT_CONTINUATION_PROMPT }],
     });
     return body;
   }

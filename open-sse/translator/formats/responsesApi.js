@@ -31,9 +31,22 @@ export const MAX_RESPONSES_CALL_ID_LEN = 64;
 // function_call ↔ function_call_output correlation never collides.
 let responsesCallIdSeq = 0;
 
+function hashResponsesCallId(value) {
+  // 64-bit FNV-1a keeps the mapping synchronous and runtime-portable while
+  // making ids with the same long prefix distinguishable.
+  let hash = 0xcbf29ce484222325n;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= BigInt(value.charCodeAt(index));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
 export function clampResponsesCallId(id) {
   if (typeof id !== "string" || !id) return `call_${Date.now()}_${(responsesCallIdSeq += 1)}`;
-  return id.length > MAX_RESPONSES_CALL_ID_LEN ? id.substring(0, MAX_RESPONSES_CALL_ID_LEN) : id;
+  if (id.length <= MAX_RESPONSES_CALL_ID_LEN) return id;
+  const suffix = `_${hashResponsesCallId(id)}`;
+  return `${id.substring(0, MAX_RESPONSES_CALL_ID_LEN - suffix.length)}${suffix}`;
 }
 
 // Single-stringify: objects → JSON once; valid JSON strings pass through untouched;

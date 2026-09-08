@@ -17,11 +17,27 @@ const projectIdCache = new Map();
 const CACHE_TTL_MS = 60 * 60 * 1000;
 
 // ─── Pending-fetch deduplication ─────────────────────────────────────────────
-// connectionId -> { promise: Promise<string|null>, controller: AbortController, startedAt: number }
+// connectionId -> { promise, controller, startedAt, deadlineTimer }
 const pendingFetches = new Map();
 
 /** Abort and evict a pending fetch that has been running longer than this (2 min). */
-const PENDING_TTL_MS = 2 * 60 * 1000;
+export const PROJECT_ID_SHARED_FETCH_TIMEOUT_MS = 2 * 60 * 1000;
+
+/**
+ * Maximum time a request waits for a cold project-ID lookup.  The shared fetch
+ * deliberately outlives an individual request so another caller can reuse it
+ * and its successful result can still warm the cache.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_REQUEST_TIMEOUT_MS = 30_000;
+
+function configuredRequestTimeoutMs() {
+    const configured = Number(process.env.PROJECT_ID_REQUEST_TIMEOUT_MS);
+    if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_REQUEST_TIMEOUT_MS;
+    return Math.min(Math.trunc(configured), MAX_REQUEST_TIMEOUT_MS);
+}
+
+export const PROJECT_ID_REQUEST_TIMEOUT_MS = configuredRequestTimeoutMs();
 
 // ─── Periodic cleanup ────────────────────────────────────────────────────────
 /** How often the background sweep runs (10 min). */
@@ -44,8 +60,9 @@ export function cleanupNow() {
             pendingFetches.delete(id);
             continue;
         }
-        if (now - item.startedAt > PENDING_TTL_MS) {
+        if (now - item.startedAt > PROJECT_ID_SHARED_FETCH_TIMEOUT_MS) {
             try { item.controller.abort(); } catch (_) { /* ignore */ }
+            clearTimeout(item.deadlineTimer);
             pendingFetches.delete(id);
         }
     }
@@ -81,10 +98,16 @@ startCacheCleanup();
  *
  * @param {string} connectionId - The connection identifier for cache keying
  * @param {string} accessToken  - Valid OAuth access token
+ * @param {{ signal?: AbortSignal, timeoutMs?: number }} [options]
  * @returns {Promise<string|null>} Real project ID or null
  */
-export async function getProjectIdForConnection(connectionId, accessToken, provider = "gemini-cli") {
+export async function getProjectIdForConnection(connectionId, accessToken, provider = "gemini-cli", options = {}) {
     if (!connectionId || !accessToken) return null;
+
+    const signal = options?.signal;
+    if (signal?.aborted) {
+        throw signal.reason ?? new DOMException("Request aborted", "AbortError");
+    }
 
     // Return cached value if still fresh
     const cached = projectIdCache.get(connectionId);
@@ -94,16 +117,23 @@ export async function getProjectIdForConnection(connectionId, accessToken, provi
 
     // Deduplicate concurrent fetches for the same connection
     if (pendingFetches.has(connectionId)) {
-        return pendingFetches.get(connectionId).promise;
+        return waitForCaller(pendingFetches.get(connectionId).promise, options);
     }
 
     // Each fetch gets its own AbortController so it can be canceled via removeConnection()
     const controller = new AbortController();
+    const pending = { promise: null, controller, startedAt: Date.now(), deadlineTimer: null };
 
-    const promise = (async () => {
+    pending.promise = (async () => {
         try {
             const projectId = await fetchProjectId(accessToken, controller.signal, provider);
             if (projectId) {
+                // A fetch implementation may ignore AbortSignal.  If this
+                // connection was removed or replaced, its stale result must
+                // not repopulate/overwrite the cache.
+                if (controller.signal.aborted || pendingFetches.get(connectionId) !== pending) {
+                    return null;
+                }
                 projectIdCache.set(connectionId, {projectId, fetchedAt: Date.now()});
                 return projectId;
             }
@@ -113,12 +143,70 @@ export async function getProjectIdForConnection(connectionId, accessToken, provi
             console.warn(`[ProjectId] Error fetching project ID: ${error.message}`);
             return null;
         } finally {
-            pendingFetches.delete(connectionId);
+            clearTimeout(pending.deadlineTimer);
+            // removeConnection()/cleanupNow() may have evicted this fetch and a
+            // newer request may already own the same key.  Never delete it.
+            if (pendingFetches.get(connectionId) === pending) {
+                pendingFetches.delete(connectionId);
+            }
         }
     })();
 
-    pendingFetches.set(connectionId, {promise, controller, startedAt: Date.now()});
-    return promise;
+    // Caller aborts/timeouts intentionally do not cancel this connection-scoped
+    // operation. Google onboarding is expensive and rate limited; allowing one
+    // bounded fetch to finish avoids retry storms and warms the next request.
+    // The exact deadline complements the coarse periodic cleanup sweep.
+    pending.deadlineTimer = setTimeout(
+        () => {
+            controller.abort();
+            if (pendingFetches.get(connectionId) === pending) {
+                pendingFetches.delete(connectionId);
+            }
+        },
+        PROJECT_ID_SHARED_FETCH_TIMEOUT_MS
+    );
+    pending.deadlineTimer?.unref?.();
+    pendingFetches.set(connectionId, pending);
+    return waitForCaller(pending.promise, options);
+}
+
+/**
+ * Bound one caller's wait without cancelling the connection-scoped fetch.
+ * A request abort is observable by the HTTP handler; a lookup timeout is a
+ * cache miss so existing provider fallback behavior remains intact.
+ */
+function waitForCaller(promise, { signal, timeoutMs } = {}) {
+    const requestedTimeout = Number(timeoutMs);
+    const waitMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+        ? Math.min(Math.trunc(requestedTimeout), MAX_REQUEST_TIMEOUT_MS)
+        : PROJECT_ID_REQUEST_TIMEOUT_MS;
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
+            fn(value);
+        };
+        const onAbort = () => finish(
+            reject,
+            signal.reason ?? new DOMException("Request aborted", "AbortError")
+        );
+        const timer = setTimeout(() => finish(resolve, null), waitMs);
+        timer?.unref?.();
+
+        if (signal?.aborted) {
+            onAbort();
+            return;
+        }
+        signal?.addEventListener("abort", onAbort, { once: true });
+        Promise.resolve(promise).then(
+            value => finish(resolve, value),
+            error => finish(reject, error)
+        );
+    });
 }
 
 /**
@@ -141,6 +229,7 @@ export function removeConnection(connectionId) {
     const pending = pendingFetches.get(connectionId);
     if (pending) {
         try { pending.controller.abort(); } catch (_) { /* ignore */ }
+        clearTimeout(pending.deadlineTimer);
         pendingFetches.delete(connectionId);
     }
 }

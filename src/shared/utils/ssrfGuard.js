@@ -19,9 +19,23 @@
 // same address to hex form ("::ffff:7f00:1") — a mismatch, not an oversight.
 
 import dns from "node:dns";
+import { Agent } from "undici";
 
 const BLOCKED_HOSTNAMES = new Set(["localhost", "ip6-localhost", "ip6-loopback"]);
 const BLOCKED_SUFFIXES = [".internal", ".local", ".localhost"];
+const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
+const SENSITIVE_REDIRECT_HEADERS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "cookie2",
+  "api-key",
+  "x-api-key",
+  "x-goog-api-key",
+  "x-key",
+  "xi-api-key",
+  "x-subscription-token",
+]);
 
 // Parse dotted IPv4 to 32-bit integer, or null if not a valid IPv4 literal.
 function ipv4ToInt(host) {
@@ -37,7 +51,10 @@ function ipv4ToInt(host) {
   return value >>> 0;
 }
 
-// Private/reserved IPv4 ranges as [startInt, maskBits].
+// IPv4 ranges that are not globally reachable, expressed as [startInt, maskBits].
+// Keep this broader than RFC1918: benchmark, documentation, protocol-assignment,
+// multicast, reserved and broadcast space can all be routed inside a host/VPC and
+// therefore are SSRF targets too.
 const BLOCKED_V4_RANGES = [
   [ipv4ToInt("0.0.0.0"), 8],
   [ipv4ToInt("10.0.0.0"), 8],
@@ -45,7 +62,18 @@ const BLOCKED_V4_RANGES = [
   [ipv4ToInt("127.0.0.0"), 8],
   [ipv4ToInt("169.254.0.0"), 16], // includes 169.254.169.254 cloud metadata
   [ipv4ToInt("172.16.0.0"), 12],
+  [ipv4ToInt("192.0.0.0"), 24], // IETF protocol assignments
+  [ipv4ToInt("192.0.2.0"), 24], // TEST-NET-1
+  [ipv4ToInt("192.31.196.0"), 24], // special-purpose AS112 service
+  [ipv4ToInt("192.52.193.0"), 24], // AMT special-purpose relay anycast
+  [ipv4ToInt("192.88.99.0"), 24], // deprecated 6to4 relay anycast
   [ipv4ToInt("192.168.0.0"), 16],
+  [ipv4ToInt("192.175.48.0"), 24], // special-purpose AS112 service
+  [ipv4ToInt("198.18.0.0"), 15], // network benchmark range
+  [ipv4ToInt("198.51.100.0"), 24], // TEST-NET-2
+  [ipv4ToInt("203.0.113.0"), 24], // TEST-NET-3
+  [ipv4ToInt("224.0.0.0"), 4], // multicast
+  [ipv4ToInt("240.0.0.0"), 4], // reserved + limited broadcast
 ];
 
 function isBlockedIpv4Int(ip) {
@@ -117,6 +145,9 @@ function parseIPv6ToGroups(rawHost) {
 }
 
 function isBlockedIpv6Groups(g) {
+  if (!Array.isArray(g) || g.length !== 8 || g.some((x) => !Number.isInteger(x) || x < 0 || x > 0xffff)) {
+    return true;
+  }
   const isZero = (n) => g[n] === 0;
   // loopback ::1
   if ([0, 1, 2, 3, 4, 5, 6].every(isZero) && g[7] === 1) return true;
@@ -126,16 +157,37 @@ function isBlockedIpv6Groups(g) {
   if ((g[0] & 0xffc0) === 0xfe80) return true;
   // unique local fc00::/7
   if ((g[0] & 0xfe00) === 0xfc00) return true;
-  // IPv4-mapped ::ffff:0:0/96 (0:0:0:0:0:ffff:a.b.c.d — the 0xffff marker is
-  // group index 5) and NAT64 well-known prefix 64:ff9b::/96 — both embed a
-  // real IPv4 address in the low 32 bits; check it against the same IPv4
-  // blocklist regardless of which prefix wraps it.
-  const low32 = ((g[6] << 16) | g[7]) >>> 0;
-  if ([0, 1, 2, 3, 4].every(isZero) && g[5] === 0xffff) return isBlockedIpv4Int(low32);
-  if (g[0] === 0x0064 && g[1] === 0xff9b && [2, 3, 4, 5].every(isZero)) return isBlockedIpv4Int(low32);
-  // IPv4-compatible ::a.b.c.d/96 (deprecated, still parseable) — excludes :: and ::1
-  // which already matched above.
-  if ([0, 1, 2, 3, 4, 5].every(isZero) && low32 !== 0 && low32 !== 1) return isBlockedIpv4Int(low32);
+  // IPv4-mapped/compatible and NAT64 literals are special-purpose IPv6 space.
+  // Reject the whole prefixes instead of relying on the host's translation
+  // configuration, even when the embedded IPv4 value looks public.
+  if ([0, 1, 2, 3, 4].every(isZero) && g[5] === 0xffff) return true;
+  if ([0, 1, 2, 3, 4, 5].every(isZero)) return true;
+  if (g[0] === 0x0064 && g[1] === 0xff9b) return true;
+
+  // Current globally routable unicast allocations are within 2000::/3. Fail
+  // closed for unallocated/special space, then exclude special ranges inside
+  // that aggregate (IETF assignments, documentation, 6to4 and doc-prefix v2).
+  if ((g[0] & 0xe000) !== 0x2000) return true;
+  if (g[0] === 0x2001 && (g[1] & 0xfe00) === 0) return true; // 2001::/23
+  if (g[0] === 0x2001 && g[1] === 0x0db8) return true; // documentation
+  if (g[0] === 0x2002) return true; // deprecated 6to4
+  if (g[0] === 0x3fff && (g[1] & 0xf000) === 0) return true; // documentation
+  return false;
+}
+
+// Canonical address classifier for callers that already performed DNS lookup
+// and need to pin their own connection. Unknown families and malformed records
+// fail closed.
+export function isPublicIpAddress(address, family) {
+  const normalized = String(address || "").toLowerCase().replace(/^\[|\]$/g, "");
+  const numericFamily = Number(family) || 0;
+  if (numericFamily === 4) {
+    return ipv4ToInt(normalized) !== null && !isBlockedIpv4(normalized);
+  }
+  if (numericFamily === 6) {
+    const groups = parseIPv6ToGroups(normalized);
+    return groups !== null && !isBlockedIpv6Groups(groups);
+  }
   return false;
 }
 
@@ -161,8 +213,50 @@ function isBlockedHost(host) {
 // resolution — see assertPublicUrlResolved for that). Caller should map to 400.
 export function assertPublicUrl(rawUrl) {
   const parsed = new URL(rawUrl);
+  if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
+    throw new Error("Blocked URL: only http(s) is allowed");
+  }
   const host = normalizeHost(parsed.hostname);
   if (isBlockedHost(host)) throw new Error("Blocked URL: internal host");
+}
+
+async function resolvePublicUrl(rawUrl) {
+  const parsed = new URL(rawUrl);
+  if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
+    throw new Error("Blocked URL: only http(s) is allowed");
+  }
+
+  const host = normalizeHost(parsed.hostname);
+  if (isBlockedHost(host)) throw new Error("Blocked URL: internal host");
+
+  // Already a literal IPv4/IPv6 address. Return it so fetchPublic can pin the
+  // connection without asking the system resolver again.
+  const bracketless = host.replace(/^\[|\]$/g, "");
+  if (ipv4ToInt(bracketless) !== null) {
+    return { parsed, host, addresses: [{ address: bracketless, family: 4 }] };
+  }
+  if (bracketless.includes(":")) {
+    return { parsed, host, addresses: [{ address: bracketless, family: 6 }] };
+  }
+
+  let addresses;
+  try {
+    addresses = await dns.promises.lookup(host, { all: true, verbatim: true });
+  } catch (error) {
+    // Fail closed. Letting fetch resolve the hostname again after our lookup
+    // failed would bypass both address validation and DNS pinning.
+    throw new Error("Blocked URL: DNS resolution failed", { cause: error });
+  }
+  if (!Array.isArray(addresses) || addresses.length === 0) {
+    throw new Error("Blocked URL: DNS returned no addresses");
+  }
+
+  for (const { address, family } of addresses) {
+    if (!isPublicIpAddress(address, family)) {
+      throw new Error("Blocked URL: hostname resolves to an internal host");
+    }
+  }
+  return { parsed, host, addresses };
 }
 
 // Async: assertPublicUrl plus DNS resolution of non-literal hostnames, so a
@@ -170,28 +264,60 @@ export function assertPublicUrl(rawUrl) {
 // services like nip.io/sslip.io, or an attacker-controlled domain with an A record
 // pointed at 127.0.0.1) is rejected too, not just IPs typed directly into the URL.
 export async function assertPublicUrlResolved(rawUrl) {
-  const parsed = new URL(rawUrl);
-  const host = normalizeHost(parsed.hostname);
-  if (isBlockedHost(host)) throw new Error("Blocked URL: internal host");
+  await resolvePublicUrl(rawUrl);
+}
 
-  // Already a literal IPv4/IPv6 address — isBlockedHost above already covered it,
-  // no DNS lookup applies (and dns.lookup would just echo it back anyway).
-  const bracketless = host.replace(/^\[|\]$/g, "");
-  if (ipv4ToInt(bracketless) !== null || bracketless.includes(":")) return;
+function createPinnedDispatcher(host, addresses) {
+  return new Agent({
+    connect: {
+      lookup(requestedHost, options, callback) {
+        if (normalizeHost(requestedHost) !== host) {
+          callback(new Error("Blocked URL: unexpected DNS lookup"));
+          return;
+        }
 
-  let addresses;
-  try {
-    addresses = await dns.promises.lookup(host, { all: true, verbatim: true });
-  } catch {
-    // Resolution failure isn't an SSRF signal by itself — let the subsequent
-    // fetch() fail with its own (clearer) network error.
-    return;
+        const requestedFamily = Number(options?.family) || 0;
+        const eligible = requestedFamily
+          ? addresses.filter(({ family }) => family === requestedFamily)
+          : addresses;
+        const records = eligible.length > 0 ? eligible : addresses;
+        if (options?.all) {
+          callback(null, records.map(({ address, family }) => ({ address, family })));
+          return;
+        }
+        callback(null, records[0].address, records[0].family);
+      },
+    },
+  });
+}
+
+function stripSensitiveRedirectHeaders(headers) {
+  const sanitized = new Headers(headers || {});
+  // Snapshot keys before deleting: mutating a live Headers iterator can skip
+  // the entry immediately after a deletion.
+  for (const name of Array.from(sanitized.keys())) {
+    const normalized = name.toLowerCase();
+    const isSensitive = SENSITIVE_REDIRECT_HEADERS.has(normalized)
+      || normalized.includes("token")
+      || normalized.includes("secret")
+      || normalized.includes("password")
+      || normalized.includes("credential")
+      || normalized.includes("api-key")
+      || normalized.includes("apikey")
+      || normalized.includes("session")
+      || normalized.includes("jwt")
+      || normalized === "key"
+      || normalized.endsWith("-key")
+      || /(^|[-_])auth(?:entication|orization)?([-_]|$)/.test(normalized);
+    if (isSensitive) sanitized.delete(name);
   }
-  for (const { address, family } of addresses) {
-    if (family === 4 ? isBlockedIpv4(address) : isBlockedIpv6Groups(parseIPv6ToGroups(address) || [])) {
-      throw new Error("Blocked URL: hostname resolves to an internal host");
-    }
-  }
+  return sanitized;
+}
+
+function switchRedirectToGet(status, method) {
+  const normalizedMethod = (method || "GET").toUpperCase();
+  return status === 303 && normalizedMethod !== "HEAD"
+    || (status === 301 || status === 302) && normalizedMethod === "POST";
 }
 
 // fetch() with SSRF-safe manual redirect handling: each hop's target is
@@ -200,16 +326,47 @@ export async function assertPublicUrlResolved(rawUrl) {
 // maxRedirects hops (fetch's own default following behavior has no bound
 // relevant here since we never let it auto-follow).
 export async function fetchPublic(url, init = {}, { maxRedirects = 5 } = {}) {
-  await assertPublicUrlResolved(url);
-  let currentUrl = url;
+  let currentUrl = new URL(url).toString();
+  let currentInit = { ...init, headers: new Headers(init.headers || {}) };
   for (let hop = 0; ; hop++) {
-    const res = await fetch(currentUrl, { ...init, redirect: "manual" });
+    const { parsed, host, addresses } = await resolvePublicUrl(currentUrl);
+    const dispatcher = createPinnedDispatcher(host, addresses);
+    let res;
+    try {
+      res = await fetch(currentUrl, { ...currentInit, redirect: "manual", dispatcher });
+    } catch (error) {
+      await dispatcher.close().catch(() => {});
+      throw error;
+    }
     const isRedirect = res.status >= 300 && res.status < 400;
     const location = isRedirect ? res.headers.get("location") : null;
-    if (!location) return res;
+    if (!location) {
+      // close() drains once the response body is consumed; do not await it here,
+      // because the caller owns the body returned below.
+      dispatcher.close().catch(() => {});
+      return res;
+    }
+
+    try { await res.body?.cancel(); } catch { /* ignore redirect-body cleanup errors */ }
+    await dispatcher.close().catch(() => {});
     if (hop >= maxRedirects) throw new Error("Blocked URL: too many redirects");
+
     const nextUrl = new URL(location, currentUrl).toString();
-    await assertPublicUrlResolved(nextUrl);
+    const nextParsed = new URL(nextUrl);
+    let nextHeaders = currentInit.headers;
+    if (nextParsed.origin !== parsed.origin) {
+      nextHeaders = stripSensitiveRedirectHeaders(nextHeaders);
+    }
+
+    if (switchRedirectToGet(res.status, currentInit.method)) {
+      nextHeaders = new Headers(nextHeaders);
+      nextHeaders.delete("content-length");
+      nextHeaders.delete("content-type");
+      nextHeaders.delete("transfer-encoding");
+      currentInit = { ...currentInit, method: "GET", body: undefined, headers: nextHeaders };
+    } else {
+      currentInit = { ...currentInit, headers: nextHeaders };
+    }
     currentUrl = nextUrl;
   }
 }

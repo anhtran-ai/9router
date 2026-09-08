@@ -15,24 +15,7 @@ export function parseDataUri(url) {
 import { lookup } from "node:dns/promises";
 import { Agent } from "undici";
 import { MAX_IMAGE_BYTES, FETCH_TIMEOUT_MS, IMAGE_SIGNATURES, BLOCKED_HOSTS } from "../../config/mediaConfig.js";
-
-// True if an IPv4/IPv6 address is private/reserved (SSRF target).
-function isPrivateIp(ip) {
-  if (!ip) return true;
-  // IPv6 loopback / unique-local / link-local
-  if (ip === "::1" || ip.startsWith("fc") || ip.startsWith("fd") || ip.startsWith("fe80")) return true;
-  // IPv4-mapped IPv6 (::ffff:a.b.c.d) -> extract tail
-  const v4 = ip.includes(".") ? ip.split(":").pop() : ip;
-  const parts = v4.split(".").map((n) => Number.parseInt(n, 10));
-  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return ip.includes(":") ? false : true;
-  const [a, b] = parts;
-  if (a === 10 || a === 127 || a === 0) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 169 && b === 254) return true; // link-local + cloud metadata
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  return false;
-}
+import { isPublicIpAddress } from "../../../src/shared/utils/ssrfGuard.js";
 
 // Resolve host once and return only public IPs (SSRF guard).
 // Rejects if any resolved record is private/reserved (defeats multi-A tricks).
@@ -40,7 +23,7 @@ async function resolvePinnedIps(hostname) {
   if (!hostname || BLOCKED_HOSTS.has(hostname.toLowerCase())) return null;
   try {
     const records = await lookup(hostname, { all: true });
-    if (!records.length || records.some((r) => isPrivateIp(r.address))) return null;
+    if (!records.length || records.some((r) => !isPublicIpAddress(r.address, r.family))) return null;
     return records;
   } catch {
     return null;
@@ -85,21 +68,41 @@ export async function fetchImageAsBase64(imageUrl, options = {}) {
   if (!pinnedIps) return null;
 
   const controller = new AbortController();
-  const timeout = signal ? null : setTimeout(() => controller.abort(), timeoutMs);
-  const fetchSignal = signal || controller.signal;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const fetchSignal = signal
+    ? AbortSignal.any([signal, controller.signal])
+    : controller.signal;
 
   // Pin connect to the validated IP so no second DNS resolution can rebind (TOCTOU fix).
   const dispatcher = new Agent({
-    connect: { lookup: (_h, _o, cb) => cb(null, [{ address: pinnedIps[0].address, family: pinnedIps[0].family }]) },
+    connect: {
+      lookup: (_host, lookupOptions, callback) => {
+        const requestedFamily = Number(lookupOptions?.family) || 0;
+        const eligible = requestedFamily
+          ? pinnedIps.filter(({ family }) => family === requestedFamily)
+          : pinnedIps;
+        const records = eligible.length > 0 ? eligible : pinnedIps;
+        if (lookupOptions?.all) {
+          callback(null, records.map(({ address, family }) => ({ address, family })));
+        } else {
+          callback(null, records[0].address, records[0].family);
+        }
+      },
+    },
   });
 
+  let response;
+  let reader;
   try {
     // redirect:"manual" prevents a public URL redirecting to a private one (SSRF bypass).
-    const response = await fetch(imageUrl, { signal: fetchSignal, redirect: "manual", dispatcher });
-    if (!response.ok || !response.body) return null;
+    response = await fetch(imageUrl, { signal: fetchSignal, redirect: "manual", dispatcher });
+    if (!response.ok || !response.body) {
+      try { await response.body?.cancel(); } catch { /* best-effort connection release */ }
+      return null;
+    }
 
     // Stream-read with a hard byte cap to avoid loading huge payloads into memory.
-    const reader = response.body.getReader();
+    reader = response.body.getReader();
     const chunks = [];
     let total = 0;
     while (true) {
@@ -116,9 +119,13 @@ export async function fetchImageAsBase64(imageUrl, options = {}) {
 
     return { url: `data:${mimeType};base64,${buf.toString("base64")}`, mimeType };
   } catch {
+    try {
+      if (reader) await reader.cancel();
+      else await response?.body?.cancel();
+    } catch { /* best-effort connection release */ }
     return null;
   } finally {
-    if (timeout) clearTimeout(timeout);
-    dispatcher.close().catch(() => {});
+    clearTimeout(timeout);
+    await dispatcher.close().catch(() => {});
   }
 }

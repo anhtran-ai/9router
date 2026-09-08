@@ -44,6 +44,34 @@ describe("contributor invite store", () => {
     expect(persisted.tokenHash).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(persisted)).not.toContain(rawSecret);
     expect(persisted.allowedProviders).toEqual(["claude", "codex"]);
+    expect(persisted.providerBaseUrls).toEqual({});
+  });
+
+  it("stores a normalized administrator-approved GitLab base URL on the invite", async () => {
+    const { invite } = await store.createContributorInvite({
+      alias: "self-hosted-gitlab",
+      allowedProviders: ["gitlab"],
+      providerBaseUrls: { gitlab: "http://127.0.0.1:8929/gitlab/" },
+    });
+
+    const persisted = JSON.parse(rows.get(`contributor_invites:${invite.id}`));
+    expect(persisted.providerBaseUrls).toEqual({
+      gitlab: "http://127.0.0.1:8929/gitlab",
+    });
+  });
+
+  it.each([
+    "file:///etc/passwd",
+    "https://user:password@gitlab.example",
+    "https://gitlab.example?redirect=http://127.0.0.1",
+    "https://gitlab.example/#fragment",
+  ])("rejects an unsafe administrator-supplied GitLab base URL: %s", async (gitlab) => {
+    await expect(store.createContributorInvite({
+      alias: "unsafe-gitlab",
+      allowedProviders: ["gitlab"],
+      providerBaseUrls: { gitlab },
+    })).rejects.toThrow(/GitLab contributor base URL/);
+    expect(rows.size).toBe(0);
   });
 
   it("allows a token to be claimed only once", async () => {

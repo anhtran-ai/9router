@@ -33,6 +33,38 @@ describe("OpenAI → Claude context mapping", () => {
     }));
   });
 
+  it("preserves developer instructions in Claude's top-level system channel", () => {
+    const out = T({
+      messages: [
+        { role: "system", content: "System rule" },
+        { role: "developer", content: "Developer rule" },
+        { role: "user", content: "Question" },
+      ],
+    });
+    const systemText = out.system.map(block => block.text || "").join("\n");
+
+    expect(systemText).toContain("System rule");
+    expect(systemText).toContain("Developer rule");
+    expect(systemText.indexOf("System rule")).toBeLessThan(systemText.indexOf("Developer rule"));
+    expect(out.messages).toEqual([
+      expect.objectContaining({ role: "user" }),
+    ]);
+  });
+
+  it("drops empty developer instructions instead of emitting invalid system text", () => {
+    const out = T({
+      messages: [
+        { role: "developer", content: [{ type: "text", text: "   " }] },
+        { role: "user", content: "Question" },
+      ],
+    });
+
+    expect(out.system.every(block => typeof block.text !== "string" || block.text.trim())).toBe(true);
+    expect(out.messages).toEqual([
+      expect.objectContaining({ role: "user" }),
+    ]);
+  });
+
   it("tool_choice=none is not turned into auto", () => {
     const out = T({
       messages: [{ role: "user", content: "hi" }],

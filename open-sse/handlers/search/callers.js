@@ -64,31 +64,44 @@ export function getProviderSetting(params, key) {
 }
 
 /**
- * Resolve base URL with optional override from providerOptions.baseUrl.
+ * Resolve base URL with optional override.
  *
- * The override is client-controlled and therefore SSRF-hardened: only public
- * http(s) URLs are accepted (internal/private/loopback/metadata addresses are
- * rejected via assertPublicUrl). The provider's own configured baseUrl is
- * trusted as-is (admin-controlled).
+ * A providerOptions override is client-controlled. It may be used only by an
+ * unauthenticated provider (for example a public SearXNG instance); otherwise
+ * it could redirect the stored provider token to an attacker. The persisted
+ * providerSpecificData override is admin-controlled and remains supported.
  *
  * @param {SearchProviderConfig} config
  * @param {SearchRequestParams} params
  * @returns {string}
  */
 export function resolveBaseUrl(config, params) {
-  const override = getProviderSetting(params, "baseUrl");
-  if (override) {
+  const requestedBaseUrl = params.providerOptions?.baseUrl;
+  const clientOverride = typeof requestedBaseUrl === "string" && requestedBaseUrl.trim()
+    ? requestedBaseUrl.trim()
+    : undefined;
+  if (clientOverride && params.token) {
+    throw new Error("provider_options.baseUrl is not allowed for authenticated providers");
+  }
+
+  const persistedBaseUrl = params.providerSpecificData?.baseUrl;
+  const persistedOverride = typeof persistedBaseUrl === "string" && persistedBaseUrl.trim()
+    ? persistedBaseUrl.trim()
+    : undefined;
+  const override = clientOverride || persistedOverride;
+
+  if (clientOverride) {
     // SSRF guard: client-supplied base URLs must be public http(s) only.
     let parsed;
     try {
-      parsed = new URL(override);
+      parsed = new URL(clientOverride);
     } catch {
-      throw new Error(`Invalid baseUrl: ${override}`);
+      throw new Error(`Invalid baseUrl: ${clientOverride}`);
     }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       throw new Error(`Invalid baseUrl protocol: ${parsed.protocol}`);
     }
-    assertPublicUrl(override);
+    assertPublicUrl(clientOverride);
   }
   return (override || config.baseUrl).replace(/\/+$/, "");
 }

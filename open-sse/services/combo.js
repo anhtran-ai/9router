@@ -525,14 +525,32 @@ const FUSION_DEFAULTS = {
   panelHardTimeoutMs: 90000, // absolute cap so one hung model can't stall forever
 };
 
-// Resolve a Response (or {__error}) within ms; the loser keeps running but is ignored.
-function withTimeout(promise, ms) {
-  return new Promise((resolve) => {
-    const t = setTimeout(() => resolve({ __timeout: true }), ms);
-    Promise.resolve(promise)
-      .then((v) => { clearTimeout(t); resolve(v); })
-      .catch((e) => { clearTimeout(t); resolve({ __error: e }); });
+// Resolve a Response (or {__error}) within ms and signal the underlying call
+// when it loses the timeout race. The promise remains observed so a late abort
+// rejection cannot become unhandled.
+function withTimeout(promise, ms, onTimeout) {
+  let cancel;
+  const wrapped = new Promise((resolve) => {
+    let finished = false;
+    let timer = null;
+    const finish = (value) => {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      resolve(value);
+    };
+    cancel = () => finish({ __cancelled: true });
+    timer = setTimeout(() => {
+      try { onTimeout?.(); } finally { finish({ __timeout: true }); }
+    }, ms);
+    // Keep observing the provider even after cancel() settles this wrapper so
+    // an abort-ignoring call cannot produce an unhandled late rejection.
+    Promise.resolve(promise).then(
+      (value) => finish(value),
+      (error) => finish({ __error: error }),
+    );
   });
+  return { promise: wrapped, cancel: () => cancel?.() };
 }
 
 /**
@@ -542,21 +560,25 @@ function withTimeout(promise, ms) {
  * still preferring a full panel when everyone is fast. Bounded by a hard timeout.
  * Returns a sparse array aligned to `calls` (undefined = not yet / dropped).
  */
-function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs }) {
+function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs, signal, onFinish }) {
   return new Promise((resolve) => {
     const out = new Array(calls.length);
     let settled = 0;
     let ok = 0;
     let finished = false;
     let graceTimer = null;
+    let hardTimer = null;
     const finish = () => {
       if (finished) return;
       finished = true;
       clearTimeout(hardTimer);
       if (graceTimer) clearTimeout(graceTimer);
-      resolve(out);
+      signal?.removeEventListener("abort", finish);
+      try { onFinish?.(); } finally { resolve(out); }
     };
-    const hardTimer = setTimeout(finish, panelHardTimeoutMs);
+    hardTimer = setTimeout(finish, panelHardTimeoutMs);
+    if (signal?.aborted) finish();
+    else signal?.addEventListener("abort", finish, { once: true });
     calls.forEach((p, i) => {
       Promise.resolve(p)
         .then((v) => { out[i] = v; })
@@ -587,7 +609,7 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs })
  * @param {Object} options
  * @param {Object} options.body - Request body (client format)
  * @param {string[]} options.models - Panel model strings
- * @param {Function} options.handleSingleModel - (body, modelStr) => Promise<Response>
+ * @param {Function} options.handleSingleModel - (body, modelStr, isPanel, panelSignal) => Promise<Response>
  * @param {Object} options.log - Logger
  * @param {string} [options.comboName] - Combo name (logging)
  * @param {string} [options.judgeModel] - Judge model; falls back to panel[0]
@@ -629,8 +651,36 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   }
 
   const t0 = Date.now();
-  const calls = panel.map((m) => withTimeout(handleSingleModel(panelBody, m, true), cfg.panelHardTimeoutMs));
-  const settled = await collectPanel(calls, { ...cfg, minPanel });
+  const panelTasks = panel.map((m) => {
+    const controller = new AbortController();
+    const panelSignal = controller.signal;
+    const task = { controller, settled: false, promise: null, cancel: null };
+    // Defer invocation into a promise so synchronous provider errors are
+    // isolated to that panel member instead of aborting the whole fan-out.
+    const call = Promise.resolve().then(() => handleSingleModel(panelBody, m, true, panelSignal));
+    const timed = withTimeout(call, cfg.panelHardTimeoutMs, () => controller.abort());
+    task.cancel = timed.cancel;
+    task.promise = timed.promise
+      .finally(() => {
+        task.settled = true;
+      });
+    return task;
+  });
+  const abortStragglers = () => {
+    for (const task of panelTasks) {
+      if (!task.settled) {
+        task.controller.abort();
+        // Do not retain the timeout or wait for providers that ignore abort.
+        task.cancel();
+      }
+    }
+  };
+  const settled = await collectPanel(panelTasks.map((task) => task.promise), {
+    ...cfg,
+    minPanel,
+    signal,
+    onFinish: abortStragglers,
+  });
   if (signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
   log.info("FUSION", `fan-out collected in ${Date.now() - t0}ms`);
 

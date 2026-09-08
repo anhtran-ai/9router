@@ -25,16 +25,57 @@ async function saveInvite(invite) {
   return invite;
 }
 
-export async function createContributorInvite({ alias, allowedProviders, expiresInMinutes = 30 }) {
+/**
+ * Normalize provider origins selected by an administrator when creating an
+ * invite.  Only providers whose contributor flow consumes a dynamic OAuth
+ * origin belong here; arbitrary invite-holder input is never persisted.
+ */
+export function normalizeContributorProviderBaseUrls(providerBaseUrls, allowedProviders = []) {
+  const normalized = {};
+  if (!providerBaseUrls || typeof providerBaseUrls !== "object" || Array.isArray(providerBaseUrls)) {
+    return normalized;
+  }
+  if (!allowedProviders.includes("gitlab") || providerBaseUrls.gitlab == null) {
+    return normalized;
+  }
+  if (typeof providerBaseUrls.gitlab !== "string" || !providerBaseUrls.gitlab.trim()) {
+    throw new Error("GitLab contributor base URL must be a non-empty HTTP(S) URL");
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(providerBaseUrls.gitlab.trim());
+  } catch {
+    throw new Error("GitLab contributor base URL must be a valid HTTP(S) URL");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("GitLab contributor base URL must use HTTP or HTTPS");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("GitLab contributor base URL cannot contain credentials, query parameters, or fragments");
+  }
+
+  normalized.gitlab = parsed.toString().replace(/\/+$/, "");
+  return normalized;
+}
+
+export async function createContributorInvite({
+  alias,
+  allowedProviders,
+  expiresInMinutes = 30,
+  providerBaseUrls,
+}) {
   const id = crypto.randomUUID();
   const secret = crypto.randomBytes(32).toString("base64url");
   const now = new Date();
   const safeMinutes = Math.min(Math.max(Number(expiresInMinutes) || 30, 5), 1440);
+  const uniqueProviders = [...new Set(allowedProviders)];
   const invite = {
     id,
     alias,
     tokenHash: hashSecret(secret),
-    allowedProviders: [...new Set(allowedProviders)],
+    allowedProviders: uniqueProviders,
+    providerBaseUrls: normalizeContributorProviderBaseUrls(providerBaseUrls, uniqueProviders),
     status: "active",
     createdAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + safeMinutes * 60_000).toISOString(),

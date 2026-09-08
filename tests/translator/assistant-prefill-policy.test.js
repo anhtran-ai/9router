@@ -173,6 +173,20 @@ function expectNativeCleanup(messages) {
 }
 
 describe("native Claude cleanup before assistant prefill policy", () => {
+  it("keeps a valid trailing server tool block and restores a user tail", () => {
+    const block = {
+      type: "server_tool_use",
+      id: "srvtoolu_01EUi6RNgHntbStfCjgLyLzz",
+      name: "web_search",
+      input: {},
+    };
+    const out = passthrough([{ role: "assistant", content: [block] }]);
+
+    expect(out.messages[0].content).toEqual([block]);
+    expect(out.messages.at(-1).role).toBe("user");
+    expect(JSON.stringify(out.messages.at(-1).content)).toMatch(continuationPattern);
+  });
+
   it("cleans foreign tool history and then normalizes the exposed prefill by default", () => {
     const out = passthrough(nativeCleanupPrefillFixture());
 

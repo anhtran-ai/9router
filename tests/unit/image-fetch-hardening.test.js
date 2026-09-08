@@ -23,7 +23,10 @@ function mockFetchOnce(bytes, ok = true) {
 
 beforeEach(() => {
   lookupMock.mockReset();
-  lookupMock.mockResolvedValue({ address: "93.184.216.34" }); // public by default
+  // Production requests lookup(..., { all: true }), whose contract is an array.
+  // Returning an object here made every path fail before fetch and let negative
+  // SSRF assertions pass for the wrong reason.
+  lookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]); // public by default
 });
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -34,12 +37,12 @@ describe("fetchImageAsBase64 hardening", () => {
   });
 
   it("SSRF: rejects private IP (10.x)", async () => {
-    lookupMock.mockResolvedValue({ address: "10.0.0.5" });
+    lookupMock.mockResolvedValue([{ address: "10.0.0.5", family: 4 }]);
     expect(await fetchImageAsBase64("http://internal.example/x.png")).toBeNull();
   });
 
   it("SSRF: rejects cloud metadata 169.254.169.254", async () => {
-    lookupMock.mockResolvedValue({ address: "169.254.169.254" });
+    lookupMock.mockResolvedValue([{ address: "169.254.169.254", family: 4 }]);
     expect(await fetchImageAsBase64("http://metadata/x.png")).toBeNull();
   });
 
@@ -48,8 +51,26 @@ describe("fetchImageAsBase64 hardening", () => {
   });
 
   it("SSRF: rejects IPv6 loopback", async () => {
-    lookupMock.mockResolvedValue({ address: "::1" });
+    lookupMock.mockResolvedValue([{ address: "::1", family: 6 }]);
     expect(await fetchImageAsBase64("http://x/y.png")).toBeNull();
+  });
+
+  it("SSRF: rejects hex IPv4-mapped IPv6 loopback", async () => {
+    lookupMock.mockResolvedValue([{ address: "::ffff:7f00:1", family: 6 }]);
+    globalThis.fetch = vi.fn();
+    expect(await fetchImageAsBase64("http://mapped.example/x.png")).toBeNull();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("SSRF: rejects non-global benchmark and documentation ranges", async () => {
+    for (const record of [
+      { address: "198.18.0.1", family: 4 },
+      { address: "203.0.113.1", family: 4 },
+      { address: "2001:db8::1", family: 6 },
+    ]) {
+      lookupMock.mockResolvedValueOnce([record]);
+      expect(await fetchImageAsBase64("http://reserved.example/x.png"), record.address).toBeNull();
+    }
   });
 
   it("accepts valid PNG from public host", async () => {

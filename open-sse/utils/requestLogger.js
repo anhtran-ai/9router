@@ -69,25 +69,102 @@ function writeJsonFile(sessionPath, filename, data) {
   }
 }
 
-// Mask sensitive data in headers (DISABLED - keep full token for testing)
-function maskSensitiveHeaders(headers) {
+const SENSITIVE_HEADER_NAMES = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "cookie2",
+  "set-cookie",
+  "api-key",
+  "x-api-key",
+  "x-goog-api-key",
+  "x-key",
+  "xi-api-key",
+  "x-subscription-token",
+]);
+
+function sensitiveNameParts(name) {
+  const normalized = String(name)
+    .replace(/([a-z\d])([A-Z])/g, "$1-$2")
+    .toLowerCase();
+  return {
+    normalized,
+    parts: normalized.split(/[^a-z\d]+/).filter(Boolean),
+  };
+}
+
+function isSensitiveName(name) {
+  const { normalized, parts } = sensitiveNameParts(name);
+  if (SENSITIVE_HEADER_NAMES.has(normalized)) return true;
+  const sensitiveParts = new Set([
+    "auth",
+    "authentication",
+    "authorization",
+    "cookie",
+    "credential",
+    "credentials",
+    "jwt",
+    "key",
+    "passwd",
+    "password",
+    "secret",
+    "session",
+    "sig",
+    "signature",
+    "token",
+  ]);
+  return parts.some((part) => sensitiveParts.has(part))
+    || ["token", "secret", "password", "credential", "apikey", "jwt"]
+      .some((marker) => normalized.includes(marker))
+    || /(?:^|[^a-z])auth(?:$|[^a-z])/.test(normalized)
+    || normalized.endsWith("auth");
+}
+
+function isSensitiveHeaderName(name) {
+  return isSensitiveName(name);
+}
+
+// Always remove full credential values before persisting request/response logs.
+export function maskSensitiveHeaders(headers) {
   if (!headers) return {};
-  return { ...headers };
-  
-  // Old masking code (disabled):
-  // const masked = { ...headers };
-  // const sensitiveKeys = ["authorization", "x-api-key", "cookie", "token"];
-  // 
-  // for (const key of Object.keys(masked)) {
-  //   const lowerKey = key.toLowerCase();
-  //   if (sensitiveKeys.some(sk => lowerKey.includes(sk))) {
-  //     const value = masked[key];
-  //     if (value && value.length > 20) {
-  //       masked[key] = value.slice(0, 10) + "..." + value.slice(-5);
-  //     }
-  //   }
-  // }
-  // return masked;
+  let entries;
+  if (typeof headers.entries === "function") entries = Array.from(headers.entries());
+  else if (Array.isArray(headers)) entries = headers;
+  else entries = Object.entries(headers);
+
+  return Object.fromEntries(entries.map(([name, value]) => [
+    name,
+    isSensitiveHeaderName(name) ? "[redacted]" : value,
+  ]));
+}
+
+function isSensitiveQueryName(name) {
+  return isSensitiveName(name) || String(name).toLowerCase() === "code";
+}
+
+// Provider URLs can contain credentials (for example Vertex's ?key=...).
+// Preserve routing information while removing userinfo and sensitive query values.
+export function sanitizeUrl(url) {
+  if (url === null || url === undefined) return url;
+  const raw = String(url);
+  const isAbsolute = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(raw);
+  try {
+    const parsed = new URL(raw, "http://request-log.invalid");
+    if (parsed.username) parsed.username = "[redacted]";
+    if (parsed.password) parsed.password = "[redacted]";
+    const sensitiveKeys = new Set();
+    for (const key of parsed.searchParams.keys()) {
+      if (isSensitiveQueryName(key)) sensitiveKeys.add(key);
+    }
+    for (const key of sensitiveKeys) parsed.searchParams.set(key, "[redacted]");
+    return isAbsolute
+      ? parsed.toString()
+      : `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    // Never fail open: a malformed provider URL may itself contain userinfo or
+    // query credentials, and retaining the raw value would persist the secret.
+    return "[invalid-url-redacted]";
+  }
 }
 
 // No-op logger when logging is disabled
@@ -130,7 +207,7 @@ export async function createRequestLogger(sourceFormat, targetFormat, model) {
     logClientRawRequest(endpoint, body, headers = {}) {
       writeJsonFile(sessionPath, "1_req_client.json", {
         timestamp: new Date().toISOString(),
-        endpoint,
+        endpoint: sanitizeUrl(endpoint),
         headers: maskSensitiveHeaders(headers),
         body
       });
@@ -157,7 +234,7 @@ export async function createRequestLogger(sourceFormat, targetFormat, model) {
     logTargetRequest(url, headers, body) {
       writeJsonFile(sessionPath, "4_req_target.json", {
         timestamp: new Date().toISOString(),
-        url,
+        url: sanitizeUrl(url),
         headers: maskSensitiveHeaders(headers),
         body
       });
@@ -170,7 +247,7 @@ export async function createRequestLogger(sourceFormat, targetFormat, model) {
         timestamp: new Date().toISOString(),
         status,
         statusText,
-        headers: headers ? (typeof headers.entries === "function" ? Object.fromEntries(headers.entries()) : headers) : {},
+        headers: maskSensitiveHeaders(headers),
         body
       });
     },
@@ -247,7 +324,7 @@ export function logError(provider, { error, url, model, requestBody }) {
       type: "error",
       provider,
       model,
-      url,
+      url: sanitizeUrl(url),
       error: error?.message || String(error),
       stack: error?.stack,
       requestBody

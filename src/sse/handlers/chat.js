@@ -7,7 +7,15 @@ import {
   extractApiKey,
   isValidApiKey,
 } from "../services/auth.js";
-import { handleAntigravityQuotaError, clearAntigravityStrikes } from "../services/antigravityQuota.js";
+import {
+  handleAntigravityQuotaError,
+  clearAntigravityStrikes,
+  beginAntigravityQuotaAttempt,
+  endAntigravityQuotaAttempt,
+  isAntigravityQuotaAttemptSuperseded,
+  canAntigravityQuotaAttemptClearFailure,
+  recordAntigravityQuotaAttemptFailure,
+} from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
@@ -110,13 +118,16 @@ export async function handleChat(request, clientRawRequest = null) {
       return handleFusionChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m, isPanel) => {
+        handleSingleModel: (b, m, isPanel, panelSignal) => {
           let cleanRawReq = clientRawRequest;
           if (isPanel && clientRawRequest) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+          const callRequest = panelSignal
+            ? { url: request?.url, headers: request?.headers, signal: panelSignal }
+            : request;
+          return handleSingleModelChat(b, m, cleanRawReq, callRequest, apiKey);
         },
         log,
         comboName: modelStr,
@@ -191,13 +202,16 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         return handleFusionChat({
           body,
           models: comboModels,
-          handleSingleModel: (b, m, isPanel) => {
+          handleSingleModel: (b, m, isPanel, panelSignal) => {
             let cleanRawReq = clientRawRequest;
             if (isPanel && clientRawRequest) {
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+            const callRequest = panelSignal
+              ? { url: request?.url, headers: request?.headers, signal: panelSignal }
+              : request;
+            return handleSingleModelChat(b, m, cleanRawReq, callRequest, apiKey);
           },
           log,
           comboName: modelStr,
@@ -241,7 +255,15 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
   while (true) {
     if (request?.signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    let credentials;
+    try {
+      credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { signal: request?.signal });
+    } catch (error) {
+      if (isAbortError(error, request?.signal)) {
+        return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
+      throw error;
+    }
     if (request?.signal?.aborted) return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
 
     // All accounts unavailable
@@ -267,7 +289,23 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {
-      const pid = await getProjectIdForConnection(credentials.connectionId, refreshedCredentials.accessToken, provider);
+      let pid;
+      try {
+        pid = await getProjectIdForConnection(
+          credentials.connectionId,
+          refreshedCredentials.accessToken,
+          provider,
+          { signal: request?.signal },
+        );
+      } catch (error) {
+        if (isAbortError(error, request?.signal)) {
+          return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+        }
+        throw error;
+      }
+      if (request?.signal?.aborted) {
+        return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
       if (pid) {
         refreshedCredentials.projectId = pid;
         // Persist to DB in background so subsequent requests have it immediately
@@ -277,6 +315,16 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Use shared chatCore
     const chatSettings = await getSettings();
+    const pxpipeTransform = chatSettings.pxpipeEnabled ? await getPxpipeTransform() : null;
+    if (request?.signal?.aborted) {
+      return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+    }
+    // Capture ordering immediately before dispatch. Assigning an attempt before
+    // awaited setup could make a request that dispatches later look older.
+    const quotaAttempt = provider === "antigravity"
+      ? beginAntigravityQuotaAttempt(credentials.connectionId, model)
+      : null;
+    try {
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
     const result = await handleChatCore({
       body: { ...body, model: `${provider}/${model}` },
@@ -302,7 +350,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       pxpipeMinChars: chatSettings.pxpipeMinChars,
       pxpipeTimeoutMs: chatSettings.pxpipeTimeoutMs,
       // Lazily warms the in-process module on first use; null when not installed (fail-open)
-      pxpipeTransform: chatSettings.pxpipeEnabled ? await getPxpipeTransform() : null,
+      pxpipeTransform,
       onPxpipeEvent: appendPxpipeEvent,
       providerThinking,
       // Detect source format by endpoint + body
@@ -315,11 +363,31 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         });
       },
       onRequestSuccess: async () => {
-        await clearAccountError(credentials.connectionId, credentials, model);
         // "Consecutive" strikes: a success clears the breaker for this pair.
-        clearAntigravityStrikes(credentials.connectionId, model);
+        // This must happen before the fallible DB cleanup so a delayed/rejected
+        // write cannot let older quota-error evaluators restore stale strikes.
+        clearAntigravityStrikes(credentials.connectionId, model, quotaAttempt);
+        if (quotaAttempt && !canAntigravityQuotaAttemptClearFailure(quotaAttempt)) return;
+        // A verified provider success owns this cleanup even if the client
+        // disconnects immediately afterward; keep the DB commit observed.
+        const cleanupGuard = quotaAttempt
+          ? () => canAntigravityQuotaAttemptClearFailure(quotaAttempt)
+          : null;
+        await clearAccountError(
+          credentials.connectionId,
+          credentials,
+          model,
+          cleanupGuard ? { reloadCurrent: true, shouldCommit: cleanupGuard } : {},
+        );
       }
     });
+
+    // Non-streaming success cleanup is normally queued by chatCore. Record the
+    // success here as well before releasing the attempt; token-based recording
+    // is idempotent and closes the success-before-error-handler race.
+    if (result.success && quotaAttempt && body?.stream !== true) {
+      clearAntigravityStrikes(credentials.connectionId, model, quotaAttempt);
+    }
 
     if (request?.signal?.aborted) {
       result.response?.body?.cancel().catch(() => {});
@@ -335,7 +403,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         quotaResetMs = await handleAntigravityQuotaError(
           credentials.connectionId, result.status, model,
           refreshedCredentials.accessToken, credentials.providerSpecificData,
-          request?.signal,
+          request?.signal, quotaAttempt,
         );
       } catch (error) {
         if (isAbortError(error, request?.signal)) {
@@ -346,14 +414,46 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       if (request?.signal?.aborted) {
         return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
       }
+      // A newer success makes this request's provider error historical. Return
+      // its own response, but do not persist cooldown or route it elsewhere.
+      if (isAntigravityQuotaAttemptSuperseded(quotaAttempt)) {
+        return result.response;
+      }
       if (quotaResetMs) resetsAtMs = quotaResetMs;
     }
 
     // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
     // Do not persist a modelLock_* for this path.
-    const shouldFallback = provider === "antigravity" && quotaResetMs
-      ? true
-      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback;
+    let shouldFallback;
+    if (provider === "antigravity" && quotaResetMs) {
+      shouldFallback = true;
+    } else {
+      try {
+        const markResult = await markAccountUnavailable(
+          credentials.connectionId, result.status, result.error, provider, model, resetsAtMs,
+          {
+            signal: request?.signal,
+            ...(quotaAttempt ? {
+              shouldCommit: () => !isAntigravityQuotaAttemptSuperseded(quotaAttempt),
+              // Record ordering at the actual DB boundary for every AG
+              // failure that persists a lock, including non-quota 4xx/5xx.
+              beforeCommit: () => recordAntigravityQuotaAttemptFailure(quotaAttempt),
+            } : {}),
+          },
+        );
+        if (markResult.superseded) return result.response;
+        shouldFallback = markResult.shouldFallback;
+      } catch (error) {
+        if (isAbortError(error, request?.signal)) {
+          return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+        }
+        throw error;
+      }
+    }
+
+    if (request?.signal?.aborted) {
+      return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+    }
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);
@@ -364,5 +464,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     }
 
     return result.response;
+    } finally {
+      endAntigravityQuotaAttempt(quotaAttempt);
+    }
   }
 }

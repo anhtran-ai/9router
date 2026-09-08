@@ -1,15 +1,27 @@
 import { NextResponse } from "next/server";
-import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
+import { assertPublicUrlResolved, fetchPublic } from "@/shared/utils/ssrfGuard.js";
 import { isLocalRequest } from "@/dashboardGuard";
 
 // Fetch with timeout wrapper
-const fetchWithTimeout = (url, options, timeout = 10000) => {
-  return Promise.race([
-    fetch(url, options),
-    new Promise((_, reject) => 
-      setTimeout(() => reject(new Error("Request timeout")), timeout)
-    )
-  ]);
+const fetchWithTimeout = async (fetchImpl, url, options, timeout = 10000) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  const signal = options?.signal
+    ? AbortSignal.any([options.signal, controller.signal])
+    : controller.signal;
+  try {
+    return await fetchImpl(url, { ...options, signal });
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("Request timeout", { cause: error });
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const discardResponseBody = async (response) => {
+  if (!response?.body || response.bodyUsed === true) return;
+  try { await response?.body?.cancel(); } catch { /* best-effort connection release */ }
 };
 
 // Validate URL format
@@ -67,13 +79,15 @@ export async function POST(request) {
     }
 
     // SSRF guard for remote callers; local host keeps self-hosted nodes (e.g. ollama-local)
-    if (!isLocalRequest(request)) {
+    const isRemote = !isLocalRequest(request);
+    if (isRemote) {
       try {
-        assertPublicUrl(baseUrl);
+        await assertPublicUrlResolved(baseUrl);
       } catch {
         return NextResponse.json({ error: "URL not allowed" }, { status: 400 });
       }
     }
+    const fetchImpl = isRemote ? fetchPublic : fetch;
 
     // Custom Embedding Validation - test POST /embeddings directly
     if (type === "custom-embedding") {
@@ -81,7 +95,7 @@ export async function POST(request) {
       if (!modelId?.trim()) {
         return NextResponse.json({ valid: false, error: "Model ID required for embedding validation" });
       }
-      const embedRes = await fetchWithTimeout(`${normalizedBase}/embeddings`, {
+      const embedRes = await fetchWithTimeout(fetchImpl, `${normalizedBase}/embeddings`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${apiKey}`,
@@ -95,6 +109,7 @@ export async function POST(request) {
         return NextResponse.json({ valid: true, method: "embeddings", dimensions: dims });
       }
       if (embedRes.status === 401 || embedRes.status === 403) {
+        await discardResponseBody(embedRes);
         return NextResponse.json({ valid: false, error: "API key unauthorized" });
       }
       const errBody = await embedRes.text().catch(() => "");
@@ -113,7 +128,7 @@ export async function POST(request) {
       }
 
       const modelsUrl = `${normalizedBase}/models`;
-      const res = await fetchWithTimeout(modelsUrl, {
+      const res = await fetchWithTimeout(fetchImpl, modelsUrl, {
         method: "GET",
         headers: {
           "x-api-key": apiKey,
@@ -122,16 +137,21 @@ export async function POST(request) {
         }
       });
 
-      if (res.ok) return NextResponse.json({ valid: true });
+      if (res.ok) {
+        await discardResponseBody(res);
+        return NextResponse.json({ valid: true });
+      }
 
       // Auth errors - no point trying chat fallback
       if (res.status === 401 || res.status === 403) {
+        await discardResponseBody(res);
         return NextResponse.json({ valid: false, error: "API key unauthorized" });
       }
 
       // Fallback: try chat/completions if modelId provided
       if (modelId) {
-        const chatRes = await fetchWithTimeout(`${normalizedBase}/chat/completions`, {
+        await discardResponseBody(res);
+        const chatRes = await fetchWithTimeout(fetchImpl, `${normalizedBase}/chat/completions`, {
           method: "POST",
           headers: {
             "Authorization": `Bearer ${apiKey}`,
@@ -146,8 +166,10 @@ export async function POST(request) {
           })
         });
         if (chatRes.ok) {
+          await discardResponseBody(chatRes);
           return NextResponse.json({ valid: true, method: "chat" });
         }
+        await discardResponseBody(chatRes);
         return NextResponse.json({
           valid: false,
           error: getChatErrorMessage(chatRes.status),
@@ -155,25 +177,31 @@ export async function POST(request) {
         });
       }
 
+      await discardResponseBody(res);
       return NextResponse.json({ valid: false, error: getModelsErrorMessage(res.status) });
     }
 
     // OpenAI Compatible Validation (Default)
     const modelsUrl = `${baseUrl.replace(/\/$/, "")}/models`;
-    const res = await fetchWithTimeout(modelsUrl, {
+    const res = await fetchWithTimeout(fetchImpl, modelsUrl, {
       headers: { "Authorization": `Bearer ${apiKey}` },
     });
 
-    if (res.ok) return NextResponse.json({ valid: true });
+    if (res.ok) {
+      await discardResponseBody(res);
+      return NextResponse.json({ valid: true });
+    }
 
     // Auth errors - no point trying chat fallback
     if (res.status === 401 || res.status === 403) {
+      await discardResponseBody(res);
       return NextResponse.json({ valid: false, error: "API key unauthorized" });
     }
 
     // Fallback: try chat/completions if modelId provided
     if (modelId) {
-      const chatRes = await fetchWithTimeout(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      await discardResponseBody(res);
+      const chatRes = await fetchWithTimeout(fetchImpl, `${baseUrl.replace(/\/$/, "")}/chat/completions`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${apiKey}`,
@@ -186,8 +214,10 @@ export async function POST(request) {
         })
       });
       if (chatRes.ok) {
+        await discardResponseBody(chatRes);
         return NextResponse.json({ valid: true, method: "chat" });
       }
+      await discardResponseBody(chatRes);
       return NextResponse.json({
         valid: false,
         error: getChatErrorMessage(chatRes.status),
@@ -195,6 +225,7 @@ export async function POST(request) {
       });
     }
 
+    await discardResponseBody(res);
     return NextResponse.json({ valid: false, error: getModelsErrorMessage(res.status) });
   } catch (error) {
     const errorMessage = getErrorMessage(error);

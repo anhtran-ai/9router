@@ -189,9 +189,19 @@ export async function createProviderConnection(data) {
 }
 
 // Critical: OAuth refresh token race — atomic merge inside transaction
-export async function updateProviderConnection(id, data) {
+export async function updateProviderConnection(id, data, options = {}) {
   const db = await getAdapter();
+  const signal = options?.signal || null;
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("Request aborted", "AbortError");
+  }
+  if (options?.shouldCommit && !options.shouldCommit()) return null;
+  options?.beforeCommit?.();
+  if (options?.shouldCommit && !options.shouldCommit()) return null;
   let result;
+  // There is deliberately no await between the abort guard and the
+  // synchronous transaction: once this stack enters the commit, cancellation
+  // cannot interleave and turn an abandoned routing decision into a DB write.
   db.transaction(() => {
     const row = db.get(`SELECT * FROM providerConnections WHERE id = ?`, [id]);
     if (!row) { result = null; return; }

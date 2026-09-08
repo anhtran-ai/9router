@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import "../translator/registerAll.js";
 import { openaiResponsesToOpenAIResponse } from "../../open-sse/translator/response/openai-responses.js";
 import { clampResponsesCallId, coerceResponsesOutput, MAX_RESPONSES_CALL_ID_LEN } from "../../open-sse/translator/formats/responsesApi.js";
-import { initState, translateResponse } from "../../open-sse/translator/index.js";
+import { initState, translateRequest, translateResponse } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
 
 const added = (id, call_id, name, type = "function_call") => ({
@@ -149,6 +149,48 @@ describe("fallback call_ids stay unique within a batch", () => {
       expect(id.length).toBeLessThanOrEqual(MAX_RESPONSES_CALL_ID_LEN);
     }
     expect(new Set([clampResponsesCallId(""), clampResponsesCallId(null)]).size).toBe(2);
+  });
+
+  it("keeps overlong ids with the same prefix distinct and deterministic", () => {
+    const sharedPrefix = "call_" + "x".repeat(80);
+    const first = clampResponsesCallId(`${sharedPrefix}-first`);
+    const second = clampResponsesCallId(`${sharedPrefix}-second`);
+
+    expect(first).toHaveLength(MAX_RESPONSES_CALL_ID_LEN);
+    expect(second).toHaveLength(MAX_RESPONSES_CALL_ID_LEN);
+    expect(first).not.toBe(second);
+    expect(clampResponsesCallId(`${sharedPrefix}-first`)).toBe(first);
+  });
+
+  it("keeps an overlong function call correlated with its output", () => {
+    const callId = "call_" + "correlated".repeat(10);
+    const out = translateRequest(
+      FORMATS.OPENAI,
+      FORMATS.OPENAI_RESPONSES,
+      "model",
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: callId,
+              type: "function",
+              function: { name: "lookup", arguments: "{}" },
+            }],
+          },
+          { role: "tool", tool_call_id: callId, content: "ok" },
+        ],
+      },
+      true,
+      null,
+      null,
+    );
+    const call = out.input.find(item => item.type === "function_call");
+    const output = out.input.find(item => item.type === "function_call_output");
+
+    expect(call.call_id).toHaveLength(MAX_RESPONSES_CALL_ID_LEN);
+    expect(output.call_id).toBe(call.call_id);
   });
 });
 

@@ -7,6 +7,11 @@ import { AntigravityExecutor } from "../../open-sse/executors/antigravity.js";
 import { openaiToAntigravityRequest } from "../../open-sse/translator/request/openai-to-gemini.js";
 import { ANTIGRAVITY_DEFAULT_SYSTEM } from "../../open-sse/config/appConstants.js";
 import { toNumericSessionId } from "../../open-sse/utils/sessionManager.js";
+import {
+  getGeminiThoughtSignature,
+  getGeminiThoughtSignatureSync,
+  storeGeminiThoughtSignature,
+} from "../../open-sse/services/thoughtSignatureStore.js";
 
 const AG2O = (req) =>
   translateRequest(FORMATS.ANTIGRAVITY, FORMATS.OPENAI, "m", { request: req }, true, null, null);
@@ -131,13 +136,43 @@ describe("Antigravity → Claude", () => {
 });
 
 describe("registered OpenAI → Gemini session forwarding", () => {
+  it("never falls back to another session or the legacy global namespace", async () => {
+    const callId = "call-session-isolation";
+    storeGeminiThoughtSignature(callId, "signature-session-a", "session-a");
+
+    expect(getGeminiThoughtSignatureSync(callId, "session-a")).toBe("signature-session-a");
+    expect(getGeminiThoughtSignatureSync(callId, "session-b")).toBeNull();
+    expect(getGeminiThoughtSignatureSync(callId)).toBeNull();
+    await expect(getGeminiThoughtSignature(callId, "session-b")).resolves.toBeNull();
+
+    const globalCallId = "call-legacy-unscoped";
+    storeGeminiThoughtSignature(globalCallId, "signature-global");
+    expect(getGeminiThoughtSignatureSync(globalCallId)).toBe("signature-global");
+    expect(getGeminiThoughtSignatureSync(globalCallId, "session-a")).toBeNull();
+    await expect(getGeminiThoughtSignature(globalCallId, "session-a")).resolves.toBeNull();
+  });
+
+  it("uses disjoint, injective keys for scoped and legacy signatures", () => {
+    const forgedLegacyId = "scope-collision:call";
+    storeGeminiThoughtSignature(forgedLegacyId, "signature-legacy-collision");
+    expect(getGeminiThoughtSignatureSync("call", "scope-collision")).toBeNull();
+
+    storeGeminiThoughtSignature("call", "signature-scoped-collision", "scope-collision");
+    expect(getGeminiThoughtSignatureSync(forgedLegacyId)).toBe("signature-legacy-collision");
+    expect(getGeminiThoughtSignatureSync("call", "scope-collision")).toBe("signature-scoped-collision");
+
+    // Both pairs used to flatten to the same `session:call` string.
+    storeGeminiThoughtSignature("b:c", "signature-first-pair", "scope-a");
+    storeGeminiThoughtSignature("c", "signature-second-pair", "scope-a:b");
+    expect(getGeminiThoughtSignatureSync("b:c", "scope-a")).toBe("signature-first-pair");
+    expect(getGeminiThoughtSignatureSync("c", "scope-a:b")).toBe("signature-second-pair");
+  });
+
   it("forwards the captured client session through Gemini CLI and replays its signature", () => {
     const callId = "call-gemini-cli-session";
     const wantedSession = "client-session-gemini-cli-a";
     const otherSession = "client-session-gemini-cli-b";
     recordThoughtSignature(callId, wantedSession, "signature-gemini-cli-a");
-    // The store also keeps a legacy unscoped value. Overwrite it deliberately:
-    // only a correctly forwarded session can now retrieve the wanted signature.
     recordThoughtSignature(callId, otherSession, "signature-gemini-cli-b");
 
     const credentials = {

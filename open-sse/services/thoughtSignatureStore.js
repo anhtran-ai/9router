@@ -4,24 +4,39 @@ const MAX_SIGNATURES = 2000;
 const MAX_PERSISTED_SIGNATURES = 10_000;
 const MEMORY_TTL_MS = 1000 * 60 * 60; // 1 hour
 const PERSISTED_TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
-const SCOPE = "gemini_thought_signatures";
+const LEGACY_SCOPE = "gemini_thought_signatures";
+const SCOPED_SCOPE = "gemini_thought_signatures_scoped_v1";
 
-const signatureKv = makeKv(SCOPE);
-const memorySignatures = new Map();
+const legacySignatureKv = makeKv(LEGACY_SCOPE);
+const scopedSignatureKv = makeKv(SCOPED_SCOPE);
+const legacyMemorySignatures = new Map();
+const scopedMemorySignatures = new Map();
 let pruneCounter = 0;
+
+function hasSessionScope(sessionId) {
+  return typeof sessionId === "string" && sessionId.length > 0;
+}
+
+function scopedSignatureKey(sessionId, toolCallId) {
+  return JSON.stringify([sessionId, toolCallId]);
+}
 
 function pruneMemoryExpired() {
   const now = Date.now();
-  for (const [key, value] of memorySignatures.entries()) {
-    if (value.expiresAt <= now) {
-      memorySignatures.delete(key);
+  const stores = [legacyMemorySignatures, scopedMemorySignatures];
+  for (const store of stores) {
+    for (const [key, value] of store.entries()) {
+      if (value.expiresAt <= now) store.delete(key);
     }
   }
 
-  while (memorySignatures.size > MAX_SIGNATURES) {
-    const oldestKey = memorySignatures.keys().next().value;
-    if (!oldestKey) break;
-    memorySignatures.delete(oldestKey);
+  while (stores.reduce((total, store) => total + store.size, 0) > MAX_SIGNATURES) {
+    const candidates = stores
+      .map(store => ({ store, first: store.entries().next().value }))
+      .filter(candidate => candidate.first);
+    if (candidates.length === 0) break;
+    candidates.sort((left, right) => left.first[1].expiresAt - right.first[1].expiresAt);
+    candidates[0].store.delete(candidates[0].first[0]);
   }
 }
 
@@ -30,30 +45,29 @@ async function maybePrunePersisted() {
   if (pruneCounter % 100 !== 0) return;
 
   try {
-    const all = await signatureKv.getAll();
-    const keys = Object.keys(all);
     const now = Date.now();
-    const expiredKeys = [];
+    const expired = [];
     const valid = [];
-
-    for (const k of keys) {
-      const entry = all[k];
-      if (!entry || typeof entry.signature !== "string" || (entry.expiresAt && entry.expiresAt <= now)) {
-        expiredKeys.push(k);
-      } else {
-        valid.push({ key: k, createdAt: entry.createdAt || 0 });
+    for (const kv of [legacySignatureKv, scopedSignatureKv]) {
+      const all = await kv.getAll();
+      for (const [key, entry] of Object.entries(all)) {
+        if (!entry || typeof entry.signature !== "string" || (entry.expiresAt && entry.expiresAt <= now)) {
+          expired.push({ kv, key });
+        } else {
+          valid.push({ kv, key, createdAt: entry.createdAt || 0 });
+        }
       }
     }
 
-    for (const k of expiredKeys) {
-      await signatureKv.remove(k).catch(() => {});
+    for (const item of expired) {
+      await item.kv.remove(item.key).catch(() => {});
     }
 
     if (valid.length > MAX_PERSISTED_SIGNATURES) {
       valid.sort((a, b) => b.createdAt - a.createdAt);
       const toRemove = valid.slice(MAX_PERSISTED_SIGNATURES);
       for (const item of toRemove) {
-        await signatureKv.remove(item.key).catch(() => {});
+        await item.kv.remove(item.key).catch(() => {});
       }
     }
   } catch {
@@ -71,25 +85,20 @@ export function storeGeminiThoughtSignature(toolCallId, signature, sessionId = n
   const now = Date.now();
   pruneMemoryExpired();
 
-  const keys = [];
-  if (sessionId && typeof sessionId === "string") {
-    keys.push(`${sessionId}:${toolCallId}`);
-  }
-  keys.push(toolCallId);
+  // Scoped and legacy entries use distinct memory maps and SQLite scopes.
+  // Client-controlled ids therefore cannot forge a key in the other namespace.
+  const scoped = hasSessionScope(sessionId);
+  const key = scoped ? scopedSignatureKey(sessionId, toolCallId) : toolCallId;
+  const memoryStore = scoped ? scopedMemorySignatures : legacyMemorySignatures;
+  const kvStore = scoped ? scopedSignatureKv : legacySignatureKv;
+  memoryStore.set(key, { signature, expiresAt: now + MEMORY_TTL_MS });
 
-  for (const k of keys) {
-    memorySignatures.set(k, {
-      signature,
-      expiresAt: now + MEMORY_TTL_MS,
-    });
-
-    // Async persist to SQLite kv table without blocking
-    signatureKv.set(k, {
-      signature,
-      createdAt: now,
-      expiresAt: now + PERSISTED_TTL_MS,
-    }).catch(() => {});
-  }
+  // Async persist to SQLite kv table without blocking.
+  kvStore.set(key, {
+    signature,
+    createdAt: now,
+    expiresAt: now + PERSISTED_TTL_MS,
+  }).catch(() => {});
 
   maybePrunePersisted().catch(() => {});
 }
@@ -102,39 +111,41 @@ export async function getGeminiThoughtSignature(toolCallId, sessionId = null) {
 
   pruneMemoryExpired();
 
-  if (sessionId && typeof sessionId === "string") {
-    const sessionKey = `${sessionId}:${toolCallId}`;
-    const sessionEntry = memorySignatures.get(sessionKey);
+  if (hasSessionScope(sessionId)) {
+    const sessionKey = scopedSignatureKey(sessionId, toolCallId);
+    const sessionEntry = scopedMemorySignatures.get(sessionKey);
     if (sessionEntry && sessionEntry.expiresAt > Date.now()) {
       return sessionEntry.signature;
     }
-  }
 
-  const entry = memorySignatures.get(toolCallId);
-  if (entry && entry.expiresAt > Date.now()) {
-    return entry.signature;
-  }
-
-  try {
-    if (sessionId && typeof sessionId === "string") {
-      const sessionKey = `${sessionId}:${toolCallId}`;
-      const sessionRow = await signatureKv.get(sessionKey);
+    try {
+      const sessionRow = await scopedSignatureKv.get(sessionKey);
       if (sessionRow && typeof sessionRow.signature === "string" && (!sessionRow.expiresAt || sessionRow.expiresAt > Date.now())) {
-        memorySignatures.set(sessionKey, {
+        scopedMemorySignatures.set(sessionKey, {
           signature: sessionRow.signature,
           expiresAt: Date.now() + MEMORY_TTL_MS,
         });
         return sessionRow.signature;
       }
+    } catch {
+      // Fail-open without crossing into another session's namespace.
     }
+    return null;
+  }
 
-    const row = await signatureKv.get(toolCallId);
+  const entry = legacyMemorySignatures.get(toolCallId);
+  if (entry && entry.expiresAt > Date.now()) {
+    return entry.signature;
+  }
+
+  try {
+    const row = await legacySignatureKv.get(toolCallId);
     if (row && typeof row.signature === "string") {
       if (row.expiresAt && row.expiresAt <= Date.now()) {
-        signatureKv.remove(toolCallId).catch(() => {});
+        legacySignatureKv.remove(toolCallId).catch(() => {});
         return null;
       }
-      memorySignatures.set(toolCallId, {
+      legacyMemorySignatures.set(toolCallId, {
         signature: row.signature,
         expiresAt: Date.now() + MEMORY_TTL_MS,
       });
@@ -154,15 +165,16 @@ export function getGeminiThoughtSignatureSync(toolCallId, sessionId = null) {
   if (typeof toolCallId !== "string" || !toolCallId) return null;
   pruneMemoryExpired();
 
-  if (sessionId && typeof sessionId === "string") {
-    const sessionKey = `${sessionId}:${toolCallId}`;
-    const sessionEntry = memorySignatures.get(sessionKey);
+  if (hasSessionScope(sessionId)) {
+    const sessionKey = scopedSignatureKey(sessionId, toolCallId);
+    const sessionEntry = scopedMemorySignatures.get(sessionKey);
     if (sessionEntry && sessionEntry.expiresAt > Date.now()) {
       return sessionEntry.signature;
     }
+    return null;
   }
 
-  const entry = memorySignatures.get(toolCallId);
+  const entry = legacyMemorySignatures.get(toolCallId);
   if (entry && entry.expiresAt > Date.now()) {
     return entry.signature;
   }

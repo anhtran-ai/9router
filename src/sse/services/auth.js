@@ -5,6 +5,7 @@ import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
+import { throwIfAborted } from "open-sse/utils/abort.js";
 import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection
@@ -32,13 +33,17 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
+  const signal = options?.signal || null;
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
   selectionMutex = new Promise(resolve => { resolveMutex = resolve; });
 
   try {
+    // Do not abandon our mutex slot on abort: resolving it before the previous
+    // owner finishes would let a later selector enter the critical section.
     await currentMutex;
+    throwIfAborted(signal);
 
     // Resolve alias to provider ID (e.g., "kc" -> "kilocode")
     const providerId = resolveProviderId(provider);
@@ -46,15 +51,18 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // Inject a virtual connection for no-auth free providers (with optional proxy pool from settings)
     if (FREE_PROVIDERS[providerId]?.noAuth) {
       const settings = await getSettings();
+      throwIfAborted(signal);
       const override = (settings.providerStrategies || {})[providerId] || {};
       const strategy = override.rotateStrategy || "none";
       let pickedId = override.proxyPoolId || null;
       if (strategy !== "none") {
         const allPools = await getProxyPools({ isActive: true });
+        throwIfAborted(signal);
         const poolIds = allPools.filter(p => p.proxyUrl).map(p => p.id);
         pickedId = pickProxyPoolId(poolIds, strategy, providerId);
       }
       const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: pickedId || "" });
+      throwIfAborted(signal);
       return {
         id: "noauth",
         connectionName: "Public",
@@ -71,6 +79,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     const connections = await getProviderConnections({ provider: providerId, isActive: true });
+    throwIfAborted(signal);
     log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeIds: ${excludeSet.size > 0 ? [...excludeSet].join(",") : "none"}, model: ${model || "any"}`);
 
     if (connections.length === 0) {
@@ -135,6 +144,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     const settings = await getSettings();
+    throwIfAborted(signal);
     // Per-provider strategy overrides global setting
     const providerOverride = (settings.providerStrategies || {})[providerId] || {};
     const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
@@ -167,10 +177,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         // Stay with current account
         connection = current;
         // Update lastUsedAt and increment count (await to ensure persistence)
-        await updateProviderConnection(connection.id, {
+        await updateConnectionWithSignal(connection.id, {
           lastUsedAt: new Date().toISOString(),
           consecutiveUseCount: (connection.consecutiveUseCount || 0) + 1
-        });
+        }, signal);
       } else {
         // Pick the least recently used (excluding current if possible)
         const sortedByOldest = [...availableConnections].sort((a, b) => {
@@ -183,10 +193,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         connection = sortedByOldest[0];
 
         // Update lastUsedAt and reset count to 1 (await to ensure persistence)
-        await updateProviderConnection(connection.id, {
+        await updateConnectionWithSignal(connection.id, {
           lastUsedAt: new Date().toISOString(),
           consecutiveUseCount: 1
-        });
+        }, signal);
       }
     } else {
       // Default: fill-first (already sorted by priority in getProviderConnections)
@@ -194,6 +204,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
 
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
+    throwIfAborted(signal);
 
     return {
       authType: connection.authType,
@@ -237,9 +248,16 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  * @param {string|null} model - The specific model that triggered the error
  * @returns {{ shouldFallback: boolean, cooldownMs: number }}
  */
-export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
+export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null, options = {}) {
+  const signal = options?.signal || null;
+  const shouldCommit = options?.shouldCommit || null;
+  const beforeCommit = options?.beforeCommit || null;
+  throwIfAborted(signal);
+  if (shouldCommit && !shouldCommit()) return { shouldFallback: false, cooldownMs: 0, superseded: true };
   if (!connectionId || connectionId === "noauth" || status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) return { shouldFallback: false, cooldownMs: 0 };
   const connections = await getProviderConnections({ provider });
+  throwIfAborted(signal);
+  if (shouldCommit && !shouldCommit()) return { shouldFallback: false, cooldownMs: 0, superseded: true };
   const conn = connections.find(c => c.id === connectionId);
   const backoffLevel = conn?.backoffLevel || 0;
 
@@ -267,14 +285,15 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
   const lockUpdate = buildModelLockUpdate(githubResetAtMs ? null : model, cooldownMs);
 
-  await updateProviderConnection(connectionId, {
+  await updateConnectionWithSignal(connectionId, {
     ...lockUpdate,
     testStatus: "unavailable",
     lastError: reason,
     errorCode: status,
     lastErrorAt: new Date().toISOString(),
     backoffLevel: newBackoffLevel ?? backoffLevel
-  });
+  }, signal, shouldCommit, beforeCommit);
+  if (shouldCommit && !shouldCommit()) return { shouldFallback: false, cooldownMs: 0, superseded: true };
 
   const lockKey = Object.keys(lockUpdate)[0];
   const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
@@ -296,9 +315,16 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
  * @param {object} currentConnection - credentials object (has _connection) or raw connection
  * @param {string|null} model - model that succeeded
  */
-export async function clearAccountError(connectionId, currentConnection, model = null) {
+export async function clearAccountError(connectionId, currentConnection, model = null, options = {}) {
   if (!connectionId || connectionId === "noauth") return;
-  const conn = currentConnection._connection || currentConnection;
+  const shouldCommit = options?.shouldCommit || null;
+  if (shouldCommit && !shouldCommit()) return;
+  let conn = currentConnection._connection || currentConnection;
+  if (options?.reloadCurrent) {
+    const currentConnections = await getProviderConnections({ provider: conn.provider });
+    conn = currentConnections.find((candidate) => candidate.id === connectionId) || conn;
+    if (shouldCommit && !shouldCommit()) return;
+  }
   const now = Date.now();
   const allLockKeys = Object.keys(conn).filter(k => k.startsWith("modelLock_"));
 
@@ -334,7 +360,23 @@ export async function clearAccountError(connectionId, currentConnection, model =
     });
   }
 
-  await updateProviderConnection(connectionId, clearObj);
+  await updateConnectionWithSignal(connectionId, clearObj, null, shouldCommit);
+}
+
+async function updateConnectionWithSignal(connectionId, updates, signal, shouldCommit = null, beforeCommit = null) {
+  throwIfAborted(signal);
+  if (shouldCommit && !shouldCommit()) return null;
+  const guardedOptions = {
+    ...(signal ? { signal } : {}),
+    ...(shouldCommit ? { shouldCommit } : {}),
+    ...(beforeCommit ? { beforeCommit } : {}),
+  };
+  const result = Object.keys(guardedOptions).length > 0
+    ? await updateProviderConnection(connectionId, updates, guardedOptions)
+    : await updateProviderConnection(connectionId, updates);
+  throwIfAborted(signal);
+  if (shouldCommit && !shouldCommit()) return null;
+  return result;
 }
 
 /**

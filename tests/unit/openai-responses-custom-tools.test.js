@@ -247,4 +247,33 @@ describe("OpenAI Chat stream → Codex custom_tool_call", () => {
       arguments: "{\"q\":\"x\"}",
     });
   });
+
+  it("assigns unique stable output indexes to reasoning, text, and parallel tools", () => {
+    const state = initState(FORMATS.OPENAI_RESPONSES);
+    const chunks = [
+      { id: "chatcmpl-indexes", choices: [{ index: 0, delta: { reasoning_content: "think" }, finish_reason: null }] },
+      { id: "chatcmpl-indexes", choices: [{ index: 0, delta: { content: "answer" }, finish_reason: null }] },
+      { id: "chatcmpl-indexes", choices: [{ index: 0, delta: { tool_calls: [
+        { index: 0, id: "call_a", type: "function", function: { name: "first", arguments: "{\"a\":1}" } },
+        { index: 1, id: "call_b", type: "function", function: { name: "second", arguments: "{\"b\":2}" } },
+      ] }, finish_reason: null }] },
+      { id: "chatcmpl-indexes", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ];
+
+    const events = chunks.flatMap((chunk) => openaiToOpenAIResponsesResponse(chunk, state));
+    const added = events.filter((event) => event.event === "response.output_item.added");
+    expect(added.map((event) => event.data.output_index)).toEqual([0, 1, 2, 3]);
+    expect(new Set(added.map((event) => event.data.output_index)).size).toBe(added.length);
+
+    const indexById = new Map(added.map((event) => [event.data.item.id, event.data.output_index]));
+    for (const event of events) {
+      const itemId = event.data.item_id || event.data.item?.id;
+      if (itemId && indexById.has(itemId) && event.data.output_index !== undefined) {
+        expect(event.data.output_index).toBe(indexById.get(itemId));
+      }
+    }
+
+    const completed = events.find((event) => event.event === "response.completed");
+    expect(completed.data.response.output.map((item) => item.id)).toEqual(added.map((event) => event.data.item.id));
+  });
 });

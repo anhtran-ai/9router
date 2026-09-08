@@ -5,7 +5,7 @@ import { FORMATS } from "../translator/formats.js";
 import { normalizeClaudePassthrough, anchorClaudeCache } from "../translator/formats/claude.js";
 import { createStreamController } from "../utils/streamHandler.js";
 import { refreshWithRetry } from "../services/tokenRefresh.js";
-import { createRequestLogger } from "../utils/requestLogger.js";
+import { createRequestLogger, sanitizeUrl } from "../utils/requestLogger.js";
 import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModelUpstreamId, getModelType, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
@@ -516,7 +516,7 @@ async function handleChatCoreRequest({ body, modelInfo, credentials, log, onCred
 
     const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
     if (log?.errorLine) {
-      const urlStr = providerUrl ? `\n    URL: ${providerUrl}` : "";
+      const urlStr = providerUrl ? `\n    URL: ${sanitizeUrl(providerUrl)}` : "";
       log.errorLine(reqTag, "✗", `ERROR ${statusCode} · ${provider}/${model} · ${Date.now() - requestStartTime}ms${urlStr}\n    ${errMsg}`);
     }
     reqLogger.logError(new Error(message), finalBody || translatedBody);

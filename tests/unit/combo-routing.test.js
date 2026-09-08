@@ -3,21 +3,22 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 const state = vi.hoisted(() => ({
   connections: [], updates: [], execute: vi.fn(), refresh: vi.fn(), pending: vi.fn(), noAuth: true,
   quotaError: vi.fn(), clearQuotaStrikes: vi.fn(),
+  beginQuotaAttempt: vi.fn(), endQuotaAttempt: vi.fn(),
+  isQuotaAttemptSuperseded: vi.fn(), canQuotaAttemptClearFailure: vi.fn(), recordQuotaAttemptFailure: vi.fn(),
+  latestQuotaSuccessId: 0, newestQuotaFailureId: 0,
+  readConnections: vi.fn(), readSettings: vi.fn(), writeConnection: vi.fn(),
+  projectId: vi.fn(),
   models: ["openrouter/model-a", "deepseek/model-b"],
+  settings: { requireApiKey: false, comboStrategy: "fallback" },
 }));
 vi.mock("open-sse/index.js", () => ({}));
 vi.mock("open-sse/executors/index.js", () => ({
   getExecutor: () => ({ execute: state.execute, refreshCredentials: state.refresh, noAuth: state.noAuth }),
 }));
 vi.mock("@/lib/localDb", () => ({
-  getSettings: vi.fn(async () => ({ requireApiKey: false, comboStrategy: "fallback" })),
-  getProviderConnections: vi.fn(async ({ provider, isActive } = {}) => structuredClone(state.connections.filter(
-    (connection) => (!provider || connection.provider === provider) && (isActive === undefined || connection.isActive === isActive),
-  ))),
-  updateProviderConnection: vi.fn(async (id, update) => {
-    state.updates.push({ id, ...structuredClone(update) });
-    Object.assign(state.connections.find((connection) => connection.id === id) || {}, update);
-  }),
+  getSettings: (...args) => state.readSettings(...args),
+  getProviderConnections: (...args) => state.readConnections(...args),
+  updateProviderConnection: (...args) => state.writeConnection(...args),
   getProxyPools: vi.fn(async () => []), validateApiKey: vi.fn(async () => false),
 }));
 vi.mock("@/lib/network/connectionProxy", () => ({ resolveConnectionProxyConfig: vi.fn(async () => ({})), pickProxyPoolId: vi.fn() }));
@@ -34,14 +35,20 @@ vi.mock("@/sse/services/tokenRefresh.js", () => ({ updateProviderCredentials: vi
 vi.mock("@/sse/services/antigravityQuota.js", () => ({
   handleAntigravityQuotaError: state.quotaError,
   clearAntigravityStrikes: state.clearQuotaStrikes,
+  beginAntigravityQuotaAttempt: state.beginQuotaAttempt,
+  endAntigravityQuotaAttempt: state.endQuotaAttempt,
+  isAntigravityQuotaAttemptSuperseded: state.isQuotaAttemptSuperseded,
+  canAntigravityQuotaAttemptClearFailure: state.canQuotaAttemptClearFailure,
+  recordAntigravityQuotaAttemptFailure: state.recordQuotaAttemptFailure,
   getAntigravityQuotaCache: vi.fn(() => new Map()),
 }));
 vi.mock("@/lib/headroom/detect", () => ({ DEFAULT_HEADROOM_URL: "http://example.invalid" }));
 vi.mock("@/lib/pxpipe/loader.js", () => ({ getTransform: vi.fn() }));
 vi.mock("@/lib/pxpipe/events.js", () => ({ appendPxpipeEvent: vi.fn() }));
 vi.mock("open-sse/utils/bypassHandler.js", () => ({ handleBypassRequest: vi.fn(() => null) }));
-vi.mock("open-sse/services/projectId.js", () => ({ getProjectIdForConnection: vi.fn() }));
+vi.mock("open-sse/services/projectId.js", () => ({ getProjectIdForConnection: state.projectId }));
 vi.mock("open-sse/utils/requestLogger.js", () => ({
+  sanitizeUrl: (url) => url,
   createRequestLogger: async () => ({
     logClientRawRequest: vi.fn(), logRawRequest: vi.fn(), logTargetRequest: vi.fn(),
     logProviderResponse: vi.fn(), logConvertedResponse: vi.fn(), logError: vi.fn(),
@@ -54,6 +61,7 @@ vi.mock("@/lib/usageDb.js", () => ({
 
 import { getRotatedModels, resetComboRotation, handleComboChat } from "../../open-sse/services/combo.js";
 import { handleChat } from "../../src/sse/handlers/chat.js";
+import { getProviderCredentials } from "../../src/sse/services/auth.js";
 import { handleChatCore } from "../../open-sse/handlers/chatCore.js";
 import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 import * as translator from "../../open-sse/translator/index.js";
@@ -142,10 +150,46 @@ describe("actual app, account selection, core and combo boundaries", () => {
     vi.clearAllMocks();
     state.connections = []; state.updates = []; state.noAuth = true;
     state.models = ["openrouter/model-a", "deepseek/model-b"];
+    state.settings = { requireApiKey: false, comboStrategy: "fallback" };
+    state.readSettings.mockReset().mockImplementation(async () => state.settings);
+    state.readConnections.mockReset().mockImplementation(async ({ provider, isActive } = {}) => structuredClone(state.connections.filter(
+      (connection) => (!provider || connection.provider === provider) && (isActive === undefined || connection.isActive === isActive),
+    )));
+    state.writeConnection.mockReset().mockImplementation(async (id, update, options = {}) => {
+      if (options?.signal?.aborted) throw options.signal.reason ?? new DOMException("Request aborted", "AbortError");
+      if (options?.shouldCommit && !options.shouldCommit()) return null;
+      options?.beforeCommit?.();
+      if (options?.shouldCommit && !options.shouldCommit()) return null;
+      state.updates.push({ id, ...structuredClone(update) });
+      Object.assign(state.connections.find((connection) => connection.id === id) || {}, update);
+    });
+    let quotaAttemptId = 0;
+    state.latestQuotaSuccessId = 0;
+    state.newestQuotaFailureId = 0;
+    state.beginQuotaAttempt.mockReset().mockImplementation((connectionId, model) => ({ key: `${connectionId}|${model}`, id: ++quotaAttemptId }));
+    state.endQuotaAttempt.mockReset();
     state.execute.mockReset().mockImplementation(async () => executorResult());
     state.refresh.mockReset();
-    state.quotaError.mockReset().mockResolvedValue(null);
-    state.clearQuotaStrikes.mockReset();
+    state.projectId.mockReset().mockResolvedValue(null);
+    state.quotaError.mockReset().mockImplementation(async (...args) => {
+      const attempt = args.at(-1);
+      if (attempt?.id) state.newestQuotaFailureId = Math.max(state.newestQuotaFailureId, attempt.id);
+      return null;
+    });
+    state.clearQuotaStrikes.mockReset().mockImplementation((_connectionId, _model, attempt) => {
+      if (!attempt?.id) return;
+      state.latestQuotaSuccessId = Math.max(state.latestQuotaSuccessId, attempt.id);
+      if (attempt.id >= state.newestQuotaFailureId) state.newestQuotaFailureId = 0;
+    });
+    state.isQuotaAttemptSuperseded.mockReset().mockImplementation((attempt) => (
+      Boolean(attempt?.id && state.latestQuotaSuccessId > attempt.id)
+    ));
+    state.canQuotaAttemptClearFailure.mockReset().mockImplementation((attempt) => (
+      !attempt?.id || attempt.id >= state.newestQuotaFailureId
+    ));
+    state.recordQuotaAttemptFailure.mockReset().mockImplementation((attempt) => {
+      if (attempt?.id) state.newestQuotaFailureId = Math.max(state.newestQuotaFailureId, attempt.id);
+    });
     vi.spyOn(Date, "now").mockReturnValue(fixedNow);
   });
   afterEach(() => vi.restoreAllMocks());
@@ -199,6 +243,180 @@ describe("actual app, account selection, core and combo boundaries", () => {
     expect(state.updates).toEqual([]);
   });
 
+  it("preserves selection mutex ordering but skips round-robin writes for an aborted waiter", async () => {
+    state.connections = [makeConnection("openrouter")];
+    state.settings = { fallbackStrategy: "round-robin", stickyRoundRobinLimit: 3 };
+    let releaseFirstSettings;
+    let markFirstSettingsStarted;
+    const firstSettingsStarted = new Promise((resolve) => { markFirstSettingsStarted = resolve; });
+    let settingsReads = 0;
+    state.readSettings.mockImplementation(async () => {
+      settingsReads += 1;
+      if (settingsReads === 1) {
+        markFirstSettingsStarted();
+        await new Promise((resolve) => { releaseFirstSettings = resolve; });
+      }
+      return state.settings;
+    });
+
+    const first = getProviderCredentials("openrouter", null, "model-a");
+    await firstSettingsStarted;
+    const client = new AbortController();
+    const abortedWaiter = getProviderCredentials("openrouter", null, "model-a", { signal: client.signal });
+    client.abort();
+    releaseFirstSettings();
+
+    await expect(first).resolves.toMatchObject({ connectionId: "fixture-openrouter" });
+    await expect(abortedWaiter).rejects.toMatchObject({ name: "AbortError" });
+    expect(state.readConnections).toHaveBeenCalledTimes(1);
+    expect(state.updates).toHaveLength(1);
+    expect(state.updates[0]).toMatchObject({ id: "fixture-openrouter", consecutiveUseCount: 1 });
+  });
+
+  it("propagates a fusion quorum abort to the real straggler executor before judging", async () => {
+    state.models = ["openrouter/model-a", "deepseek/model-b", "openrouter/model-slow"];
+    state.settings = {
+      requireApiKey: false,
+      comboStrategy: "fusion",
+      comboStrategies: {
+        "test-combo": {
+          fallbackStrategy: "fusion",
+          judgeModel: "openrouter/model-judge",
+          fusionTuning: { minPanel: 2, stragglerGraceMs: 5, panelHardTimeoutMs: 1000 },
+        },
+      },
+    };
+    state.connections = [makeConnection("openrouter"), makeConnection("deepseek")];
+
+    let slowAborted = false;
+    let judgeObservedAbort = false;
+    state.execute.mockImplementation(async ({ model, signal }) => {
+      if (model === "model-slow") {
+        return new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            slowAborted = true;
+            reject(new DOMException("fusion straggler aborted", "AbortError"));
+          }, { once: true });
+        });
+      }
+      if (model === "model-judge") judgeObservedAbort = slowAborted;
+      return executorResult(new Response(JSON.stringify({
+        choices: [{ index: 0, message: { role: "assistant", content: `answer-${model}` }, finish_reason: "stop" }],
+      }), { headers: { "Content-Type": "application/json" } }));
+    });
+
+    const response = await handleChat(makeRequest("test-combo"));
+
+    expect(response.status).toBe(200);
+    expect(slowAborted).toBe(true);
+    expect(judgeObservedAbort).toBe(true);
+    expect(state.execute.mock.calls.some(([{ model }]) => model === "model-judge")).toBe(true);
+    expect(state.clearQuotaStrikes).not.toHaveBeenCalledWith("fixture-openrouter", "model-slow");
+    expect(state.quotaError).not.toHaveBeenCalled();
+  });
+
+  it("does not write cooldown after quorum aborts a panel paused in the auth DB read", async () => {
+    vi.useFakeTimers();
+    state.models = ["openrouter/model-fast-a", "deepseek/model-fast-b", "antigravity/model-slow"];
+    state.settings = {
+      requireApiKey: false,
+      comboStrategy: "fusion",
+      comboStrategies: {
+        "test-combo": {
+          fallbackStrategy: "fusion",
+          judgeModel: "openrouter/model-judge",
+          fusionTuning: { minPanel: 2, stragglerGraceMs: 5, panelHardTimeoutMs: 90_000 },
+        },
+      },
+    };
+    state.connections = [makeConnection("openrouter"), makeConnection("deepseek"), makeConnection("antigravity")];
+
+    let releaseMarkRead;
+    let markReadStarted;
+    const started = new Promise((resolve) => { markReadStarted = resolve; });
+    const defaultRead = state.readConnections.getMockImplementation();
+    state.readConnections.mockImplementation(async (query = {}) => {
+      if (query.provider === "antigravity" && query.isActive === undefined) {
+        markReadStarted();
+        await new Promise((resolve) => { releaseMarkRead = resolve; });
+      }
+      return defaultRead(query);
+    });
+    let markSlowEnded;
+    const slowEnded = new Promise((resolve) => { markSlowEnded = resolve; });
+    state.endQuotaAttempt.mockImplementation((attempt) => {
+      if (attempt?.key === "fixture-antigravity|model-slow") markSlowEnded();
+    });
+    state.execute.mockImplementation(async ({ model }) => {
+      if (model === "model-slow") {
+        return executorResult(new Response(JSON.stringify({ error: { message: "fixture overloaded" } }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        }));
+      }
+      return executorResult(new Response(JSON.stringify({
+        choices: [{ index: 0, message: { role: "assistant", content: `answer-${model}` }, finish_reason: "stop" }],
+      }), { headers: { "Content-Type": "application/json" } }));
+    });
+
+    try {
+      const pending = handleChat(makeRequest("test-combo"));
+      await started;
+      await vi.advanceTimersByTimeAsync(5);
+      const response = await pending;
+      expect(response.status).toBe(200);
+
+      releaseMarkRead();
+      await slowEnded;
+      expect(state.updates.some(({ id }) => id === "fixture-antigravity")).toBe(false);
+      expect(state.quotaError).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records Antigravity success before an account-cleanup rejection", async () => {
+    state.connections = [makeConnection("antigravity", {
+      testStatus: "unavailable",
+      lastError: "old failure",
+      errorCode: 429,
+    })];
+    let markCleanupStarted;
+    const cleanupStarted = new Promise((resolve) => { markCleanupStarted = resolve; });
+    state.writeConnection.mockImplementation(async () => {
+      markCleanupStarted();
+      throw new Error("fixture DB cleanup failure");
+    });
+
+    const response = await handleChat(makeRequest("antigravity/model-a"));
+    await cleanupStarted;
+
+    expect(response.status).toBe(200);
+    expect(state.clearQuotaStrikes).toHaveBeenCalledWith(
+      "fixture-antigravity",
+      "model-a",
+      expect.objectContaining({ key: "fixture-antigravity|model-a" }),
+    );
+    expect(state.clearQuotaStrikes.mock.invocationCallOrder[0])
+      .toBeLessThan(state.writeConnection.mock.invocationCallOrder[0]);
+  });
+
+  it("does not record Antigravity streaming success from headers alone", async () => {
+    state.connections = [makeConnection("antigravity")];
+    state.execute.mockImplementationOnce(async () => executorResult(new Response(new ReadableStream({
+      start() {
+        // Valid streaming headers with no terminal event: success cleanup must
+        // wait for the stream contract to complete, not the initial 200.
+      },
+    }), { headers: { "Content-Type": "text/event-stream" } })));
+
+    const response = await handleChat(makeRequest("antigravity/model-a", undefined, { stream: true }));
+    expect(response.status).toBe(200);
+    expect(state.clearQuotaStrikes).not.toHaveBeenCalled();
+    await response.body.cancel();
+    expect(state.clearQuotaStrikes).not.toHaveBeenCalled();
+  });
+
   it("stops Antigravity quota refresh and account fallback when the request aborts", async () => {
     state.connections = [
       makeConnection("antigravity", { id: "ag-first" }),
@@ -212,7 +430,7 @@ describe("actual app, account selection, core and combo boundaries", () => {
     let quotaStarted;
     const started = new Promise(resolve => { quotaStarted = resolve; });
     state.quotaError.mockImplementation((...args) => {
-      const signal = args.at(-1);
+      const signal = args.at(-2);
       quotaStarted();
       return new Promise((resolve, reject) => {
         const onAbort = () => reject(signal.reason ?? new DOMException("Request aborted", "AbortError"));
@@ -230,6 +448,125 @@ describe("actual app, account selection, core and combo boundaries", () => {
     expect(response.status).toBe(499);
     expect(state.quotaError).toHaveBeenCalledTimes(1);
     expect(state.execute).toHaveBeenCalledTimes(1);
+    expect(state.updates).toEqual([]);
+  });
+
+  it("returns a stale Antigravity 429 without cooldown or fallback after a newer success", async () => {
+    state.connections = [makeConnection("antigravity")];
+    state.execute
+      .mockResolvedValueOnce(executorResult(new Response(
+        JSON.stringify({ error: { message: "older quota error" } }),
+        { status: 429, headers: { "Content-Type": "application/json" } },
+      )))
+      .mockResolvedValueOnce(executorResult());
+    let releaseOlderQuota;
+    let markOlderQuotaStarted;
+    const olderQuotaStarted = new Promise((resolve) => { markOlderQuotaStarted = resolve; });
+    state.quotaError.mockImplementation(async () => {
+      markOlderQuotaStarted();
+      await new Promise((resolve) => { releaseOlderQuota = resolve; });
+      return null;
+    });
+
+    const older = handleChat(makeRequest("antigravity/model-a"));
+    await olderQuotaStarted;
+    const newerResponse = await handleChat(makeRequest("antigravity/model-a"));
+    expect(newerResponse.status).toBe(200);
+
+    releaseOlderQuota();
+    const olderResponse = await older;
+    expect(olderResponse.status).toBe(429);
+    expect(state.execute).toHaveBeenCalledTimes(2);
+    expect(state.updates).toEqual([]);
+    expect(state.isQuotaAttemptSuperseded).toHaveReturnedWith(true);
+  });
+
+  it("does not let an older success cleanup erase a newer Antigravity DB lock", async () => {
+    state.connections = [makeConnection("antigravity", {
+      testStatus: "unavailable",
+      lastError: "expired failure",
+      errorCode: 429,
+      "modelLock_model-a": new Date(fixedNow - 1_000).toISOString(),
+    })];
+    state.execute
+      .mockResolvedValueOnce(executorResult())
+      .mockResolvedValueOnce(executorResult(new Response(
+        JSON.stringify({ error: { message: "newer provider error" } }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      )));
+
+    let releaseOlderCleanupRead;
+    let markOlderCleanupReadStarted;
+    const olderCleanupReadStarted = new Promise((resolve) => { markOlderCleanupReadStarted = resolve; });
+    let unfilteredReads = 0;
+    const defaultRead = state.readConnections.getMockImplementation();
+    state.readConnections.mockImplementation(async (query = {}) => {
+      if (query.provider === "antigravity" && query.isActive === undefined) {
+        unfilteredReads += 1;
+        if (unfilteredReads === 1) {
+          markOlderCleanupReadStarted();
+          await new Promise((resolve) => { releaseOlderCleanupRead = resolve; });
+        }
+      }
+      return defaultRead(query);
+    });
+    let markRejectedCleanupGuardSeen;
+    const rejectedCleanupGuardSeen = new Promise((resolve) => { markRejectedCleanupGuardSeen = resolve; });
+    state.canQuotaAttemptClearFailure.mockImplementation((attempt) => {
+      const canClear = !attempt?.id || attempt.id >= state.newestQuotaFailureId;
+      if (!canClear && attempt?.id === 1) markRejectedCleanupGuardSeen();
+      return canClear;
+    });
+
+    const olderSuccess = await handleChat(makeRequest("antigravity/model-a"));
+    expect(olderSuccess.status).toBe(200);
+    await olderCleanupReadStarted;
+
+    const newerFailure = await handleChat(makeRequest("antigravity/model-a"));
+    expect(newerFailure.status).toBe(503);
+    expect(state.updates).toHaveLength(1);
+    expect(state.updates[0]).toMatchObject({
+      id: "fixture-antigravity",
+      testStatus: "unavailable",
+      errorCode: 503,
+    });
+    expect(state.recordQuotaAttemptFailure).toHaveBeenCalledWith(expect.objectContaining({ id: 2 }));
+
+    releaseOlderCleanupRead();
+    await rejectedCleanupGuardSeen;
+    await Promise.resolve();
+    expect(state.updates).toHaveLength(1);
+    expect(state.connections[0]["modelLock_model-a"]).not.toBeNull();
+    expect(state.connections[0].testStatus).toBe("unavailable");
+  });
+
+  it("stops during a cold project-ID lookup without dispatching or mutating account state", async () => {
+    state.connections = [makeConnection("antigravity", { accessToken: "access-token" })];
+    const client = new AbortController();
+    let lookupStarted;
+    const started = new Promise((resolve) => { lookupStarted = resolve; });
+    state.projectId.mockImplementation((_connectionId, _token, _provider, { signal }) => {
+      lookupStarted();
+      return new Promise((resolve, reject) => {
+        const onAbort = () => reject(signal.reason ?? new DOMException("Request aborted", "AbortError"));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      });
+    });
+
+    const pending = handleChat(makeRequest("antigravity/model-a", client.signal));
+    await started;
+    client.abort();
+    const response = await pending;
+
+    expect(response.status).toBe(499);
+    expect(state.projectId).toHaveBeenCalledWith(
+      "fixture-antigravity",
+      "access-token",
+      "antigravity",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(state.execute).not.toHaveBeenCalled();
     expect(state.updates).toEqual([]);
   });
 

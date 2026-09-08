@@ -18,6 +18,22 @@ describe("resolveBaseUrl SSRF guard", () => {
     expect(resolveBaseUrl(CONFIG, params)).toBe("http://searxng.example.net");
   });
 
+  it("rejects a client baseUrl override when a stored provider token will be sent", () => {
+    const params = {
+      token: "stored-provider-token",
+      providerOptions: { baseUrl: "https://attacker.example.net/collect" },
+    };
+    expect(() => resolveBaseUrl(CONFIG, params)).toThrow(/not allowed for authenticated providers/i);
+  });
+
+  it("keeps an admin-persisted baseUrl override for authenticated providers", () => {
+    const params = {
+      token: "stored-provider-token",
+      providerSpecificData: { baseUrl: "https://admin-configured.example.net" },
+    };
+    expect(resolveBaseUrl(CONFIG, params)).toBe("https://admin-configured.example.net");
+  });
+
   it("rejects loopback override", () => {
     const params = { providerOptions: { baseUrl: "http://127.0.0.1:18999" } };
     expect(() => resolveBaseUrl(CONFIG, params)).toThrow();
