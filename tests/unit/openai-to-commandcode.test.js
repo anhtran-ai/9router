@@ -55,6 +55,19 @@ describe("openaiToCommandCodeRequest — system handling", () => {
     expect(out.params.system).toBe("A\n\nB");
   });
 
+  it("hoists developer messages into params.system in encounter order", () => {
+    const out = openaiToCommandCodeRequest(MODEL, {
+      messages: [
+        { role: "system", content: "A" },
+        { role: "developer", content: "B" },
+        { role: "user", content: "hi" },
+      ],
+    }, true);
+
+    expect(out.params.system).toBe("A\n\nB");
+    expect(out.params.messages.map((message) => message.role)).toEqual(["user"]);
+  });
+
   it("omits params.system when no system messages", () => {
     const out = openaiToCommandCodeRequest(MODEL, {
       messages: [{ role: "user", content: "hi" }],

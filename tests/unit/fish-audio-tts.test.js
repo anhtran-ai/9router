@@ -5,15 +5,14 @@ import { PROVIDER_MEDIA } from "../../open-sse/providers/index.js";
 import { FORMAT_HANDLERS } from "../../open-sse/handlers/ttsProviders/genericFormats.js";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
 
-const AUDIO = new Uint8Array(256).fill(7);
+const AUDIO = new Uint8Array(417);
+AUDIO.set([0xff, 0xfb, 0x90, 0x64]);
 
 function okResponse() {
-  return {
-    ok: true,
+  return new Response(AUDIO, {
     status: 200,
-    headers: new Headers({ "content-type": "audio/mpeg" }),
-    arrayBuffer: async () => AUDIO.buffer,
-  };
+    headers: { "content-type": "audio/mpeg" },
+  });
 }
 
 describe("Fish Audio TTS provider", () => {
@@ -96,11 +95,10 @@ describe("Fish Audio TTS request shape", () => {
   });
 
   it("surfaces the upstream error message", async () => {
-    global.fetch = vi.fn(async () => ({
-      ok: false,
-      status: 402,
-      text: async () => JSON.stringify({ message: "Insufficient credit" }),
-    }));
+    global.fetch = vi.fn(async () => new Response(
+      JSON.stringify({ message: "Insufficient credit" }),
+      { status: 402, headers: { "content-type": "application/json" } },
+    ));
 
     await expect(
       handler({ baseUrl: "u", apiKey: "k", text: "t", modelId: "s1", voiceId: "" }),

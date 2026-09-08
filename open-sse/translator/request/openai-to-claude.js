@@ -1,13 +1,12 @@
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
-import { CLAUDE_SYSTEM_PROMPT } from "../../config/appConstants.js";
 import { adjustMaxTokens } from "../formats/maxTokens.js";
 import { safeParseJSON } from "../concerns/json.js";
 import { parseDataUri } from "../concerns/image.js";
 import { extractTextContent } from "../formats/gemini.js";
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
 import { getCapabilitiesForModel } from "../../providers/capabilities.js";
-import { renderHostedToolForClaude } from "../concerns/hostedToolPolicy.js";
+import { renderHostedToolForClaude, ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
 import { rejectNativeCustomTools, translateToolChoice } from "../concerns/toolChoice.js";
 
 // Empty prefix matches real Claude Code behavior (no tool name prefix).
@@ -139,17 +138,13 @@ Respond ONLY with the JSON object, no other text.`);
     }
   }
 
-  // System with Claude Code prompt and cache_control
-  const claudeCodePrompt = { type: CLAUDE_BLOCK.TEXT, text: CLAUDE_SYSTEM_PROMPT };
-
+  // User-provided system content only. Provider-specific identity belongs at
+  // the final provider boundary in prepareClaudeRequest().
   if (systemParts.length > 0) {
     const systemText = systemParts.join("\n");
     result.system = [
-      claudeCodePrompt,
       { type: CLAUDE_BLOCK.TEXT, text: systemText, cache_control: { type: "ephemeral", ttl: "1h" } }
     ];
-  } else {
-    result.system = [claudeCodePrompt];
   }
 
   // Tools - convert from OpenAI format to Claude format with prefix for OAuth
@@ -256,6 +251,8 @@ function getContentBlocksFromMessage(msg, toolNameMap = new Map()) {
           }
         } else if (part.type === OPENAI_BLOCK.IMAGE && part.source) {
           blocks.push({ type: CLAUDE_BLOCK.IMAGE, source: part.source });
+        } else if (part.type === OPENAI_BLOCK.INPUT_AUDIO || part.type === OPENAI_BLOCK.AUDIO_URL) {
+          throw new ToolCompatibilityError("Claude Messages targets do not support audio input blocks");
         } else if (part.type === OPENAI_BLOCK.FILE && part.file) {
           // OpenAI file block -> Claude document (PDF only; Claude rejects other mimes).
           const fileData = part.file.file_data;

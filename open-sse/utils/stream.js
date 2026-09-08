@@ -82,11 +82,25 @@ export function createSSEStream(options = {}) {
   let finalized = false;
   let pendingFinalized = false;
 
+  const observeLifecycleCallback = (label, callback, ...args) => {
+    if (!callback) return;
+    try {
+      Promise.resolve(callback(...args)).catch(error => {
+        console.error(`[SSE] ${label} failed:`, error?.message || error);
+      });
+    } catch (error) {
+      console.error(`[SSE] ${label} failed:`, error?.message || error);
+    }
+  };
+
   const finalizePending = () => {
     if (pendingFinalized) return;
     pendingFinalized = true;
-    if (onPendingDone) onPendingDone();
-    else trackPendingRequest(model, provider, connectionId, false);
+    if (onPendingDone) observeLifecycleCallback("onPendingDone", onPendingDone);
+    else {
+      try { trackPendingRequest(model, provider, connectionId, false); }
+      catch (error) { console.error("[SSE] pending-request cleanup failed:", error?.message || error); }
+    }
   };
 
   // Usage/logging tail, callable from transform() as well as flush(): a client that
@@ -110,12 +124,10 @@ export function createSSEStream(options = {}) {
       appendRequestLog({ model, provider, connectionId, tokens: null, status: "200 OK" }).catch(() => { });
     }
 
-    if (onStreamComplete) {
-      onStreamComplete({
-        content: accumulatedContent,
-        thinking: accumulatedThinking
-      }, finalUsage, ttftAt);
-    }
+    observeLifecycleCallback("onStreamComplete", onStreamComplete, {
+      content: accumulatedContent,
+      thinking: accumulatedThinking
+    }, finalUsage, ttftAt);
   };
 
   return new TransformStream({

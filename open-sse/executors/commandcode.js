@@ -3,6 +3,7 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { commandCodeToOpenAIResponse } from "../translator/response/commandcode-to-openai.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
+import { cancelReaderBestEffort } from "../utils/reader.js";
 
 /**
  * CommandCodeExecutor — talks to https://api.commandcode.ai/alpha/generate
@@ -209,7 +210,7 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
   }
 
   if (detectedError) {
-    try { await reader.cancel(); } catch { /* ignore */ }
+    cancelReaderBestEffort(reader, "CommandCode error event");
     const { statusCode, message, type } = parseCommandCodeError(detectedError);
     return new Response(
       JSON.stringify({
@@ -266,12 +267,8 @@ function createReplayedStream(bufferedLines, remainingBuffer, reader) {
         controller.error(err);
       }
     },
-    async cancel(reason) {
-      try {
-        await reader.cancel(reason);
-      } catch {
-        /* ignore */
-      }
+    cancel(reason) {
+      cancelReaderBestEffort(reader, reason);
     },
   });
 }
@@ -281,6 +278,8 @@ function wrapNdjsonAsOpenAISse(streamBody, model, originalResponse = null) {
   const encoder = new TextEncoder();
   let buffer = "";
   const state = { model };
+  let terminalSeen = false;
+  let failed = false;
 
   const emitChunks = (chunks, controller) => {
     if (!chunks) return;
@@ -291,21 +290,56 @@ function wrapNdjsonAsOpenAISse(streamBody, model, originalResponse = null) {
     }
   };
 
+  const emitFailure = (controller, code, reason) => {
+    if (failed) return;
+    failed = true;
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+      error: {
+        message: `Invalid upstream response: ${reason}`,
+        type: "upstream_error",
+        code,
+      },
+    })}\n\n`));
+  };
+
+  const processLine = (line, controller) => {
+    if (failed) return;
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const jsonText = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
+    if (!jsonText || jsonText === "[DONE]") return;
+
+    let event;
+    try { event = JSON.parse(jsonText); } catch {
+      emitFailure(controller, "commandcode_malformed_stream", "malformed CommandCode event");
+      return;
+    }
+    if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string") {
+      emitFailure(controller, "commandcode_malformed_stream", "invalid CommandCode event");
+      return;
+    }
+    if (event.type === "error") {
+      emitFailure(controller, "commandcode_upstream_error", "CommandCode returned an error event");
+      return;
+    }
+    if (event.type === "finish") terminalSeen = true;
+    emitChunks(commandCodeToOpenAIResponse(event, state), controller);
+  };
+
   const transform = new TransformStream({
     transform(chunk, controller) {
       buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        emitChunks(commandCodeToOpenAIResponse(trimmed, state), controller);
+        processLine(line, controller);
       }
     },
     flush(controller) {
       const trimmed = buffer.trim();
-      if (trimmed) {
-        emitChunks(commandCodeToOpenAIResponse(trimmed, state), controller);
+      if (trimmed) processLine(trimmed, controller);
+      if (!failed && !terminalSeen) {
+        emitFailure(controller, "commandcode_missing_terminal", "CommandCode stream ended without a finish event");
       }
       controller.enqueue(encoder.encode(SSE_DONE));
     },

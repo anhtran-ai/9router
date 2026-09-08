@@ -13,6 +13,135 @@ const searchEndpoint = (id, model) =>
 
 const REQUEST_TIMEOUT_MS = 15000;
 const DEFAULT_MAX_RESULTS = 10;
+const MAX_CHAT_SEARCH_RESPONSE_BYTES = 16 * 1024 * 1024;
+
+function chatSearchBodyTooLargeError() {
+  const error = new Error("Upstream chat-search response body is too large");
+  error.code = "UPSTREAM_BODY_TOO_LARGE";
+  return error;
+}
+
+function releaseReader(reader) {
+  try { reader?.releaseLock?.(); } catch { /* a pending read releases after cancellation settles */ }
+}
+
+function cancelReader(reader, reason) {
+  let cancellation;
+  try {
+    cancellation = reader?.cancel?.(reason);
+  } catch {
+    releaseReader(reader);
+    return;
+  }
+  Promise.resolve(cancellation).catch(() => {}).finally(() => releaseReader(reader));
+}
+
+function discardResponseBody(response, reason) {
+  if (!response?.body || response.bodyUsed === true) return;
+  try {
+    const cancellation = response.body.cancel(reason);
+    cancellation?.catch?.(() => {});
+  } catch { /* best-effort connection release */ }
+}
+
+function upstreamErrorMessage(data) {
+  if (!data || typeof data !== "object") return null;
+  const failedStatus = typeof data.status === "string"
+    && ["error", "failed", "failure", "cancelled", "canceled"].includes(data.status.toLowerCase());
+  const explicitFailure = data.success === false || data.ok === false || failedStatus;
+  const error = data.error;
+  if (error != null && error !== false && error !== "") {
+    if (typeof error === "string") return error;
+    if (typeof error?.message === "string" && error.message.trim()) return error.message;
+    try { return JSON.stringify(error); } catch { return "Upstream returned an error payload"; }
+  }
+  if (explicitFailure) {
+    return typeof data.message === "string" && data.message.trim()
+      ? data.message
+      : "Upstream reported an unsuccessful search";
+  }
+  return null;
+}
+
+function hasExpectedChatEnvelope(provider, data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+  if (provider === "gemini") return !!data.candidates?.[0]?.content;
+  if (provider === "antigravity") {
+    const response = data.response || data;
+    return !!response?.candidates?.[0]?.content;
+  }
+  if (["openai", "kimi", "minimax", "perplexity"].includes(provider)) {
+    return !!data.choices?.[0]?.message;
+  }
+  if (["xai", "perplexity-agent"].includes(provider)) {
+    return Array.isArray(data.output) && data.output.length > 0;
+  }
+  return false;
+}
+
+function runWithSignal(operation, signal) {
+  const reason = () => signal?.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted", "AbortError");
+  if (signal?.aborted) return Promise.reject(reason());
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener?.("abort", onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(reject, reason());
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+    Promise.resolve().then(operation).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+async function readBoundedJson(response, signal) {
+  const declaredLength = response?.headers?.get?.("content-length");
+  if (declaredLength !== null && Number(declaredLength) > MAX_CHAT_SEARCH_RESPONSE_BYTES) {
+    discardResponseBody(response, chatSearchBodyTooLargeError());
+    throw chatSearchBodyTooLargeError();
+  }
+
+  if (!response?.body?.getReader) {
+    const data = await runWithSignal(() => response.json(), signal);
+    if (new TextEncoder().encode(JSON.stringify(data)).byteLength > MAX_CHAT_SEARCH_RESPONSE_BYTES) {
+      throw chatSearchBodyTooLargeError();
+    }
+    return data;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await runWithSignal(() => reader.read(), signal);
+      if (done) break;
+      total += value?.byteLength || 0;
+      if (total > MAX_CHAT_SEARCH_RESPONSE_BYTES) throw chatSearchBodyTooLargeError();
+      chunks.push(value);
+    }
+  } catch (error) {
+    cancelReader(reader, error);
+    throw error;
+  } finally {
+    releaseReader(reader);
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: response.ok }).decode(bytes));
+}
 
 /**
  * Normalize a citation entry into the unified result shape.
@@ -433,7 +562,9 @@ export async function handleChatSearch({
   maxResults,
   model,
   credentials,
-  log
+  log,
+  signal: outerSignal = null,
+  timeoutMs = REQUEST_TIMEOUT_MS,
 }) {
   const startTime = Date.now();
   const cfg = CHAT_SEARCH_CONFIG[provider];
@@ -474,7 +605,13 @@ export async function handleChatSearch({
   const headers = cfg.buildHeaders(token);
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const boundedTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? Math.max(1, Math.floor(timeoutMs))
+    : REQUEST_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), boundedTimeout);
+  const signal = outerSignal
+    ? AbortSignal.any([outerSignal, controller.signal])
+    : controller.signal;
 
   let upstreamStart = Date.now();
   let resp;
@@ -483,11 +620,14 @@ export async function handleChatSearch({
       method: "POST",
       headers,
       body: JSON.stringify(body),
-      signal: controller.signal
+      signal,
     });
   } catch (err) {
     clearTimeout(timer);
-    if (err?.name === "AbortError") {
+    if (outerSignal?.aborted) {
+      return { success: false, status: 499, error: "Client closed request" };
+    }
+    if (controller.signal.aborted || err?.name === "AbortError") {
       log?.warn?.(`[chatSearch] timeout provider=${provider}`);
       return { success: false, status: 504, error: "Upstream timeout" };
     }
@@ -498,19 +638,31 @@ export async function handleChatSearch({
       error: `Network error: ${err?.message || "unknown"}`
     };
   }
-  clearTimeout(timer);
   const upstreamLatency = Date.now() - upstreamStart;
 
   let data;
   try {
-    data = await resp.json();
-  } catch {
+    data = await readBoundedJson(resp, signal);
+  } catch (err) {
+    discardResponseBody(resp, err);
+    clearTimeout(timer);
+    if (outerSignal?.aborted) {
+      return { success: false, status: 499, error: "Client closed request" };
+    }
+    if (controller.signal.aborted || err?.name === "AbortError") {
+      log?.warn?.(`[chatSearch] timeout provider=${provider}`);
+      return { success: false, status: 504, error: "Upstream timeout" };
+    }
+    if (err?.code === "UPSTREAM_BODY_TOO_LARGE") {
+      return { success: false, status: 502, error: err.message };
+    }
     return {
       success: false,
       status: 502,
       error: `Invalid upstream response (status ${resp.status})`
     };
   }
+  clearTimeout(timer);
 
   if (!resp.ok) {
     const errMsg =
@@ -526,9 +678,33 @@ export async function handleChatSearch({
     };
   }
 
+  const embeddedError = upstreamErrorMessage(data);
+  if (embeddedError) {
+    log?.warn?.(`[chatSearch] semantic upstream error provider=${provider}`);
+    return { success: false, status: 502, error: embeddedError };
+  }
+  if (!hasExpectedChatEnvelope(provider, data)) {
+    return {
+      success: false,
+      status: 502,
+      error: `Invalid upstream response envelope for ${provider}`,
+    };
+  }
+
   const { text, citations, tokens } = cfg.extractAnswer(data);
+  const hasAnswer = typeof text === "string" && text.trim().length > 0;
+  const validCitations = Array.isArray(citations)
+    ? citations.filter((citation) => typeof citation?.url === "string" && citation.url.trim().length > 0)
+    : [];
+  if (!hasAnswer && validCitations.length === 0) {
+    return {
+      success: false,
+      status: 502,
+      error: `${provider} returned no answer or search citations`,
+    };
+  }
   const retrievedAt = new Date().toISOString();
-  const limited = (citations || []).slice(0, limit);
+  const limited = validCitations.slice(0, limit);
   const results = limited.map((c, i) => toResult(c, i, provider, retrievedAt));
 
   return {

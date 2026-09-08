@@ -703,9 +703,9 @@ describe("Kiro terminal integrity recovery", () => {
   it("surfaces retry HTTP failures as SSE after heartbeat commits headers", async () => {
     fetchMock
       .mockResolvedValueOnce(response([]))
-      .mockResolvedValueOnce(new Response("unauthorized", {
-        status: 401,
-        statusText: "Unauthorized"
+      .mockResolvedValueOnce(new Response("invalid repair request", {
+        status: 400,
+        statusText: "Bad Request"
       }));
 
     const result = await execute();
@@ -713,15 +713,16 @@ describe("Kiro terminal integrity recovery", () => {
 
     expect(result.response.status).toBe(200);
     expect(body).toContain("kiro_integrity_retry_upstream_error");
-    expect(body).toContain("unauthorized");
+    expect(body).toContain("invalid repair request");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("bounds the retry HTTP error body", async () => {
     fetchMock
       .mockResolvedValueOnce(response([]))
       .mockResolvedValueOnce(new Response(`error-start-${"x".repeat(10_000)}-error-tail`, {
-        status: 401,
-        statusText: "Unauthorized"
+        status: 400,
+        statusText: "Bad Request"
       }));
 
     const body = await (await execute()).response.text();
@@ -729,6 +730,26 @@ describe("Kiro terminal integrity recovery", () => {
     expect(body).toContain("error-start-");
     expect(body).not.toContain("error-tail");
     expect(body.length).toBeLessThan(5000);
+  });
+
+  it("bounds a repair retry's auth-surface fallback to every configured endpoint", async () => {
+    fetchMock
+      .mockResolvedValueOnce(response([]))
+      .mockResolvedValueOnce(new Response("runtime unauthorized", { status: 401 }))
+      .mockResolvedValueOnce(new Response("codewhisperer unauthorized", { status: 401 }))
+      .mockResolvedValueOnce(new Response("q unauthorized", { status: 401 }));
+
+    const body = await (await execute()).response.text();
+    const retryUrls = fetchMock.mock.calls.slice(1).map(([url]) => url);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(retryUrls).toEqual([
+      "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+      "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+      "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
+    ]);
+    expect(body).toContain("kiro_integrity_retry_upstream_error");
+    expect(body).toContain("q unauthorized");
   });
 
   it("propagates cancellation while validation is waiting for EOF", async () => {

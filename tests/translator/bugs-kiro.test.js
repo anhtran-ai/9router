@@ -3,6 +3,7 @@ import { describe, it, expect } from "vitest";
 import "./registerAll.js";
 import { translateRequest } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
+import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 
 const O2K = (body) => translateRequest(FORMATS.OPENAI, FORMATS.KIRO, "m", body, true, null, "kiro");
 const R2K = (model, body) => translateRequest(
@@ -33,8 +34,7 @@ describe("OpenAI → Kiro", () => {
     expect(out.systemPrompt || "").not.toContain("<max_thinking_length>");
   });
 
-  // openai-to-kiro.js — safeJSONParse guards bad tool-call JSON (fixed in PR #1582)
-  it("malformed tool arguments do not throw the whole request", () => {
+  it("fails closed instead of replacing malformed tool arguments with an empty object", () => {
     expect(() =>
       O2K({
         messages: [
@@ -45,26 +45,28 @@ describe("OpenAI → Kiro", () => {
           { role: "tool", tool_call_id: "c1", content: "r" },
         ],
       })
-    ).not.toThrow();
+    ).toThrowError(ToolCompatibilityError);
   });
 
-  // openai-to-kiro.js:309 — maxTokens hardcoded to 32000, ignores body.max_tokens
-  // KNOWN BUG
-  it.fails("respects client max_tokens", () => {
+  it("respects client max_tokens", () => {
     const out = O2K({ max_tokens: 100, messages: [{ role: "user", content: "hi" }] });
     expect(out.inferenceConfig?.maxTokens, "client max_tokens ignored").toBe(100);
   });
 
-  // openai-to-kiro.js:132-134 — remote http image becomes "[Image: url]" text (lost)
-  // KNOWN BUG
-  it.fails("remote image url is preserved as an image, not text", () => {
-    const out = O2K({
+  it("fails closed if a remote image remains after the prefetch boundary", () => {
+    expect(() => O2K({
       messages: [{ role: "user", content: [
         { type: "text", text: "see" },
         { type: "image_url", image_url: { url: "https://x.com/p.png" } },
       ] }],
-    });
-    const content = out.conversationState?.currentMessage?.userInputMessage?.content || "";
-    expect(content, "remote image flattened to text").not.toContain("[Image:");
+    })).toThrowError(ToolCompatibilityError);
+  });
+
+  it.each([
+    { type: "input_audio", input_audio: { data: "AAAA", format: "wav" } },
+    { type: "file", file: { file_data: "data:application/pdf;base64,AAAA" } },
+  ])("fails closed for unsupported rich content $type", (part) => {
+    expect(() => O2K({ messages: [{ role: "user", content: [part] }] }))
+      .toThrowError(ToolCompatibilityError);
   });
 });

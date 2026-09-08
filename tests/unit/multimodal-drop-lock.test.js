@@ -2,6 +2,7 @@
 import { describe, it, expect } from "vitest";
 import { openaiToClaudeRequest } from "../../open-sse/translator/request/openai-to-claude.js";
 import { convertOpenAIContentToParts } from "../../open-sse/translator/formats/gemini.js";
+import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 
 function userImage(detail) {
   return {
@@ -26,7 +27,7 @@ describe("openai→claude: image_url.detail is dropped (docs 11 §4)", () => {
     expect("detail" in imgBlock.source).toBe(false);
   });
 
-  it("drops input_audio entirely (claude has no audio block)", () => {
+  it("fails closed for input_audio (Claude has no audio block)", () => {
     const body = {
       model: "claude-sonnet-4-6",
       messages: [{ role: "user", content: [
@@ -34,9 +35,7 @@ describe("openai→claude: image_url.detail is dropped (docs 11 §4)", () => {
         { type: "input_audio", input_audio: { data: "ZZZ", format: "wav" } },
       ] }],
     };
-    const out = openaiToClaudeRequest("claude-sonnet-4-6", body, false);
-    const blocks = out.messages[0].content;
-    expect(blocks.some((b) => b.type === "audio" || b.type === "input_audio")).toBe(false);
+    expect(() => openaiToClaudeRequest("claude-sonnet-4-6", body, false)).toThrowError(ToolCompatibilityError);
   });
 });
 

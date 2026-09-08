@@ -3,19 +3,19 @@
 // Message contract: target text in `role: assistant` content, style/voice
 // instructions in `role: user` content. Voice is selected via the top-level
 // `audio.voice` field (NOT embedded in the model name).
-import { parseModelVoice } from "./_base.js";
+import { parseModelVoice, readTtsJson, throwUpstreamError } from "./_base.js";
 
 const DEFAULT_MODEL = "mimo-v2.5-tts";
 const DEFAULT_VOICE = "mimo_default";
 
 export default {
-  synthesize(text, model, credentials, responseFormat, { style, language } = {}) {
+  synthesize(text, model, credentials, _responseFormat, options = {}) {
     if (!credentials?.apiKey) throw new Error("xiaomi-mimo API key required");
-    return synthesizeMiMo(text, model, credentials.apiKey, style, language);
+    return synthesizeMiMo(text, model, credentials.apiKey, options.style, options.language, options);
   },
 };
 
-export async function synthesizeMiMo(text, model, apiKey, style, language) {
+export async function synthesizeMiMo(text, model, apiKey, style, language, options = {}) {
   const { modelId, voiceId } = parseModelVoice(model, DEFAULT_MODEL, DEFAULT_VOICE, [DEFAULT_MODEL]);
 
   // Language and style are soft instructions → prepend as a role:user message.
@@ -43,17 +43,11 @@ export async function synthesizeMiMo(text, model, apiKey, style, language) {
         voice: voiceId || DEFAULT_VOICE,
       },
     }),
+    signal: options.signal,
   });
 
-  const rawText = await res.text();
-  let data = {};
-  if (rawText) {
-    try { data = JSON.parse(rawText); } catch { data = {}; }
-  }
-
-  if (!res.ok) {
-    throw new Error(data?.error?.message || rawText || `MiMo TTS error (${res.status})`);
-  }
+  if (!res.ok) await throwUpstreamError(res, options);
+  const data = await readTtsJson(res, options);
 
   const audio = data?.choices?.[0]?.message?.audio?.data;
   if (!audio) throw new Error(data?.error?.message || "MiMo TTS returned no audio");

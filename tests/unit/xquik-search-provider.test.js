@@ -12,6 +12,7 @@ vi.mock("../../src/shared/utils/ssrfGuard.js", async (importOriginal) => {
 import REGISTRY from "../../open-sse/providers/registry/index.js";
 import { buildSearchRequest } from "../../open-sse/handlers/search/callers.js";
 import { handleSearchCore } from "../../open-sse/handlers/search/index.js";
+import { handleChatSearch } from "../../open-sse/handlers/search/chatSearch.js";
 import { normalizeSearchResponse } from "../../open-sse/handlers/search/normalizers.js";
 import { AI_PROVIDERS, getProvidersByKind } from "@/shared/constants/providers.js";
 
@@ -49,7 +50,11 @@ const RESPONSE = {
   next_cursor: "cursor-2",
 };
 
+const originalFetch = global.fetch;
+
 afterEach(() => {
+  vi.useRealTimers();
+  global.fetch = originalFetch;
   mocks.fetchPublic.mockReset();
 });
 
@@ -159,5 +164,94 @@ describe("Xquik search provider", () => {
       provider_credits_used: 1,
     });
     expect(payload.pagination).toEqual({ has_more: true, next_cursor: "cursor-2" });
+  });
+
+  it("keeps the chat-search timeout active while parsing a stalled body", async () => {
+    vi.useFakeTimers();
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    global.fetch = vi.fn(async (_url, init) => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "Content-Type": "application/json" }),
+      body: { cancel },
+      json: () => new Promise((resolve, reject) => {
+        const abort = () => reject(new DOMException("body timeout", "AbortError"));
+        if (init.signal.aborted) abort();
+        else init.signal.addEventListener("abort", abort, { once: true });
+      }),
+    }));
+
+    const pending = handleChatSearch({
+      provider: "gemini",
+      query: "stalled response",
+      credentials: { apiKey: "fixture-key" },
+      timeoutMs: 25,
+    });
+    await vi.advanceTimersByTimeAsync(25);
+
+    await expect(pending).resolves.toMatchObject({ success: false, status: 504 });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("caps a declared oversized chat-search JSON body and releases it", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream({ start() {}, cancel });
+    global.fetch = vi.fn().mockResolvedValue(new Response(body, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": String(16 * 1024 * 1024 + 1),
+      },
+    }));
+
+    const result = await handleChatSearch({
+      provider: "gemini",
+      query: "oversized response",
+      credentials: { apiKey: "fixture-key" },
+    });
+
+    expect(result).toMatchObject({ success: false, status: 502 });
+    expect(result.error).toMatch(/too large/i);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(body.locked).toBe(false);
+  });
+
+  it("keeps dedicated plus chat fallback inside one global deadline", async () => {
+    vi.useFakeTimers();
+    mocks.fetchPublic.mockImplementation(() => new Promise((resolve) => {
+      setTimeout(() => resolve(Response.json({ error: "retry" }, { status: 502 })), 14_990);
+    }));
+    let fallbackSignal;
+    global.fetch = vi.fn((_url, init) => {
+      fallbackSignal = init.signal;
+      return new Promise((_, reject) => {
+        const abort = () => reject(new DOMException("fallback timeout", "AbortError"));
+        if (init.signal.aborted) abort();
+        else init.signal.addEventListener("abort", abort, { once: true });
+      });
+    });
+
+    const pending = handleSearchCore({
+      body: { query: "one deadline" },
+      provider: { id: "gemini", searchViaChat: { defaultModel: "gemini-2.5-flash" } },
+      providerConfig: {
+        authType: "apikey",
+        baseUrl: "https://8.8.8.8/search",
+        timeoutMs: 15_000,
+        defaultMaxResults: 1,
+        maxMaxResults: 1,
+        searchTypes: ["web"],
+      },
+      credentials: { apiKey: "fixture-key" },
+    });
+
+    await vi.advanceTimersByTimeAsync(14_990);
+    for (let i = 0; i < 30 && global.fetch.mock.calls.length === 0; i++) await Promise.resolve();
+    expect(global.fetch).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(10);
+
+    await expect(pending).resolves.toMatchObject({ success: false });
+    expect(fallbackSignal.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

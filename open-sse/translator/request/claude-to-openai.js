@@ -164,6 +164,7 @@ function convertClaudeMessage(msg) {
     const parts = [];
     const toolCalls = [];
     const toolResults = [];
+    const reasoningParts = [];
 
     for (const block of msg.content) {
       switch (block.type) {
@@ -179,8 +180,22 @@ function convertClaudeMessage(msg) {
                 url: encodeDataUri(block.source.media_type, block.source.data)
               }
             });
+          } else if (block.source?.type === "url" && typeof block.source.url === "string") {
+            parts.push({
+              type: OPENAI_BLOCK.IMAGE_URL,
+              image_url: { url: block.source.url }
+            });
+          } else {
+            throw new ToolCompatibilityError("OpenAI Chat targets cannot represent this Claude image source");
           }
           break;
+
+        case CLAUDE_BLOCK.THINKING:
+          if (typeof block.thinking === "string" && block.thinking) reasoningParts.push(block.thinking);
+          break;
+
+        case CLAUDE_BLOCK.REDACTED_THINKING:
+          throw new ToolCompatibilityError("OpenAI Chat targets cannot preserve Claude redacted thinking blocks");
 
         case CLAUDE_BLOCK.TOOL_USE:
           toolCalls.push({
@@ -198,13 +213,14 @@ function convertClaudeMessage(msg) {
           if (typeof block.content === "string") {
             resultContent = block.content;
           } else if (Array.isArray(block.content)) {
-            resultContent = block.content
-              .filter(c => c.type === CLAUDE_BLOCK.TEXT)
-              .map(c => c.text)
-              .join("\n") || JSON.stringify(block.content);
+            if (block.content.some(c => c?.type !== CLAUDE_BLOCK.TEXT)) {
+              throw new ToolCompatibilityError("OpenAI Chat targets cannot represent images in Claude tool results");
+            }
+            resultContent = block.content.map(c => c.text || "").join("\n");
           } else if (block.content) {
             resultContent = JSON.stringify(block.content);
           }
+          if (block.is_error) resultContent = `[Tool error]\n${resultContent}`;
           
           toolResults.push({
             role: ROLE.TOOL,
@@ -230,15 +246,24 @@ function convertClaudeMessage(msg) {
         result.content = collapseTextParts(parts);
       }
       result.tool_calls = toolCalls;
+      if (reasoningParts.length > 0) result.reasoning_content = reasoningParts.join("\n");
       return result;
     }
 
     // Return content
     if (parts.length > 0) {
-      return {
+      const result = {
         role,
         content: collapseTextParts(parts)
       };
+      if (role === ROLE.ASSISTANT && reasoningParts.length > 0) {
+        result.reasoning_content = reasoningParts.join("\n");
+      }
+      return result;
+    }
+
+    if (role === ROLE.ASSISTANT && reasoningParts.length > 0) {
+      return { role, content: "", reasoning_content: reasoningParts.join("\n") };
     }
     
     // Empty content array

@@ -9,16 +9,19 @@ import { fetchImageAsBase64 } from "../../open-sse/translator/concerns/image.js"
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 function mockFetchOnce(bytes, ok = true) {
+  const releaseLock = vi.fn();
   const body = {
     getReader() {
       let sent = false;
       return {
         read: async () => sent ? { done: true } : (sent = true, { done: false, value: new Uint8Array(bytes) }),
         cancel: async () => {},
+        releaseLock,
       };
     },
   };
   globalThis.fetch = vi.fn(async () => ({ ok, body }));
+  return { releaseLock };
 }
 
 beforeEach(() => {
@@ -28,7 +31,10 @@ beforeEach(() => {
   // SSRF assertions pass for the wrong reason.
   lookupMock.mockResolvedValue([{ address: "93.184.216.34", family: 4 }]); // public by default
 });
-afterEach(() => { vi.restoreAllMocks(); });
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe("fetchImageAsBase64 hardening", () => {
   it("rejects non-http url", async () => {
@@ -74,11 +80,12 @@ describe("fetchImageAsBase64 hardening", () => {
   });
 
   it("accepts valid PNG from public host", async () => {
-    mockFetchOnce(PNG);
+    const { releaseLock } = mockFetchOnce(PNG);
     const r = await fetchImageAsBase64("https://example.com/a.png");
     expect(r).not.toBeNull();
     expect(r.mimeType).toBe("image/png");
     expect(r.url.startsWith("data:image/png;base64,")).toBe(true);
+    expect(releaseLock).toHaveBeenCalledOnce();
   });
 
   it("rejects disguised non-image payload (magic byte mismatch)", async () => {
@@ -87,12 +94,67 @@ describe("fetchImageAsBase64 hardening", () => {
   });
 
   it("rejects payload over size cap", async () => {
-    mockFetchOnce(Buffer.alloc(1024));
+    const { releaseLock } = mockFetchOnce(Buffer.alloc(1024));
     expect(await fetchImageAsBase64("https://example.com/big.png", { maxBytes: 100 })).toBeNull();
+    expect(releaseLock).toHaveBeenCalledOnce();
   });
 
   it("returns null when fetch not ok", async () => {
     mockFetchOnce(PNG, false);
     expect(await fetchImageAsBase64("https://example.com/404.png")).toBeNull();
+  });
+
+  it("does not wait forever for a non-cooperative response cancellation", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    globalThis.fetch = vi.fn(async () => ({ ok: false, body: { cancel } }));
+
+    await expect(fetchImageAsBase64("https://example.com/404.png")).resolves.toBeNull();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("honors an already-aborted caller before an unresolved DNS lookup", async () => {
+    lookupMock.mockReturnValue(new Promise(() => {}));
+    globalThis.fetch = vi.fn();
+    const controller = new AbortController();
+    controller.abort(new Error("caller closed"));
+
+    await expect(fetchImageAsBase64("https://example.com/a.png", {
+      signal: controller.signal,
+    })).resolves.toBeNull();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("enforces its deadline when fetch ignores AbortSignal before headers", async () => {
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn(() => new Promise(() => {}));
+
+    const pending = fetchImageAsBase64("https://example.com/a.png", { timeoutMs: 100 });
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(globalThis.fetch).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(pending).resolves.toBeNull();
+  });
+
+  it("enforces its deadline when a response body read ignores AbortSignal", async () => {
+    vi.useFakeTimers();
+    const reader = {
+      read: vi.fn(() => new Promise(() => {})),
+      cancel: vi.fn(() => new Promise(() => {})),
+      releaseLock: vi.fn(),
+    };
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      body: { getReader: () => reader },
+    }));
+
+    const pending = fetchImageAsBase64("https://example.com/a.png", { timeoutMs: 100 });
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(reader.read).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(pending).resolves.toBeNull();
+    expect(reader.cancel).toHaveBeenCalledOnce();
+    expect(reader.releaseLock).toHaveBeenCalled();
   });
 });

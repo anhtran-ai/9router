@@ -10,12 +10,18 @@ const mocks = vi.hoisted(() => ({
   getCombos: vi.fn(),
   handleFetchCore: vi.fn(),
   checkAndRefreshToken: vi.fn(),
+  beginAccountMutationAttempt: vi.fn(() => ({ id: 1 })),
+  endAccountMutationAttempt: vi.fn(),
+  recordAccountMutationSuccess: vi.fn(),
 }));
 
 vi.mock("@/sse/services/auth.js", () => ({
   getProviderCredentials: mocks.getProviderCredentials,
   markAccountUnavailable: mocks.markAccountUnavailable,
   clearAccountError: mocks.clearAccountError,
+  beginAccountMutationAttempt: mocks.beginAccountMutationAttempt,
+  endAccountMutationAttempt: mocks.endAccountMutationAttempt,
+  recordAccountMutationSuccess: mocks.recordAccountMutationSuccess,
   extractApiKey: mocks.extractApiKey,
   isValidApiKey: mocks.isValidApiKey,
 }));
@@ -86,12 +92,32 @@ describe("web fetch account state", () => {
       "jina-connection",
       expect.objectContaining({ connectionName: "Jina Test" }),
       "webfetch:jina-reader",
+      { mutationAttempt: { id: 1 } },
     );
     expect(mocks.getProviderCredentials).toHaveBeenCalledWith(
       "jina-reader",
       expect.any(Set),
       "webfetch:jina-reader",
     );
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+  });
+
+  it("preserves a successful fetch when account cleanup rejects", async () => {
+    mocks.clearAccountError.mockRejectedValueOnce(new Error("database unavailable"));
+
+    const response = await handleFetch(new Request("http://localhost/v1/web/fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "jina-reader",
+        url: "https://example.com/article",
+      }),
+    }));
+    await Promise.resolve();
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ content: { text: "ok" } });
+    expect(mocks.recordAccountMutationSuccess).toHaveBeenCalledWith({ id: 1 });
     expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
   });
 
@@ -119,6 +145,35 @@ describe("web fetch account state", () => {
       "quota exceeded",
       "jina-reader",
       "webfetch:jina-reader",
+      null,
+      { mutationAttempt: { id: 1 } },
     );
+  });
+
+  it("passes the client signal through and does not mutate account state on 499", async () => {
+    mocks.handleFetchCore.mockResolvedValueOnce({
+      success: false,
+      status: 499,
+      error: "Client closed request",
+    });
+    const controller = new AbortController();
+    const request = new Request("http://localhost/v1/web/fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "jina-reader",
+        url: "https://example.com/article",
+      }),
+      signal: controller.signal,
+    });
+
+    const response = await handleFetch(request);
+
+    expect(response.status).toBe(499);
+    expect(mocks.handleFetchCore).toHaveBeenCalledWith(expect.objectContaining({ signal: request.signal }));
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+    expect(mocks.clearAccountError).not.toHaveBeenCalled();
+    expect(mocks.recordAccountMutationSuccess).not.toHaveBeenCalled();
+    expect(mocks.endAccountMutationAttempt).toHaveBeenCalledOnce();
   });
 });

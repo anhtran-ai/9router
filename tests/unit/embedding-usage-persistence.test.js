@@ -3,6 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   handleEmbeddingsCore: vi.fn(),
   saveRequestUsage: vi.fn(),
+  beginAccountMutationAttempt: vi.fn(() => ({ id: 1 })),
+  endAccountMutationAttempt: vi.fn(),
+  recordAccountMutationSuccess: vi.fn(),
+  markAccountUnavailable: vi.fn(),
+  clearAccountError: vi.fn(),
 }));
 
 vi.mock("../../src/sse/services/auth.js", () => ({
@@ -11,8 +16,11 @@ vi.mock("../../src/sse/services/auth.js", () => ({
     connectionId: "connection-a",
     connectionName: "Provider A",
   }),
-  markAccountUnavailable: vi.fn(),
-  clearAccountError: vi.fn(),
+  markAccountUnavailable: mocks.markAccountUnavailable,
+  clearAccountError: mocks.clearAccountError,
+  beginAccountMutationAttempt: mocks.beginAccountMutationAttempt,
+  endAccountMutationAttempt: mocks.endAccountMutationAttempt,
+  recordAccountMutationSuccess: mocks.recordAccountMutationSuccess,
   extractApiKey: () => "client-key",
   isValidApiKey: vi.fn(),
 }));
@@ -87,5 +95,31 @@ describe("embedding usage persistence", () => {
     }));
 
     expect(mocks.saveRequestUsage).not.toHaveBeenCalled();
+  });
+
+  it("passes the client signal to core and does not mutate account state on 499", async () => {
+    mocks.handleEmbeddingsCore.mockResolvedValueOnce({
+      success: false,
+      status: 499,
+      error: "Request aborted",
+      response: Response.json({ error: "Request aborted" }, { status: 499 }),
+    });
+    const controller = new AbortController();
+    const request = new Request("http://localhost/v1/embeddings", {
+      method: "POST",
+      body: JSON.stringify({ model: "openai/text-embedding-3-small", input: "hello" }),
+      signal: controller.signal,
+    });
+
+    const response = await handleEmbeddings(request);
+
+    expect(response.status).toBe(499);
+    expect(mocks.handleEmbeddingsCore).toHaveBeenCalledWith(
+      expect.objectContaining({ signal: request.signal }),
+    );
+    expect(mocks.markAccountUnavailable).not.toHaveBeenCalled();
+    expect(mocks.clearAccountError).not.toHaveBeenCalled();
+    expect(mocks.recordAccountMutationSuccess).not.toHaveBeenCalled();
+    expect(mocks.endAccountMutationAttempt).toHaveBeenCalledOnce();
   });
 });

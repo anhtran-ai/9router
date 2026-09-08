@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { handleFetchCore } from "../../open-sse/handlers/fetch/index.js";
+import { handleFetchCore, __test__ } from "../../open-sse/handlers/fetch/index.js";
 
 const originalFetch = global.fetch;
 
@@ -9,6 +9,7 @@ describe("Jina Reader fetch", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     global.fetch = originalFetch;
   });
 
@@ -62,5 +63,51 @@ describe("Jina Reader fetch", () => {
       status: 402,
     });
     expect(result.error).toContain("Payment required");
+  });
+
+  it("keeps the provider timeout active while reading the response body", async () => {
+    vi.useFakeTimers();
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    global.fetch.mockImplementationOnce(async (_url, init) => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "Content-Type": "text/plain" }),
+      body: { cancel },
+      text: () => new Promise((resolve, reject) => {
+        const abort = () => reject(new DOMException("body timeout", "AbortError"));
+        if (init.signal.aborted) abort();
+        else init.signal.addEventListener("abort", abort, { once: true });
+      }),
+    }));
+
+    const pending = handleFetchCore({
+      url: "https://example.com/stalled",
+      provider: "jina-reader",
+      providerConfig: { timeoutMs: 25 },
+      credentials: { apiKey: "jina-test-key" },
+    });
+    await vi.advanceTimersByTimeAsync(25);
+
+    await expect(pending).resolves.toMatchObject({ success: false, status: 504 });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a chunked upstream body once its byte limit is exceeded", async () => {
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode("12345"));
+        controller.enqueue(encoder.encode("67890"));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }), {
+      headers: { "content-type": "text/plain" },
+    });
+
+    await expect(__test__.readTextWithLimit(response, 8)).rejects.toThrow(/exceeds/i);
+    expect(cancelled).toBe(true);
   });
 });

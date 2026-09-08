@@ -11,6 +11,12 @@ function isLoopbackOrigin(origin) {
   return /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin);
 }
 
+function proxyOwnerKey(contributorReservationHash) {
+  return contributorReservationHash
+    ? `contributor:${contributorReservationHash}`
+    : "normal";
+}
+
 
 /**
  * Start a local HTTP server to receive OAuth callback
@@ -128,6 +134,7 @@ export function waitForCallback(timeoutMs = 300000) {
 // Singleton proxy server for Codex OAuth callback on fixed port
 let codexProxyServer = null;
 let codexProxyTimeout = null;
+let codexProxyOwnerKey = null;
 
 const CODEX_PROXY_TIMEOUT_MS = 300000; // 5 minutes
 const CODEX_PORT = CODEX_CONFIG.fixedPort;
@@ -139,11 +146,23 @@ const pendingExchanges = new Map();
  * Register a pending exchange session for server-side mode.
  * Modal client calls this before opening popup.
  */
-export function registerCodexSession({ state, codeVerifier, redirectUri }) {
+export function registerCodexSession({
+  state,
+  codeVerifier,
+  redirectUri,
+  commitProviderConnection,
+  contributorReservationHash,
+}) {
   if (!state || !codeVerifier || !redirectUri) return false;
+  if (
+    codexProxyOwnerKey
+    && codexProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
   pendingExchanges.set(state, {
     codeVerifier,
     redirectUri,
+    commitProviderConnection,
+    contributorReservationHash,
     status: "pending",
     createdAt: Date.now(),
   });
@@ -173,6 +192,18 @@ function escapeHtml(str) {
     .replace(/'/g, "&#39;");
 }
 
+async function persistProxyConnection(session, connectionData) {
+  if (typeof session?.commitProviderConnection === "function") {
+    const connection = await session.commitProviderConnection(connectionData);
+    if (connection) return connection;
+    const error = new Error("Contribution reservation is no longer valid");
+    error.status = 409;
+    throw error;
+  }
+  const { createProviderConnection } = await import("@/models");
+  return createProviderConnection(connectionData);
+}
+
 function renderCodexResultPage(success, message) {
   const color = success ? "#22c55e" : "#ef4444";
   const icon = success ? "&#10003;" : "&#10007;";
@@ -191,12 +222,22 @@ function renderCodexResultPage(success, message) {
  * Mode A (server-side): if any session was registered, proxy auto-exchanges + saves DB.
  * Mode B (channel fallback): if no session, proxy 302 redirects to app port for legacy channel-based flow.
  */
-export function startCodexProxy(appPort) {
+export function startCodexProxy(appPort, contributorReservationHash) {
   return new Promise((resolve) => {
-    if (codexProxyServer) {
+    const requestedOwnerKey = proxyOwnerKey(contributorReservationHash);
+    if (codexProxyOwnerKey) {
+      if (codexProxyOwnerKey !== requestedOwnerKey) {
+        resolve({ success: false, reason: "Codex callback proxy is already in use" });
+        return;
+      }
+      if (!codexProxyServer) {
+        resolve({ success: false, reason: "Codex callback proxy is still starting" });
+        return;
+      }
       resolve({ success: true });
       return;
     }
+    codexProxyOwnerKey = requestedOwnerKey;
 
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, "http://localhost");
@@ -222,7 +263,6 @@ export function startCodexProxy(appPort) {
 
           // Lazy import to avoid circular deps
           const { exchangeTokens } = await import("../providers.js");
-          const { createProviderConnection } = await import("@/models");
 
           const tokenData = await exchangeTokens(
             "codex",
@@ -231,7 +271,7 @@ export function startCodexProxy(appPort) {
             session.codeVerifier,
             state
           );
-          const connection = await createProviderConnection({
+          const connection = await persistProxyConnection(session, {
             provider: "codex",
             authType: "oauth",
             ...tokenData,
@@ -250,10 +290,15 @@ export function startCodexProxy(appPort) {
         } catch (err) {
           session.status = "error";
           session.error = err.message;
+          session.errorStatus = Number(err?.status) || null;
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
           res.end(renderCodexResultPage(false, err.message));
         } finally {
-          stopCodexProxy();
+          if (
+            session.contributorReservationHash
+            && (session.status === "done" || session.errorStatus === 409)
+          ) clearCodexSession(state);
+          stopCodexProxy(session.contributorReservationHash);
         }
         return;
       }
@@ -272,6 +317,9 @@ export function startCodexProxy(appPort) {
     });
 
     server.on("error", (err) => {
+      if (!codexProxyServer && codexProxyOwnerKey === requestedOwnerKey) {
+        codexProxyOwnerKey = null;
+      }
       if (err.code === "EADDRINUSE") {
         resolve({ success: false, reason: "port_busy" });
       } else {
@@ -284,7 +332,11 @@ export function startCodexProxy(appPort) {
 /**
  * Stop the Codex proxy server and cleanup
  */
-export function stopCodexProxy() {
+export function stopCodexProxy(contributorReservationHash) {
+  if (
+    contributorReservationHash
+    && codexProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
   if (codexProxyTimeout) {
     clearTimeout(codexProxyTimeout);
     codexProxyTimeout = null;
@@ -293,6 +345,8 @@ export function stopCodexProxy() {
     codexProxyServer.close();
     codexProxyServer = null;
   }
+  codexProxyOwnerKey = null;
+  return true;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -303,15 +357,28 @@ export function stopCodexProxy() {
 
 let xaiProxyServer = null;
 let xaiProxyTimeout = null;
+let xaiProxyOwnerKey = null;
 const XAI_PROXY_TIMEOUT_MS = 300000; // 5 minutes
 const XAI_PROXY_PORT = 56121;
 const xaiPendingExchanges = new Map();
 
-export function registerXaiSession({ state, codeVerifier, redirectUri }) {
+export function registerXaiSession({
+  state,
+  codeVerifier,
+  redirectUri,
+  commitProviderConnection,
+  contributorReservationHash,
+}) {
   if (!state || !codeVerifier || !redirectUri) return false;
+  if (
+    xaiProxyOwnerKey
+    && xaiProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
   xaiPendingExchanges.set(state, {
     codeVerifier,
     redirectUri,
+    commitProviderConnection,
+    contributorReservationHash,
     status: "pending",
     createdAt: Date.now(),
   });
@@ -335,12 +402,22 @@ function renderXaiResultPage(success, message) {
  * Mode A (server-side): if any session was registered, proxy auto-exchanges + saves DB.
  * Mode B (channel fallback): if no session, proxy 302 redirects to app port.
  */
-export function startXaiProxy(appPort) {
+export function startXaiProxy(appPort, contributorReservationHash) {
   return new Promise((resolve) => {
-    if (xaiProxyServer) {
+    const requestedOwnerKey = proxyOwnerKey(contributorReservationHash);
+    if (xaiProxyOwnerKey) {
+      if (xaiProxyOwnerKey !== requestedOwnerKey) {
+        resolve({ success: false, reason: "xAI callback proxy is already in use" });
+        return;
+      }
+      if (!xaiProxyServer) {
+        resolve({ success: false, reason: "xAI callback proxy is still starting" });
+        return;
+      }
       resolve({ success: true });
       return;
     }
+    xaiProxyOwnerKey = requestedOwnerKey;
 
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, "http://localhost");
@@ -364,7 +441,6 @@ export function startXaiProxy(appPort) {
           if (!code) throw new Error("No authorization code received");
 
           const { exchangeTokens } = await import("../providers.js");
-          const { createProviderConnection } = await import("@/models");
 
           const tokenData = await exchangeTokens(
             "xai",
@@ -373,7 +449,7 @@ export function startXaiProxy(appPort) {
             session.codeVerifier,
             state
           );
-          const connection = await createProviderConnection({
+          const connection = await persistProxyConnection(session, {
             provider: "xai",
             authType: "oauth",
             ...tokenData,
@@ -392,10 +468,15 @@ export function startXaiProxy(appPort) {
         } catch (err) {
           session.status = "error";
           session.error = err.message;
+          session.errorStatus = Number(err?.status) || null;
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
           res.end(renderXaiResultPage(false, err.message));
         } finally {
-          stopXaiProxy();
+          if (
+            session.contributorReservationHash
+            && (session.status === "done" || session.errorStatus === 409)
+          ) clearXaiSession(state);
+          stopXaiProxy(session.contributorReservationHash);
         }
         return;
       }
@@ -414,6 +495,9 @@ export function startXaiProxy(appPort) {
     });
 
     server.on("error", (err) => {
+      if (!xaiProxyServer && xaiProxyOwnerKey === requestedOwnerKey) {
+        xaiProxyOwnerKey = null;
+      }
       if (err.code === "EADDRINUSE") {
         resolve({ success: false, reason: "port_busy" });
       } else {
@@ -423,7 +507,11 @@ export function startXaiProxy(appPort) {
   });
 }
 
-export function stopXaiProxy() {
+export function stopXaiProxy(contributorReservationHash) {
+  if (
+    contributorReservationHash
+    && xaiProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
   if (xaiProxyTimeout) {
     clearTimeout(xaiProxyTimeout);
     xaiProxyTimeout = null;
@@ -432,6 +520,8 @@ export function stopXaiProxy() {
     xaiProxyServer.close();
     xaiProxyServer = null;
   }
+  xaiProxyOwnerKey = null;
+  return true;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -443,10 +533,21 @@ let traeProxyServer = null;
 let traeProxyTimeout = null;
 let traeProxyPort = null;
 let traeSession = null;
+let traeProxyOwnerKey = null;
 
-export function registerTraeSession({ state }) {
+export function registerTraeSession({ state, commitProviderConnection, contributorReservationHash }) {
   if (!state) return false;
-  traeSession = { state, status: "pending", createdAt: Date.now() };
+  if (
+    traeProxyOwnerKey
+    && traeProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
+  traeSession = {
+    state,
+    commitProviderConnection,
+    contributorReservationHash,
+    status: "pending",
+    createdAt: Date.now(),
+  };
   return true;
 }
 export function getTraeSessionStatus(state) {
@@ -458,12 +559,22 @@ export function clearTraeSession(state) {
   if (!state || (traeSession && traeSession.state === state)) traeSession = null;
 }
 
-export function startTraeProxy() {
+export function startTraeProxy(contributorReservationHash) {
   return new Promise((resolve) => {
-    if (traeProxyServer) {
+    const requestedOwnerKey = proxyOwnerKey(contributorReservationHash);
+    if (traeProxyOwnerKey) {
+      if (traeProxyOwnerKey !== requestedOwnerKey) {
+        resolve({ success: false, reason: "Trae callback proxy is already in use" });
+        return;
+      }
+      if (!traeProxyServer) {
+        resolve({ success: false, reason: "Trae callback proxy is still starting" });
+        return;
+      }
       resolve({ success: true, port: traeProxyPort, callbackUrl: `http://127.0.0.1:${traeProxyPort}${TRAE_CONFIG.callbackPath}` });
       return;
     }
+    traeProxyOwnerKey = requestedOwnerKey;
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, "http://localhost");
       if (url.pathname !== TRAE_CONFIG.callbackPath && url.pathname !== "/auth/callback") {
@@ -490,16 +601,15 @@ export function startTraeProxy() {
         session.error = "Trae callback state mismatch";
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(renderCodexResultPage(false, session.error));
-        stopTraeProxy();
+        stopTraeProxy(session.contributorReservationHash);
         return;
       }
       // Pass the raw callback query to exchangeTokens → parseTraeCallback
       const rawCallback = `${url.pathname}?${url.searchParams.toString()}`;
       try {
         const { exchangeTokens } = await import("../providers.js");
-        const { createProviderConnection } = await import("@/models");
         const tokenData = await exchangeTokens("trae", rawCallback);
-        const connection = await createProviderConnection({
+        const connection = await persistProxyConnection(session, {
           provider: "trae",
           authType: "oauth",
           ...tokenData,
@@ -516,10 +626,15 @@ export function startTraeProxy() {
       } catch (err) {
         session.status = "error";
         session.error = err.message;
+        session.errorStatus = Number(err?.status) || null;
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(renderCodexResultPage(false, err.message));
       } finally {
-        stopTraeProxy();
+        if (
+          session.contributorReservationHash
+          && (session.status === "done" || session.errorStatus === 409)
+        ) clearTraeSession(session.state);
+        stopTraeProxy(session.contributorReservationHash);
       }
     });
     server.listen(0, "127.0.0.1", () => {
@@ -528,14 +643,25 @@ export function startTraeProxy() {
       traeProxyTimeout = setTimeout(() => stopTraeProxy(), TRAE_CONFIG.oauthTimeoutMs);
       resolve({ success: true, port: traeProxyPort, callbackUrl: `http://127.0.0.1:${traeProxyPort}${TRAE_CONFIG.callbackPath}` });
     });
-    server.on("error", (err) => resolve({ success: false, reason: err.message }));
+    server.on("error", (err) => {
+      if (!traeProxyServer && traeProxyOwnerKey === requestedOwnerKey) {
+        traeProxyOwnerKey = null;
+      }
+      resolve({ success: false, reason: err.message });
+    });
   });
 }
 
-export function stopTraeProxy() {
+export function stopTraeProxy(contributorReservationHash) {
+  if (
+    contributorReservationHash
+    && traeProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
   if (traeProxyTimeout) { clearTimeout(traeProxyTimeout); traeProxyTimeout = null; }
   if (traeProxyServer) { traeProxyServer.close(); traeProxyServer = null; }
   traeProxyPort = null;
+  traeProxyOwnerKey = null;
+  return true;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -547,10 +673,21 @@ let windsurfProxyServer = null;
 let windsurfProxyTimeout = null;
 let windsurfProxyPort = null;
 let windsurfSession = null;
+let windsurfProxyOwnerKey = null;
 
-export function registerWindsurfSession({ state }) {
+export function registerWindsurfSession({ state, commitProviderConnection, contributorReservationHash }) {
   if (!state) return false;
-  windsurfSession = { state, status: "pending", createdAt: Date.now() };
+  if (
+    windsurfProxyOwnerKey
+    && windsurfProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
+  windsurfSession = {
+    state,
+    commitProviderConnection,
+    contributorReservationHash,
+    status: "pending",
+    createdAt: Date.now(),
+  };
   return true;
 }
 export function getWindsurfSessionStatus(state) {
@@ -562,12 +699,22 @@ export function clearWindsurfSession(state) {
   if (!state || (windsurfSession && windsurfSession.state === state)) windsurfSession = null;
 }
 
-export function startWindsurfProxy() {
+export function startWindsurfProxy(contributorReservationHash) {
   return new Promise((resolve) => {
-    if (windsurfProxyServer) {
+    const requestedOwnerKey = proxyOwnerKey(contributorReservationHash);
+    if (windsurfProxyOwnerKey) {
+      if (windsurfProxyOwnerKey !== requestedOwnerKey) {
+        resolve({ success: false, reason: "Windsurf callback proxy is already in use" });
+        return;
+      }
+      if (!windsurfProxyServer) {
+        resolve({ success: false, reason: "Windsurf callback proxy is still starting" });
+        return;
+      }
       resolve({ success: true, port: windsurfProxyPort, callbackUrl: `http://127.0.0.1:${windsurfProxyPort}${WINDSURF_CONFIG.callbackPath}` });
       return;
     }
+    windsurfProxyOwnerKey = requestedOwnerKey;
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, "http://localhost");
       if (url.pathname !== WINDSURF_CONFIG.callbackPath) {
@@ -593,15 +740,14 @@ export function startWindsurfProxy() {
         session.error = "Windsurf callback state mismatch";
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(renderCodexResultPage(false, session.error));
-        stopWindsurfProxy();
+        stopWindsurfProxy(session.contributorReservationHash);
         return;
       }
       const rawCallback = `${url.pathname}?${url.searchParams.toString()}`;
       try {
         const { exchangeTokens } = await import("../providers.js");
-        const { createProviderConnection } = await import("@/models");
         const tokenData = await exchangeTokens("windsurf", rawCallback, null, null, session.state);
-        const connection = await createProviderConnection({
+        const connection = await persistProxyConnection(session, {
           provider: "windsurf",
           authType: "api_key",
           ...tokenData,
@@ -615,10 +761,15 @@ export function startWindsurfProxy() {
       } catch (err) {
         session.status = "error";
         session.error = err.message;
+        session.errorStatus = Number(err?.status) || null;
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(renderCodexResultPage(false, err.message));
       } finally {
-        stopWindsurfProxy();
+        if (
+          session.contributorReservationHash
+          && (session.status === "done" || session.errorStatus === 409)
+        ) clearWindsurfSession(session.state);
+        stopWindsurfProxy(session.contributorReservationHash);
       }
     });
     server.listen(0, "127.0.0.1", () => {
@@ -627,14 +778,25 @@ export function startWindsurfProxy() {
       windsurfProxyTimeout = setTimeout(() => stopWindsurfProxy(), WINDSURF_CONFIG.oauthTimeoutMs);
       resolve({ success: true, port: windsurfProxyPort, callbackUrl: `http://127.0.0.1:${windsurfProxyPort}${WINDSURF_CONFIG.callbackPath}` });
     });
-    server.on("error", (err) => resolve({ success: false, reason: err.message }));
+    server.on("error", (err) => {
+      if (!windsurfProxyServer && windsurfProxyOwnerKey === requestedOwnerKey) {
+        windsurfProxyOwnerKey = null;
+      }
+      resolve({ success: false, reason: err.message });
+    });
   });
 }
 
-export function stopWindsurfProxy() {
+export function stopWindsurfProxy(contributorReservationHash) {
+  if (
+    contributorReservationHash
+    && windsurfProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
   if (windsurfProxyTimeout) { clearTimeout(windsurfProxyTimeout); windsurfProxyTimeout = null; }
   if (windsurfProxyServer) { windsurfProxyServer.close(); windsurfProxyServer = null; }
   windsurfProxyPort = null;
+  windsurfProxyOwnerKey = null;
+  return true;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -647,10 +809,27 @@ let zedProxyServer = null;
 let zedProxyTimeout = null;
 let zedProxyPort = null;
 let zedSession = null;
+let zedProxyOwnerKey = null;
 
-export function registerZedSession({ state, codeVerifier }) {
+export function registerZedSession({
+  state,
+  codeVerifier,
+  commitProviderConnection,
+  contributorReservationHash,
+}) {
   if (!state || !codeVerifier) return false;
-  zedSession = { state, codeVerifier, status: "pending", createdAt: Date.now() };
+  if (
+    zedProxyOwnerKey
+    && zedProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
+  zedSession = {
+    state,
+    codeVerifier,
+    commitProviderConnection,
+    contributorReservationHash,
+    status: "pending",
+    createdAt: Date.now(),
+  };
   return true;
 }
 export function getZedSessionStatus(state) {
@@ -662,12 +841,22 @@ export function clearZedSession(state) {
   if (!state || (zedSession && zedSession.state === state)) zedSession = null;
 }
 
-export function startZedProxy(preferredPort = 0) {
+export function startZedProxy(preferredPort = 0, contributorReservationHash) {
   return new Promise((resolve) => {
-    if (zedProxyServer) {
+    const requestedOwnerKey = proxyOwnerKey(contributorReservationHash);
+    if (zedProxyOwnerKey) {
+      if (zedProxyOwnerKey !== requestedOwnerKey) {
+        resolve({ success: false, reason: "Zed callback proxy is already in use" });
+        return;
+      }
+      if (!zedProxyServer) {
+        resolve({ success: false, reason: "Zed callback proxy is still starting" });
+        return;
+      }
       resolve({ success: true, port: zedProxyPort, callbackUrl: `http://127.0.0.1:${zedProxyPort}/` });
       return;
     }
+    zedProxyOwnerKey = requestedOwnerKey;
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, "http://localhost");
       // Log path + redacted params (access_token is the RSA-encrypted credential).
@@ -699,9 +888,8 @@ export function startZedProxy(preferredPort = 0) {
       const rawCallback = url.search ? `${url.pathname}?${url.searchParams.toString()}` : url.pathname;
       try {
         const { exchangeTokens } = await import("../providers.js");
-        const { createProviderConnection } = await import("@/models");
         const tokenData = await exchangeTokens("zed", rawCallback, null, session.codeVerifier, session.state);
-        const connection = await createProviderConnection({
+        const connection = await persistProxyConnection(session, {
           provider: "zed",
           authType: "oauth",
           ...tokenData,
@@ -715,10 +903,15 @@ export function startZedProxy(preferredPort = 0) {
       } catch (err) {
         session.status = "error";
         session.error = err.message;
+        session.errorStatus = Number(err?.status) || null;
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(renderCodexResultPage(false, err.message));
       } finally {
-        stopZedProxy();
+        if (
+          session.contributorReservationHash
+          && (session.status === "done" || session.errorStatus === 409)
+        ) clearZedSession(session.state);
+        stopZedProxy(session.contributorReservationHash);
       }
     });
     const tryPort = Number(preferredPort) || 0;
@@ -735,6 +928,9 @@ export function startZedProxy(preferredPort = 0) {
         });
       } else {
         console.log(`[Zed proxy] listen error: ${err.message}`);
+        if (!zedProxyServer && zedProxyOwnerKey === requestedOwnerKey) {
+          zedProxyOwnerKey = null;
+        }
         resolve({ success: false, reason: err.message });
       }
     });
@@ -748,10 +944,16 @@ export function startZedProxy(preferredPort = 0) {
   });
 }
 
-export function stopZedProxy() {
+export function stopZedProxy(contributorReservationHash) {
+  if (
+    contributorReservationHash
+    && zedProxyOwnerKey !== proxyOwnerKey(contributorReservationHash)
+  ) return false;
   console.log(`[Zed proxy] stopping (port ${zedProxyPort || "-"})`);
   if (zedProxyTimeout) { clearTimeout(zedProxyTimeout); zedProxyTimeout = null; }
   if (zedProxyServer) { zedProxyServer.close(); zedProxyServer = null; }
   zedProxyPort = null;
+  zedProxyOwnerKey = null;
+  return true;
 }
 

@@ -7,7 +7,12 @@ import {
   formatRetryAfter,
   isModelCompatibilityError,
 } from "./accountFallback.js";
-import { errorResponse, unavailableResponse } from "../utils/error.js";
+import {
+  errorResponse,
+  readUpstreamBodyText,
+  rebuildUpstreamResponse,
+  unavailableResponse,
+} from "../utils/error.js";
 import { isAbortError, throwIfAborted, waitWithSignal } from "../utils/abort.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
@@ -20,6 +25,19 @@ const HARD_CAPS = new Set(["vision", "pdf", "audioInput", "videoInput"]);
 // Prefixes used when flattening tool turns into plain prose for panel models.
 const TOOL_CALL_PREFIX = "[Called tools: ";
 const TOOL_RESULT_PREFIX = "[Tool result: ";
+const COMBO_ERROR_BODY_MAX_BYTES = 256 * 1024;
+const COMBO_ERROR_BODY_STALL_TIMEOUT_MS = 5000;
+const FUSION_PANEL_BODY_MAX_BYTES = 8 * 1024 * 1024;
+const FUSION_PANEL_BODY_STALL_TIMEOUT_MS = 15_000;
+const FUSION_JUDGE_TEXT_MAX_CHARS = 16 * 1024 * 1024;
+
+function discardResponseBody(response, reason) {
+  if (!response?.body || response.bodyUsed === true) return;
+  try {
+    const cancellation = response.body.cancel(reason);
+    cancellation?.catch?.(() => {});
+  } catch { /* best-effort connection release */ }
+}
 
 // Flatten tool turns into prose so panel models keep the context but can't loop
 // on tools: drop the request's tools, turn tool/function results into assistant
@@ -327,9 +345,9 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
 
     try {
       throwIfAborted(signal);
-      const result = await handleSingleModel(body, modelStr);
+      let result = await handleSingleModel(body, modelStr);
       if (signal?.aborted) {
-        result.body?.cancel().catch(() => {});
+        discardResponseBody(result, "combo request aborted");
         return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
       }
       if (result.status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) return result;
@@ -345,15 +363,23 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       let errorCode = null;
       const receivedAt = Date.now();
       let retryAfter = parseRetryDeadline(result.headers?.get?.("Retry-After"), receivedAt, true);
+      let errorBodyText = "";
       try {
-        const errorBody = await result.clone().json();
+        errorBodyText = await readUpstreamBodyText(result, {
+          signal,
+          maxBytes: COMBO_ERROR_BODY_MAX_BYTES,
+          stallTimeoutMs: COMBO_ERROR_BODY_STALL_TIMEOUT_MS,
+        });
+        const errorBody = JSON.parse(errorBodyText);
         errorText = errorBody?.error?.message || errorBody?.error || errorBody?.message || errorText;
         if (typeof errorBody?.error?.code === "string") errorCode = errorBody.error.code;
         const jsonRetryAfter = parseRetryDeadline(errorBody?.retryAfter, receivedAt);
         if (jsonRetryAfter !== null && (retryAfter === null || jsonRetryAfter < retryAfter)) retryAfter = jsonRetryAfter;
       } catch {
-        // Ignore JSON parse errors
+        // Ignore malformed, stalled, or oversized diagnostics. Caller abort is
+        // checked below; the bounded reader already cancelled failed bodies.
       }
+      result = rebuildUpstreamResponse(result, errorBodyText);
 
       // Track earliest retryAfter across all combo models
       if (retryAfter !== null && (earliestRetryAfter === null || retryAfter < earliestRetryAfter)) {
@@ -381,6 +407,8 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
         return result;
       }
+
+      discardResponseBody(result, "trying next combo model");
 
       // For transient errors (503/502/504), wait for cooldown before falling through
       // so a briefly-overloaded provider gets a chance to recover rather than being
@@ -534,7 +562,13 @@ function withTimeout(promise, ms, onTimeout) {
     let finished = false;
     let timer = null;
     const finish = (value) => {
-      if (finished) return;
+      if (finished) {
+        // A provider may ignore the panel abort and resolve after quorum or the
+        // hard timeout. Its late Response is no longer observable by callers,
+        // so explicitly release the body instead of leaving it to GC.
+        discardResponseBody(value, "late fusion panel response");
+        return;
+      }
       finished = true;
       if (timer) clearTimeout(timer);
       resolve(value);
@@ -585,12 +619,37 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs, s
         .catch((e) => { out[i] = { __error: e }; })
         .finally(() => {
           settled++;
-          if (out[i] && out[i].ok) ok++;
+          // Quorum is based on a fully consumed, semantically valid answer.
+          // An HTTP 200 header alone is not success: the body may still stall,
+          // be malformed, or contain no assistant content.
+          if (out[i]?.__answer) ok++;
           if (settled === calls.length) return finish();
           if (ok >= minPanel && !graceTimer) graceTimer = setTimeout(finish, stragglerGraceMs);
         });
     });
   });
+}
+
+async function readFusionPanelAnswer(response, model, signal) {
+  if (!response?.ok) {
+    discardResponseBody(response, "failed fusion panel response");
+    return { __failed: true, status: response?.status };
+  }
+
+  try {
+    const bodyText = await readUpstreamBodyText(response, {
+      signal,
+      maxBytes: FUSION_PANEL_BODY_MAX_BYTES,
+      stallTimeoutMs: FUSION_PANEL_BODY_STALL_TIMEOUT_MS,
+      fatalUtf8: true,
+    });
+    const json = JSON.parse(bodyText);
+    const text = extractPanelText(json);
+    if (!text) return { __failed: true, empty: true };
+    return { __answer: { model, text } };
+  } catch (error) {
+    return { __error: error };
+  }
 }
 
 /**
@@ -657,7 +716,12 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
     const task = { controller, settled: false, promise: null, cancel: null };
     // Defer invocation into a promise so synchronous provider errors are
     // isolated to that panel member instead of aborting the whole fan-out.
-    const call = Promise.resolve().then(() => handleSingleModel(panelBody, m, true, panelSignal));
+    // Keep header receipt, complete bounded body consumption and semantic
+    // validation inside the same per-panel deadline. This also lets quorum
+    // count real answers rather than optimistic HTTP 200 responses.
+    const call = Promise.resolve()
+      .then(() => handleSingleModel(panelBody, m, true, panelSignal))
+      .then((response) => readFusionPanelAnswer(response, m, panelSignal));
     const timed = withTimeout(call, cfg.panelHardTimeoutMs, () => controller.abort());
     task.cancel = timed.cancel;
     task.promise = timed.promise
@@ -686,25 +750,24 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
 
   // 2. Collect successful answers.
   const answers = [];
+  let acceptedAnswerChars = 0;
   for (let i = 0; i < settled.length; i++) {
     const res = settled[i];
     const model = panel[i];
     if (!res) { log.warn("FUSION", `Panel ${model} dropped (straggler/timeout)`); continue; }
     if (res.__timeout) { log.warn("FUSION", `Panel ${model} timed out`); continue; }
-    if (res.__error) { log.warn("FUSION", `Panel ${model} threw`, { error: res.__error?.message || String(res.__error) }); continue; }
-    if (!res.ok) { log.warn("FUSION", `Panel ${model} failed`, { status: res.status }); continue; }
-    try {
-      const json = await res.clone().json();
-      const text = extractPanelText(json);
-      if (text) {
-        answers.push({ model, text });
-        log.info("FUSION", `Panel ${model} ok (${text.length} chars)`);
-      } else {
-        log.warn("FUSION", `Panel ${model} returned empty content`);
+    if (res.__error) { log.warn("FUSION", `Panel ${model} failed validation`, { error: res.__error?.message || String(res.__error) }); continue; }
+    if (res.__answer) {
+      if (acceptedAnswerChars + res.__answer.text.length > FUSION_JUDGE_TEXT_MAX_CHARS) {
+        log.warn("FUSION", `Panel ${model} exceeded the aggregate judge-input limit`);
+        continue;
       }
-    } catch (e) {
-      log.warn("FUSION", `Panel ${model} unparseable`, { error: e.message || String(e) });
+      answers.push(res.__answer);
+      acceptedAnswerChars += res.__answer.text.length;
+      log.info("FUSION", `Panel ${model} ok (${res.__answer.text.length} chars)`);
+      continue;
     }
+    log.warn("FUSION", res.empty ? `Panel ${model} returned empty content` : `Panel ${model} failed`, { status: res.status });
   }
 
   // 3. Degrade gracefully when the panel is too thin to fuse.

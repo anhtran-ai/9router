@@ -3,6 +3,7 @@ import { FORMATS } from "../formats.js";
 import { parseDataUri } from "../concerns/image.js";
 import { safeParseJSON } from "../concerns/json.js";
 import { ROLE, OPENAI_BLOCK } from "../schema/index.js";
+import { extractReasoningText } from "../concerns/reasoning.js";
 
 /**
  * Convert OpenAI request to Ollama format
@@ -81,6 +82,7 @@ function normalizeMessages(messages) {
 
   // Second pass: convert messages
   for (const msg of messages) {
+    const thinking = msg.role === ROLE.ASSISTANT ? extractReasoningText(msg) : "";
     // Handle tool result messages (OpenAI format -> Ollama format)
     if (msg.role === ROLE.TOOL) {
       const toolResult = normalizeContent(msg.content);
@@ -113,11 +115,13 @@ function normalizeMessages(messages) {
         }
       }));
 
-      result.push({
+      const assistantMessage = {
         role: ROLE.ASSISTANT,
         content: content,
         tool_calls: ollamaToolCalls
-      });
+      };
+      if (thinking) assistantMessage.thinking = thinking;
+      result.push(assistantMessage);
       continue;
     }
 
@@ -133,6 +137,10 @@ function normalizeMessages(messages) {
       role: role,
       content: content
     };
+
+    // Ollama's native chat history schema carries prior model reasoning in
+    // message.thinking, including reasoning-only assistant turns.
+    if (thinking) out.thinking = thinking;
 
     if (images.length > 0) {
       out.images = images;

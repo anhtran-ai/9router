@@ -289,7 +289,7 @@ const PROVIDER_MODELS_CONFIG = {
 
   // Custom resolvers (non-OpenAI-shaped APIs / token-refresh flows)
   kiro: {
-    customResolver: async (connection) => {
+    customResolver: async (connection, signal) => {
       const credentials = {
         accessToken: connection.accessToken,
         refreshToken: connection.refreshToken,
@@ -299,15 +299,22 @@ const PROVIDER_MODELS_CONFIG = {
       try {
         const result = await resolveKiroModels(credentials, {
           log: console,
+          signal,
           onCredentialsRefreshed: async (refreshed) => {
             if (refreshed?.accessToken) {
               await updateProviderCredentials(connection.id, {
-                accessToken: refreshed.accessToken,
+                ...refreshed,
                 refreshToken: refreshed.refreshToken || connection.refreshToken,
-                expiresIn: refreshed.expiresIn,
+                existingProviderSpecificData: connection.providerSpecificData || {},
               });
               connection.accessToken = refreshed.accessToken;
               if (refreshed.refreshToken) connection.refreshToken = refreshed.refreshToken;
+              if (refreshed.providerSpecificData) {
+                connection.providerSpecificData = {
+                  ...(connection.providerSpecificData || {}),
+                  ...refreshed.providerSpecificData,
+                };
+              }
             }
           }
         });
@@ -532,7 +539,7 @@ export async function GET(request, { params }) {
 
     // Config-driven custom resolver path (OAuth refresh, non-OpenAI shape, etc.)
     if (typeof config.customResolver === "function") {
-      const result = await config.customResolver(connection);
+      const result = await config.customResolver(connection, request?.signal);
       if (result.error) {
         return NextResponse.json({ error: result.error }, { status: result.status || 500 });
       }

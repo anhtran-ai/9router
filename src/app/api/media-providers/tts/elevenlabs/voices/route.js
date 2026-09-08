@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getProviderConnections } from "@/lib/localDb";
 import { fetchElevenLabsVoices } from "open-sse/handlers/ttsCore.js";
+import { voiceListErrorStatus } from "open-sse/handlers/ttsProviders/voiceList.js";
 
 const langNames = new Intl.DisplayNames(["en"], { type: "language" });
 
@@ -21,7 +22,7 @@ export async function GET(request) {
       return NextResponse.json({ error: "No ElevenLabs connection found" }, { status: 400 });
     }
 
-    const voices = await fetchElevenLabsVoices(apiKey);
+    const voices = await fetchElevenLabsVoices(apiKey, { signal: request.signal });
 
     // Group by all supported languages (verified_languages + labels.language)
     const byLang = {};
@@ -66,6 +67,7 @@ export async function GET(request) {
 
     return NextResponse.json({ languages, byLang });
   } catch (err) {
-    return NextResponse.json({ error: err.message || "Failed to fetch voices" }, { status: 502 });
+    const status = request.signal?.aborted ? 499 : voiceListErrorStatus(err);
+    return NextResponse.json({ error: err.message || "Failed to fetch voices" }, { status });
   }
 }

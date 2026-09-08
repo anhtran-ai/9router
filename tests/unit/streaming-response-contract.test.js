@@ -35,11 +35,12 @@ const textBlock = [
 ];
 const events = (items) => items.map(item => sse(item)).join("");
 
-async function run(input, { target = FORMATS.OPENAI, source = FORMATS.CLAUDE, contentType = "text/event-stream", provider = "openrouter", signal, persistUsage = false, credentials = null } = {}) {
+async function run(input, { target = FORMATS.OPENAI, source = FORMATS.CLAUDE, contentType = "text/event-stream", provider = "openrouter", signal, persistUsage = false, credentials = null, completionHook, failureHook } = {}) {
   const body = { messages: [{ role: "user", content: "fixture" }], stream: true };
   const requestStartTime = Date.now(); const log = { line: vi.fn(), errorLine: vi.fn() };
-  const completion = persistUsage ? buildOnStreamComplete({ provider, model: "fixture", body, stream: true, requestStartTime, log }).onStreamComplete : undefined;
+  const completion = completionHook ?? (persistUsage ? buildOnStreamComplete({ provider, model: "fixture", body, stream: true, requestStartTime, log }).onStreamComplete : undefined);
   const trackDone = vi.fn(); const onStreamComplete = vi.fn(completion); const onRequestSuccess = vi.fn();
+  const onRequestFailure = vi.fn(failureHook);
   let finished = false;
   const finish = () => { if (!finished) { finished = true; trackDone(); } };
   const streamController = createStreamController({ signal, onDisconnect: finish, onError: finish, log: { line: vi.fn(), errorLine: vi.fn() } });
@@ -47,9 +48,9 @@ async function run(input, { target = FORMATS.OPENAI, source = FORMATS.CLAUDE, co
   const result = await handleStreamingResponse({
     providerResponse, provider, model: "fixture", sourceFormat: source, targetFormat: target,
     body, stream: true, requestStartTime, reqLogger: {}, streamController, onRequestSuccess,
-    onStreamComplete, trackDone: finish, log, credentials,
+    onStreamComplete, onRequestFailure, trackDone: finish, log, credentials,
   });
-  return { ...result, trackDone, onStreamComplete, onRequestSuccess, streamController };
+  return { ...result, trackDone, onStreamComplete, onRequestSuccess, onRequestFailure, streamController };
 }
 
 function parsedData(text) {
@@ -128,6 +129,12 @@ describe("streaming response contract", () => {
     expect(text).not.toContain("untrusted private diagnostic");
     expect(result.onStreamComplete).not.toHaveBeenCalled();
     expect(result.onRequestSuccess).not.toHaveBeenCalled();
+    expect(result.onRequestFailure).toHaveBeenCalledTimes(1);
+    expect(result.onRequestFailure).toHaveBeenCalledWith(expect.objectContaining({
+      name: "InvalidStreamResponseError",
+      status: 502,
+      code: "invalid_upstream_response",
+    }));
     expect(result.trackDone).toHaveBeenCalledTimes(1);
   });
 
@@ -150,6 +157,34 @@ describe("streaming response contract", () => {
     expect(result.onStreamComplete).toHaveBeenCalledTimes(1);
     expect(result.onRequestSuccess).toHaveBeenCalledTimes(1);
     expect(result.trackDone).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["throws synchronously", () => { throw new Error("fixture sync cleanup failure"); }],
+    ["rejects asynchronously", () => Promise.reject(new Error("fixture async cleanup failure"))],
+  ])("keeps a validated terminal success when onStreamComplete %s", async (_label, completionHook) => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await run(events([claudeStart, ...textBlock, ...claudeEnd()]), {
+        target: FORMATS.CLAUDE,
+        source: FORMATS.CLAUDE,
+        completionHook,
+      });
+
+      const text = await result.response.text();
+      await Promise.resolve();
+
+      expect(text).toContain("event: message_stop");
+      expect(text).not.toContain("invalid_upstream_response");
+      expect(result.onRequestSuccess).toHaveBeenCalledTimes(1);
+      expect(result.trackDone).toHaveBeenCalledTimes(1);
+      expect(consoleError).toHaveBeenCalledWith(
+        "[ChatCore] onStreamComplete failed:",
+        expect.stringContaining("cleanup failure"),
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it("preserves a Chat usage trailer before emitting Claude terminal/tool/reasoning events", async () => {
@@ -533,6 +568,7 @@ describe("streaming response contract", () => {
     await reader.cancel();
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(cancel).toHaveBeenCalledTimes(1);
+    expect(result.onRequestFailure).not.toHaveBeenCalled();
     expect(result.trackDone).toHaveBeenCalledTimes(1);
     result.streamController.handleComplete();
   });

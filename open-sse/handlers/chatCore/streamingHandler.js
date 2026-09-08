@@ -45,7 +45,7 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
 /**
  * Handle streaming response — pipe provider SSE through transform stream to client.
  */
-export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, trackDone, credentials }) {
+export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, onRequestFailure, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, trackDone, credentials }) {
   const recordFailure = error => {
     trackDone?.();
     saveRequestDetail(buildRequestDetail({
@@ -66,10 +66,25 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
   }
 
   const complete = (...args) => {
-    onStreamComplete?.(...args);
-    if (onRequestSuccess) Promise.resolve().then(onRequestSuccess).catch(err => {
-      console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
-    });
+    try {
+      Promise.resolve(onStreamComplete?.(...args)).catch(err => {
+        console.error("[ChatCore] onStreamComplete failed:", err?.message || err);
+      });
+    } catch (err) {
+      console.error("[ChatCore] onStreamComplete failed:", err?.message || err);
+    }
+    // Invoke synchronously so the account-success watermark is published at
+    // the validated protocol terminal. Only the fallible persistence tail is
+    // asynchronous, and it must never corrupt the already-valid response.
+    if (onRequestSuccess) {
+      try {
+        Promise.resolve(onRequestSuccess()).catch(err => {
+          console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+        });
+      } catch (err) {
+        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+      }
+    }
   };
   const translator = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete: complete, apiKey, trackDone, credentials });
   const validator = createStreamContract(targetFormat);
@@ -83,6 +98,15 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
   const onStreamError = error => {
     const safeError = error instanceof InvalidStreamResponseError ? error : new InvalidStreamResponseError("stream interrupted");
     recordFailure(safeError);
+    if (onRequestFailure) {
+      try {
+        Promise.resolve(onRequestFailure(safeError)).catch(err => {
+          console.error("[ChatCore] onRequestFailure failed:", err?.message || err);
+        });
+      } catch (err) {
+        console.error("[ChatCore] onRequestFailure failed:", err?.message || err);
+      }
+    }
     return formatStreamFailure(safeError, sourceFormat);
   };
   const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs, onStreamError);
@@ -103,6 +127,10 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
 
   return {
     success: true,
+    // HTTP headers only prove that a stream was established. The response is
+    // not an account success until the contract reaches its protocol terminal
+    // and invokes onRequestSuccess through `complete` above.
+    streaming: true,
     response: new Response(transformedBody, { headers: SSE_HEADERS })
   };
 }

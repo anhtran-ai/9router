@@ -34,6 +34,8 @@ const {
   clearAntigravityStrikes,
   beginAntigravityQuotaAttempt,
   endAntigravityQuotaAttempt,
+  canAntigravityQuotaAttemptClearFailure,
+  recordAntigravityQuotaAttemptFailure,
 } = await import("@/sse/services/antigravityQuota.js");
 const { getProviderCredentials } = await import("@/sse/services/auth.js");
 
@@ -385,6 +387,33 @@ describe("Antigravity quota-aware routing", () => {
     await expect(handleAntigravityQuotaError(connectionId, 429, MODEL, "token", {}, null, third))
       .resolves.toBeGreaterThan(Date.now());
     endAntigravityQuotaAttempt(third);
+  });
+
+  it("does not let an older exhausted-quota evaluation erase a newer failure watermark", async () => {
+    const connectionId = "ag-old-zero-new-failure";
+    const resetAt = new Date(Date.now() + 60_000).toISOString();
+    mocks.getAntigravityUsage.mockResolvedValue({ quotas: {
+      [MODEL]: { remainingPercentage: 0, resetAt },
+    } });
+    const olderQuotaError = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    const delayedSuccess = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    const newerFailure = beginAntigravityQuotaAttempt(connectionId, MODEL);
+    recordAntigravityQuotaAttemptFailure(newerFailure);
+
+    expect(canAntigravityQuotaAttemptClearFailure(delayedSuccess)).toBe(false);
+    await expect(handleAntigravityQuotaError(
+      connectionId, 429, MODEL, "token", {}, null, olderQuotaError,
+    )).resolves.toBe(Date.parse(resetAt));
+
+    // The older real-0% path may update quota cache, but it must preserve the
+    // ordering watermark that prevents its late success from clearing failure 2.
+    expect(canAntigravityQuotaAttemptClearFailure(delayedSuccess)).toBe(false);
+    clearAntigravityStrikes(connectionId, MODEL, delayedSuccess);
+    expect(canAntigravityQuotaAttemptClearFailure(delayedSuccess)).toBe(false);
+
+    endAntigravityQuotaAttempt(newerFailure);
+    endAntigravityQuotaAttempt(delayedSuccess);
+    endAntigravityQuotaAttempt(olderQuotaError);
   });
 
   it("records a middle success watermark while retaining a newer failure", async () => {

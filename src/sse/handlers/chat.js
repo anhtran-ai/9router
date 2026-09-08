@@ -6,6 +6,9 @@ import {
   clearAccountError,
   extractApiKey,
   isValidApiKey,
+  beginAccountMutationAttempt,
+  endAccountMutationAttempt,
+  recordAccountMutationSuccess,
 } from "../services/auth.js";
 import {
   handleAntigravityQuotaError,
@@ -324,6 +327,15 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     const quotaAttempt = provider === "antigravity"
       ? beginAntigravityQuotaAttempt(credentials.connectionId, model)
       : null;
+    const mutationAttempt = beginAccountMutationAttempt(credentials.connectionId, model);
+    let streamOwnsAttempts = false;
+    let attemptsReleased = false;
+    const releaseAttempts = () => {
+      if (attemptsReleased) return;
+      attemptsReleased = true;
+      endAccountMutationAttempt(mutationAttempt);
+      endAntigravityQuotaAttempt(quotaAttempt);
+    };
     try {
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
     const result = await handleChatCore({
@@ -362,35 +374,83 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
           testStatus: "active"
         });
       },
-      onRequestSuccess: async () => {
-        // "Consecutive" strikes: a success clears the breaker for this pair.
-        // This must happen before the fallible DB cleanup so a delayed/rejected
-        // write cannot let older quota-error evaluators restore stale strikes.
-        clearAntigravityStrikes(credentials.connectionId, model, quotaAttempt);
-        if (quotaAttempt && !canAntigravityQuotaAttemptClearFailure(quotaAttempt)) return;
-        // A verified provider success owns this cleanup even if the client
-        // disconnects immediately afterward; keep the DB commit observed.
-        const cleanupGuard = quotaAttempt
-          ? () => canAntigravityQuotaAttemptClearFailure(quotaAttempt)
-          : null;
-        await clearAccountError(
-          credentials.connectionId,
-          credentials,
-          model,
-          cleanupGuard ? { reloadCurrent: true, shouldCommit: cleanupGuard } : {},
-        );
-      }
+      onRequestSuccess: () => {
+        try {
+          // Publish success ordering synchronously, before any fallible DB read.
+          // A failure from an older request must not commit while cleanup waits.
+          recordAccountMutationSuccess(mutationAttempt);
+          // "Consecutive" strikes: a success clears the breaker for this pair.
+          // This must happen before the fallible DB cleanup so a delayed/rejected
+          // write cannot let older quota-error evaluators restore stale strikes.
+          clearAntigravityStrikes(credentials.connectionId, model, quotaAttempt);
+          if (quotaAttempt && !canAntigravityQuotaAttemptClearFailure(quotaAttempt)) return;
+          // A verified provider success owns this cleanup even if the client
+          // disconnects immediately afterward; keep the DB commit observed.
+          const cleanupGuard = quotaAttempt
+            ? () => canAntigravityQuotaAttemptClearFailure(quotaAttempt)
+            : null;
+          return clearAccountError(
+            credentials.connectionId,
+            credentials,
+            model,
+            {
+              mutationAttempt,
+              ...(cleanupGuard ? { reloadCurrent: true, shouldCommit: cleanupGuard } : {}),
+            },
+          );
+        } finally {
+          // The stream terminal owns the attempt lifetime. Releasing after the
+          // guarded mutation starts keeps older live streams visible to newer
+          // success/failure watermarks without waiting on database cleanup.
+          releaseAttempts();
+        }
+      },
+      onRequestFailure: (streamError) => {
+        let failureMutation;
+        try {
+          // Streaming headers have already been returned, so this request cannot
+          // safely retry. Persist a model-scoped cooldown for future requests,
+          // guarded by the same ordering attempt as pre-header failures.
+          failureMutation = markAccountUnavailable(
+            credentials.connectionId,
+            streamError?.status || HTTP_STATUS.BAD_GATEWAY,
+            streamError?.message || "Invalid upstream response stream",
+            provider,
+            model,
+            null,
+            {
+              mutationAttempt,
+              ...(quotaAttempt ? {
+                shouldCommit: () => !isAntigravityQuotaAttemptSuperseded(quotaAttempt),
+                beforeCommit: () => recordAntigravityQuotaAttemptFailure(quotaAttempt),
+              } : {}),
+            },
+          );
+        } catch (error) {
+          releaseAttempts();
+          throw error;
+        }
+        // Keep the failed attempt active until the DB-boundary predicate has
+        // been evaluated. Releasing it earlier would discard a newer success
+        // watermark and let this late streaming failure overwrite that success.
+        return Promise.resolve(failureMutation).finally(releaseAttempts);
+      },
+      onDisconnect: releaseAttempts,
     });
+
+    if (result.success && result.streaming === true) streamOwnsAttempts = true;
 
     // Non-streaming success cleanup is normally queued by chatCore. Record the
     // success here as well before releasing the attempt; token-based recording
     // is idempotent and closes the success-before-error-handler race.
-    if (result.success && quotaAttempt && body?.stream !== true) {
-      clearAntigravityStrikes(credentials.connectionId, model, quotaAttempt);
+    if (result.success && result.streaming !== true) {
+      recordAccountMutationSuccess(mutationAttempt);
+      if (quotaAttempt) clearAntigravityStrikes(credentials.connectionId, model, quotaAttempt);
     }
 
     if (request?.signal?.aborted) {
       result.response?.body?.cancel().catch(() => {});
+      releaseAttempts();
       return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
     }
     if (result.success || result.status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) return result.response;
@@ -414,11 +474,6 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       if (request?.signal?.aborted) {
         return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
       }
-      // A newer success makes this request's provider error historical. Return
-      // its own response, but do not persist cooldown or route it elsewhere.
-      if (isAntigravityQuotaAttemptSuperseded(quotaAttempt)) {
-        return result.response;
-      }
       if (quotaResetMs) resetsAtMs = quotaResetMs;
     }
 
@@ -433,6 +488,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
           credentials.connectionId, result.status, result.error, provider, model, resetsAtMs,
           {
             signal: request?.signal,
+            mutationAttempt,
             ...(quotaAttempt ? {
               shouldCommit: () => !isAntigravityQuotaAttemptSuperseded(quotaAttempt),
               // Record ordering at the actual DB boundary for every AG
@@ -441,7 +497,6 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
             } : {}),
           },
         );
-        if (markResult.superseded) return result.response;
         shouldFallback = markResult.shouldFallback;
       } catch (error) {
         if (isAbortError(error, request?.signal)) {
@@ -465,7 +520,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     return result.response;
     } finally {
-      endAntigravityQuotaAttempt(quotaAttempt);
+      if (!streamOwnsAttempts) releaseAttempts();
     }
   }
 }

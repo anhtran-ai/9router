@@ -13,6 +13,21 @@ const origCreate = http.createServer.bind(http);
 const PEER_TOKEN = crypto.randomBytes(24).toString("hex");
 process.env.NINEROUTER_PEER_TOKEN = PEER_TOKEN;
 
+// h2c downgrade requests are buffered before being replayed through Next's
+// HTTP/1 handler. Bound both bytes and time so an unauthenticated upgrade
+// cannot turn that compatibility shim into a memory or slowloris sink.
+const H2C_MAX_BODY_BYTES = 64 * 1024 * 1024;
+const H2C_BODY_TIMEOUT_MS = (() => {
+  const override = process.env.NODE_ENV === "test"
+    ? process.env.NINEROUTER_TEST_H2C_BODY_TIMEOUT_MS
+    : null;
+  if (override && /^\d+$/.test(override)) {
+    const parsed = Number(override);
+    if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+  }
+  return 30_000;
+})();
+
 let backgroundRefreshStarted = false;
 
 function startBackgroundTokenRefreshFromCustomServer() {
@@ -84,18 +99,55 @@ http.createServer = (...args) => {
       return origEmit.call(this, event, ...eventArgs);
     }
 
-    const contentLength = Number(req.headers["content-length"] || 0);
-    if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
-      socket.destroy();
+    const rejectUpgrade = (status, message) => {
+      try {
+        socket.end(
+          `HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
+        );
+      } catch {
+        socket.destroy();
+      }
+    };
+    // This compatibility path only knows how to delimit a fixed-size body.
+    // Reject chunked requests rather than replaying an empty/truncated body
+    // while leaving a misleading Transfer-Encoding header on the request.
+    if (req.headers["transfer-encoding"] !== undefined) {
+      rejectUpgrade(400, "Bad Request");
       return true;
     }
-    const chunks = [head];
-    let received = head.length;
+    const rawContentLength = req.headers["content-length"];
+    if (rawContentLength !== undefined && !/^\d+$/.test(String(rawContentLength))) {
+      rejectUpgrade(400, "Bad Request");
+      return true;
+    }
+    const contentLength = Number(rawContentLength || 0);
+    if (!Number.isSafeInteger(contentLength)) {
+      rejectUpgrade(400, "Bad Request");
+      return true;
+    }
+    if (contentLength > H2C_MAX_BODY_BYTES) {
+      rejectUpgrade(413, "Payload Too Large");
+      return true;
+    }
+    // Ignore bytes after the declared request body instead of retaining them
+    // in the replay buffer. The downgraded connection is always closed.
+    const initialBody = head.subarray(0, contentLength);
+    const chunks = initialBody.length ? [initialBody] : [];
+    let received = initialBody.length;
+    let bodyTimer = null;
+    let readBody = null;
+    const cleanupBodyWait = () => {
+      if (bodyTimer) clearTimeout(bodyTimer);
+      bodyTimer = null;
+      if (readBody) socket.off("data", readBody);
+      readBody = null;
+    };
     const serve = () => {
+      cleanupBodyWait();
       // Replay the upgraded request through the existing HTTP/1.1 handler.
       const replay = new http.IncomingMessage(socket);
       Object.assign(replay, { method: req.method, url: req.url, headers: req.headers, complete: true });
-      if (received) replay.push(Buffer.concat(chunks, received).subarray(0, contentLength));
+      if (received) replay.push(Buffer.concat(chunks, received));
       replay.push(null);
       const res = new http.ServerResponse(replay);
       res.shouldKeepAlive = false;
@@ -108,13 +160,22 @@ http.createServer = (...args) => {
     };
     if (received >= contentLength) serve();
     else {
-      socket.on("data", function readBody(chunk) {
-        chunks.push(chunk);
-        received += chunk.length;
+      readBody = (chunk) => {
+        const remaining = contentLength - received;
+        const bodyChunk = chunk.subarray(0, remaining);
+        if (bodyChunk.length) chunks.push(bodyChunk);
+        received += bodyChunk.length;
         if (received < contentLength) return;
-        socket.off("data", readBody);
         serve();
-      });
+      };
+      socket.on("data", readBody);
+      bodyTimer = setTimeout(() => {
+        cleanupBodyWait();
+        socket.destroy(new Error("h2c request body timeout"));
+      }, H2C_BODY_TIMEOUT_MS);
+      bodyTimer.unref?.();
+      socket.once("close", cleanupBodyWait);
+      socket.once("error", cleanupBodyWait);
       socket.resume();
     }
     delete req.headers.upgrade;

@@ -1,5 +1,5 @@
 // Fal.ai — async submit + queue polling
-import { sleep, nowSec, sizeToAspectRatio, POLL_INTERVAL_MS, POLL_TIMEOUT_MS } from "./_base.js";
+import { cancelResponseBody, nowSec, sizeToAspectRatio, POLL_INTERVAL_MS, POLL_TIMEOUT_MS, requireProviderUrl } from "./_base.js";
 import { PROVIDER_MEDIA } from "../../providers/index.js";
 
 const BASE_URL = PROVIDER_MEDIA["fal-ai"]?.imageConfig?.baseUrl;
@@ -17,17 +17,26 @@ export default {
     if (body.image) req.image_url = body.image;
     return req;
   },
-  async parseResponse(response, { headers }) {
-    const { status_url, response_url } = await response.json();
+  async parseResponse(response, { headers, fetch, sleep, readJson, signal }) {
+    const queue = await readJson(response);
+    const statusUrl = requireProviderUrl(queue.status_url, BASE_URL, "Fal status URL");
+    const responseUrl = requireProviderUrl(queue.response_url, BASE_URL, "Fal response URL");
     const deadline = Date.now() + POLL_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      await sleep(POLL_INTERVAL_MS);
-      const r = await fetch(status_url, { headers });
-      if (!r.ok) throw new Error(`Fal status ${r.status}`);
-      const s = await r.json();
+      await sleep(POLL_INTERVAL_MS, signal);
+      const r = await fetch(statusUrl, { headers, redirect: "error" });
+      if (!r.ok) {
+        cancelResponseBody(r);
+        throw new Error(`Fal status ${r.status}`);
+      }
+      const s = await readJson(r);
       if (s.status === "COMPLETED") {
-        const fr = await fetch(response_url, { headers });
-        return await fr.json();
+        const fr = await fetch(responseUrl, { headers, redirect: "error" });
+        if (!fr.ok) {
+          cancelResponseBody(fr);
+          throw new Error(`Fal result ${fr.status}`);
+        }
+        return await readJson(fr);
       }
       if (s.status === "FAILED") throw new Error(s.error || "Fal generation failed");
     }

@@ -29,6 +29,7 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
+import { cancelReaderBestEffort } from "../utils/reader.js";
 import { FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import {
   QODER_CHAT_URL_ENCODED,
@@ -352,7 +353,7 @@ async function wrapQoderSSE(response, model) {
   const peek = await peekFirstQoderFrame(reader, decoder);
   if (peek?.isBilling) {
     // Billing block detected — return 403 so chatCore fails this connection
-    await reader.cancel().catch(() => {});
+    cancelReaderBestEffort(reader, "Qoder billing block");
     return new Response(
       JSON.stringify({ error: { message: peek.message, code: peek.statusVal } }),
       { status: 403, headers: { "Content-Type": "application/json" } }
@@ -364,6 +365,21 @@ async function wrapQoderSSE(response, model) {
   const upstreamDrained = peek.upstreamDone === true;
   const encoder = new TextEncoder();
   let doneEmitted = false;
+  let terminalSeen = false;
+
+  const emitFailure = (controller, code, reason) => {
+    if (doneEmitted) return;
+    const error = {
+      error: {
+        message: `Invalid upstream response: ${reason}`,
+        type: "upstream_error",
+        code,
+      },
+    };
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(error)}\n\n`));
+    controller.enqueue(encoder.encode(SSE_DONE));
+    doneEmitted = true;
+  };
 
   // Process one already-extracted SSE line (no trailing newline).
   const processLine = (line, controller) => {
@@ -375,36 +391,54 @@ async function wrapQoderSSE(response, model) {
     const data = trimmed.slice(5).trimStart();
     if (data === "[DONE]") {
       controller.enqueue(encoder.encode(SSE_DONE));
+      terminalSeen = true;
       doneEmitted = true;
       return;
     }
 
     let envelope;
-    try { envelope = JSON.parse(data); } catch { return; }
+    try { envelope = JSON.parse(data); } catch {
+      emitFailure(controller, "qoder_malformed_stream", "malformed Qoder envelope");
+      return;
+    }
+    if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+      emitFailure(controller, "qoder_malformed_stream", "invalid Qoder envelope");
+      return;
+    }
     const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
     const inner = typeof envelope.body === "string" ? envelope.body : "";
     if (statusVal !== 200) {
-      const msg = inner || `upstream status ${statusVal}`;
-      const errChunk = JSON.stringify({
-        id: `qoder-error-${Date.now()}`,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{ index: 0, delta: { content: `\n[qoder error ${statusVal}: ${truncate(msg, 200)}]` }, finish_reason: "stop" }],
-      });
-      controller.enqueue(encoder.encode(`data: ${errChunk}\n\n`));
-      controller.enqueue(encoder.encode(SSE_DONE));
-      doneEmitted = true;
+      emitFailure(controller, "qoder_upstream_error", `Qoder returned status ${statusVal}`);
       return;
     }
-    if (!inner) return;
+    if (!inner) {
+      emitFailure(controller, "qoder_malformed_stream", "Qoder envelope had no response body");
+      return;
+    }
     if (inner === "[DONE]") {
       controller.enqueue(encoder.encode(SSE_DONE));
+      terminalSeen = true;
       doneEmitted = true;
       return;
     }
     // Strip embedded newlines so the SSE frame stays a single event.
     const sanitized = inner.replace(/\r?\n/g, "");
+    let innerEvent;
+    try { innerEvent = JSON.parse(sanitized); } catch {
+      emitFailure(controller, "qoder_malformed_stream", "malformed Qoder response event");
+      return;
+    }
+    if (!innerEvent || typeof innerEvent !== "object" || Array.isArray(innerEvent)) {
+      emitFailure(controller, "qoder_malformed_stream", "invalid Qoder response event");
+      return;
+    }
+    if (innerEvent.error) {
+      emitFailure(controller, "qoder_upstream_error", "Qoder returned an error event");
+      return;
+    }
+    if (innerEvent.choices?.some?.(choice => typeof choice?.finish_reason === "string" && choice.finish_reason)) {
+      terminalSeen = true;
+    }
     controller.enqueue(encoder.encode(`data: ${sanitized}\n\n`));
   };
 
@@ -420,7 +454,7 @@ async function wrapQoderSSE(response, model) {
           buffer = buffer.slice(nlSeed + 1);
           processLine(line, controller);
           if (doneEmitted) {
-            await reader.cancel().catch(() => {});
+            cancelReaderBestEffort(reader, "Qoder terminal frame");
             controller.close();
             return;
           }
@@ -453,27 +487,28 @@ async function wrapQoderSSE(response, model) {
             processLine(line, controller);
             if (doneEmitted) {
               // Terminal frame received — drop upstream keepalive and end.
-              await reader.cancel().catch(() => {});
+              cancelReaderBestEffort(reader, "Qoder terminal frame");
               controller.close();
               return;
             }
           }
         }
       } catch {
-        // fall through to terminal [DONE] + close
+        try {
+          emitFailure(controller, "qoder_stream_interrupted", "Qoder stream was interrupted");
+        } catch { /* downstream already cancelled */ }
       } finally {
-        if (!doneEmitted) {
+        if (!doneEmitted && !terminalSeen) {
           try {
-            controller.enqueue(encoder.encode(SSE_DONE));
-            doneEmitted = true;
+            emitFailure(controller, "qoder_missing_terminal", "Qoder stream ended without a terminal event");
           } catch { /* already closed */ }
         }
         try { controller.close(); } catch { /* already closed */ }
-        await reader.cancel().catch(() => {});
+        cancelReaderBestEffort(reader, "Qoder stream finished");
       }
     },
-    cancel() {
-      return reader.cancel().catch(() => {});
+    cancel(reason) {
+      cancelReaderBestEffort(reader, reason);
     },
   });
 

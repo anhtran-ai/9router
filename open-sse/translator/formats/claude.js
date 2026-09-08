@@ -8,6 +8,7 @@ import { isValidClaudeSignature } from "../../utils/claudeSignature.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { DEFAULT_MAX_TOKENS } from "../../config/runtimeConfig.js";
+import { CLAUDE_SYSTEM_PROMPT } from "../../config/appConstants.js";
 import { applyAssistantPrefillPolicy } from "../concerns/assistantPrefillPolicy.js";
 import { ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
 
@@ -32,6 +33,8 @@ export function hasValidContent(msg) {
   if (Array.isArray(msg.content)) {
     return msg.content.some(block =>
       (block.type === CLAUDE_BLOCK.TEXT && block.text?.trim()) ||
+      block.type === CLAUDE_BLOCK.THINKING ||
+      block.type === CLAUDE_BLOCK.REDACTED_THINKING ||
       block.type === CLAUDE_BLOCK.TOOL_USE ||
       block.type === CLAUDE_BLOCK.TOOL_RESULT ||
       block.type === CLAUDE_BLOCK.IMAGE ||
@@ -325,6 +328,22 @@ export function anchorClaudeCache(body) {
 // - Fix tool_use/tool_result ordering
 // - Apply cloaking (billing header + fake user ID) for OAuth tokens
 export function prepareClaudeRequest(body, provider = null, apiKey = null, connectionId = null, rawHeaders = null, sessionId = null) {
+  // The Claude Code identity is specific to the official Claude transport. It
+  // must not leak into unrelated Anthropic-compatible providers.
+  if (provider === "claude") {
+    const promptBlock = { type: CLAUDE_BLOCK.TEXT, text: CLAUDE_SYSTEM_PROMPT };
+    if (Array.isArray(body.system)) {
+      const alreadyPresent = body.system.some(block => block?.text === CLAUDE_SYSTEM_PROMPT);
+      if (!alreadyPresent) body.system = [promptBlock, ...body.system];
+    } else if (typeof body.system === "string" && body.system) {
+      if (!body.system.includes(CLAUDE_SYSTEM_PROMPT)) {
+        body.system = [promptBlock, { type: CLAUDE_BLOCK.TEXT, text: body.system }];
+      }
+    } else {
+      body.system = [promptBlock];
+    }
+  }
+
   // quirk: MiniMax's Claude-compatible endpoint rejects Anthropic's output_config (400 invalid params)
   if (PROVIDERS[provider]?.quirks?.dropOutputConfig) {
     delete body.output_config;
@@ -429,6 +448,8 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
           // DeepSeek: keep existing thinking as-is; add an unsigned placeholder only if missing.
           const isClaudeNative = provider === "claude";
           const isDeepSeek = provider === "deepseek";
+          const hadThinking = msg.content.some(block =>
+            block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING);
           const kept = [];
           for (const block of msg.content) {
             const isThinking = block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING;
@@ -452,6 +473,9 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
             kept.push(block);
           }
           msg.content = kept;
+          if (isClaudeNative && hadThinking && kept.length === 0) {
+            throw new ToolCompatibilityError("Claude native cannot preserve unsigned reasoning-only assistant history");
+          }
 
           // Add thinking block if thinking enabled + has tool_use but no thinking
           if (thinkingEnabled && !hasKeptThinking && hasToolUse) {

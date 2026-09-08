@@ -2,6 +2,9 @@ import {
   getProviderCredentials,
   markAccountUnavailable,
   clearAccountError,
+  beginAccountMutationAttempt,
+  endAccountMutationAttempt,
+  recordAccountMutationSuccess,
   extractApiKey,
   isValidApiKey,
 } from "../services/auth.js";
@@ -117,49 +120,71 @@ export async function handleEmbeddings(request) {
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
 
-    const result = await handleEmbeddingsCore({
-      body: { ...body, model: `${provider}/${model}` },
-      modelInfo: { provider, model },
-      credentials: refreshedCredentials,
-      log,
-      onCredentialsRefreshed: async (newCreds) => {
-        await updateProviderCredentials(credentials.connectionId, {
-          ...newCreds,
-          existingProviderSpecificData: credentials.providerSpecificData,
-          testStatus: "active"
-        });
-      },
-      onRequestSuccess: async () => {
-        await clearAccountError(credentials.connectionId, credentials, model);
-      }
-    });
+    const mutationAttempt = beginAccountMutationAttempt(credentials.connectionId, model);
+    try {
+      const result = await handleEmbeddingsCore({
+        body: { ...body, model: `${provider}/${model}` },
+        modelInfo: { provider, model },
+        credentials: refreshedCredentials,
+        log,
+        signal: request.signal,
+        onCredentialsRefreshed: async (newCreds) => {
+          await updateProviderCredentials(credentials.connectionId, {
+            ...newCreds,
+            existingProviderSpecificData: credentials.providerSpecificData,
+            testStatus: "active"
+          });
+        },
+        onRequestSuccess: async () => {
+          recordAccountMutationSuccess(mutationAttempt);
+          await clearAccountError(credentials.connectionId, credentials, model, { mutationAttempt });
+        }
+      });
 
-    if (result.success) {
-      const usage = exactEmbeddingUsage(result.usage);
-      if (usage) {
-        saveRequestUsage({
-          provider,
-          model,
-          connectionId: credentials.connectionId,
-          apiKey,
-          endpoint: url.pathname,
-          tokens: usage,
-          status: "success",
-        }).catch(() => {});
+      if (result.success) {
+        recordAccountMutationSuccess(mutationAttempt);
+        const usage = exactEmbeddingUsage(result.usage);
+        if (usage) {
+          saveRequestUsage({
+            provider,
+            model,
+            connectionId: credentials.connectionId,
+            apiKey,
+            endpoint: url.pathname,
+            tokens: usage,
+            status: "success",
+          }).catch(() => {});
+        }
+        return result.response;
       }
+
+      // A client disconnect is not evidence that the provider account failed.
+      // Do not write cooldown/error state or rotate to another credential.
+      if (result.status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) {
+        return result.response;
+      }
+
+      const { shouldFallback } = await markAccountUnavailable(
+        credentials.connectionId,
+        result.status,
+        result.error,
+        provider,
+        model,
+        null,
+        { mutationAttempt },
+      );
+
+      if (shouldFallback) {
+        log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
+        excludeConnectionIds.add(credentials.connectionId);
+        lastError = result.error;
+        lastStatus = result.status;
+        continue;
+      }
+
       return result.response;
+    } finally {
+      endAccountMutationAttempt(mutationAttempt);
     }
-
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);
-
-    if (shouldFallback) {
-      log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
-      excludeConnectionIds.add(credentials.connectionId);
-      lastError = result.error;
-      lastStatus = result.status;
-      continue;
-    }
-
-    return result.response;
   }
 }

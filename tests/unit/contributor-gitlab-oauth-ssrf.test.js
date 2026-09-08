@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   createConnection: vi.fn(async (data) => ({ id: "connection-1", ...data })),
+  completeConnection: vi.fn(async (_id, data) => ({ id: "connection-1", ...data })),
 }));
 
 vi.mock("next/server", () => ({
@@ -10,13 +11,21 @@ vi.mock("next/server", () => ({
 
 vi.mock("@/lib/contributor/session", () => ({
   getContributorSession: async () => ({
-    invite: { id: "invite-1", allowedProviders: ["gitlab"], providerBaseUrls: {} },
+    invite: { id: "invite-1", sessionId: "session-1", allowedProviders: ["gitlab"], providerBaseUrls: {} },
+    payload: { sessionId: "session-1" },
   }),
   isSameOrigin: () => true,
 }));
 
 vi.mock("@/lib/contributor/store", () => ({
-  consumeContributorInvite: vi.fn(async () => true),
+  cancelContributorInviteReservation: vi.fn(async () => true),
+  completeContributorInviteWithConnection: mocks.completeConnection,
+  getContributorInvite: vi.fn(async () => null),
+  reserveContributorInvite: vi.fn(async () => ({ leaseId: "lease-1" })),
+  resumeContributorInviteReservation: vi.fn(async () => ({
+    reservation: { sessionId: "session-1", leaseHash: "lease-hash-1" },
+  })),
+  releaseContributorInviteReservation: vi.fn(async () => true),
   normalizeContributorProviderBaseUrls: (providerBaseUrls, allowedProviders = []) => {
     if (!allowedProviders.includes("gitlab") || !providerBaseUrls?.gitlab) return {};
     const parsed = new URL(providerBaseUrls.gitlab);
@@ -40,6 +49,7 @@ const { POST } = await import("../../src/app/api/contribute/oauth/[provider]/[ac
 afterEach(() => {
   vi.unstubAllGlobals();
   mocks.createConnection.mockClear();
+  mocks.completeConnection.mockClear();
 });
 
 describe("contributor GitLab OAuth SSRF boundary", () => {
@@ -85,12 +95,17 @@ describe("contributor GitLab OAuth SSRF boundary", () => {
     expect(fetchMock.mock.calls[0][1].body).toContain("code=authorization-code");
     expect(fetchMock.mock.calls[0][1].body).toContain("client_secret=contributor-secret");
     expect(fetchMock.mock.calls[1][0]).toBe("https://gitlab.com/api/v4/user");
-    expect(fetchMock.mock.calls[1][1].headers.Authorization).toBe("Bearer gitlab-access-token");
+    expect(fetchMock.mock.calls[1][1].headers.get("authorization")).toBe("Bearer gitlab-access-token");
     expect(fetchMock.mock.calls.every(([url]) => new URL(url).hostname === "gitlab.com")).toBe(true);
-    expect(mocks.createConnection).toHaveBeenCalledWith(expect.objectContaining({
+    expect(mocks.completeConnection).toHaveBeenCalledWith(
+      "invite-1",
+      expect.objectContaining({
       provider: "gitlab",
       accessToken: "gitlab-access-token",
       providerSpecificData: expect.objectContaining({ baseUrl: "https://gitlab.com" }),
-    }));
+      }),
+      { sessionId: "session-1", leaseId: "lease-1" },
+    );
+    expect(mocks.createConnection).not.toHaveBeenCalled();
   });
 });

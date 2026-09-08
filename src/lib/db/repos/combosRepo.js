@@ -85,7 +85,13 @@ export async function importComboItems(items, { conflictPolicy = "update" } = {}
   db.transaction(() => {
     const settingsRow = db.get(`SELECT data FROM settings WHERE id = 1`);
     const rawSettings = settingsRow ? parseJson(settingsRow.data, {}) : {};
-    const comboStrategies = { ...(rawSettings.comboStrategies || {}) };
+    const storedStrategies = rawSettings.comboStrategies;
+    const comboStrategies = Object.assign(
+      Object.create(null),
+      storedStrategies && typeof storedStrategies === "object" && !Array.isArray(storedStrategies)
+        ? storedStrategies
+        : {},
+    );
     let strategiesChanged = false;
 
     for (const item of items) {

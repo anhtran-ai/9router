@@ -1,8 +1,56 @@
 import { PROVIDERS, PROVIDER_OAUTH } from "../../config/providers.js";
 import { OAUTH_ENDPOINTS, GITHUB_COPILOT, buildKimiHeaders } from "../../config/appConstants.js";
 import { proxyAwareFetch } from "../../utils/proxyFetch.js";
+import { awaitWithSignal, throwIfAborted } from "../../utils/abort.js";
 import { dedupRefresh } from "./dedup.js";
 import { buildExternalIdpRefreshParams } from "../../../src/lib/oauth/kiroExternalIdp.js";
+import {
+  readModelCatalogJson,
+  readModelCatalogText,
+} from "../modelCatalogResponse.js";
+
+const TOKEN_REFRESH_BODY_LIMIT_BYTES = 256 * 1024;
+const COPILOT_REFRESH_TIMEOUT_MS = 10_000;
+const KIRO_REFRESH_TIMEOUT_MS = 30_000;
+
+async function runTokenRefreshWithDeadline(label, timeoutMs, operation) {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new DOMException(`${label} timed out`, "TimeoutError")),
+    timeoutMs,
+  );
+  const pending = Promise.resolve().then(() => operation(controller.signal));
+  try {
+    // Keep observing `pending` if a custom fetch ignores AbortSignal and settles
+    // after the deadline; this prevents a late unhandled rejection.
+    return await awaitWithSignal(pending, controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readRefreshText(response, signal) {
+  if (response?.body && typeof response.body.getReader === "function") {
+    return readModelCatalogText(response, {
+      signal,
+      maxBytes: TOKEN_REFRESH_BODY_LIMIT_BYTES,
+    });
+  }
+  // Compatibility for lightweight Response doubles. The surrounding refresh
+  // deadline still bounds an abort-ignoring `.text()` implementation.
+  return awaitWithSignal(response?.text?.() ?? Promise.resolve(""), signal);
+}
+
+async function readRefreshJson(response, signal) {
+  if (response?.body && typeof response.body.getReader === "function") {
+    return readModelCatalogJson(response, {
+      signal,
+      maxBytes: TOKEN_REFRESH_BODY_LIMIT_BYTES,
+    });
+  }
+  // Compatibility for lightweight Response doubles used by integrations.
+  return awaitWithSignal(response?.json?.() ?? Promise.reject(new TypeError("Missing JSON body")), signal);
+}
 
 let _xaiServiceSingleton = null;
 export async function refreshXaiToken(refreshToken, log) {
@@ -313,19 +361,30 @@ export async function refreshCodexToken(refreshToken, log) {
   }, log);
 }
 
-async function resolveKiroProfileArnPatch(providerSpecificData, accessToken, refreshedArn) {
+async function resolveKiroProfileArnPatch(providerSpecificData, accessToken, refreshedArn, signal) {
   if (providerSpecificData?.profileArn) return {};
   let profileArn = refreshedArn?.trim?.() || null;
   if (!profileArn) {
     const { fetchKiroProfileArn } = await import("../../../src/lib/oauth/providers.js");
-    profileArn = await fetchKiroProfileArn(accessToken);
+    // The legacy helper does not accept a signal. Stop this refresh's wait at
+    // the deadline and keep observing the helper's eventual completion.
+    profileArn = await awaitWithSignal(fetchKiroProfileArn(accessToken), signal);
   }
   return profileArn ? { providerSpecificData: { profileArn } } : {};
 }
 
-export async function refreshKiroToken(refreshToken, providerSpecificData, log, proxyOptions = null) {
+export async function refreshKiroToken(
+  refreshToken,
+  providerSpecificData,
+  log,
+  proxyOptions = null,
+  requestOptions = null,
+) {
   if (!refreshToken) return null;
-  return dedupRefresh("kiro", refreshToken, async () => {
+  throwIfAborted(requestOptions?.signal);
+  const sharedRefresh = dedupRefresh("kiro", refreshToken, async () => {
+  try {
+  return await runTokenRefreshWithDeadline("Kiro token refresh", KIRO_REFRESH_TIMEOUT_MS, async (refreshSignal) => {
   const authMethod = providerSpecificData?.authMethod;
   const clientId = providerSpecificData?.clientId;
   const clientSecret = providerSpecificData?.clientSecret;
@@ -347,18 +406,19 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
         Accept: "application/json",
       },
       body: refreshRequest.body,
+      signal: refreshSignal,
     }, proxyOptions);
 
     if (!response.ok) {
-      const errorText = await response.text();
+      const errorText = await readRefreshText(response, refreshSignal);
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Kiro external_idp token", {
         status: response.status,
-        error: errorText,
+        error: errorText.slice(0, 4096),
       });
       return null;
     }
 
-    const tokens = await response.json();
+    const tokens = await readRefreshJson(response, refreshSignal);
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed Kiro external_idp token", {
       hasNewAccessToken: !!tokens.access_token,
@@ -392,18 +452,19 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
         refreshToken: refreshToken,
         grantType: "refresh_token",
       }),
+      signal: refreshSignal,
     }, proxyOptions);
 
     if (!response.ok) {
-      const errorText = await response.text();
+      const errorText = await readRefreshText(response, refreshSignal);
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Kiro AWS token", {
         status: response.status,
-        error: errorText,
+        error: errorText.slice(0, 4096),
       });
       return null;
     }
 
-    const tokens = await response.json();
+    const tokens = await readRefreshJson(response, refreshSignal);
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed Kiro AWS token", {
       hasNewAccessToken: !!tokens.accessToken,
@@ -414,7 +475,12 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken || refreshToken,
       expiresIn: tokens.expiresIn,
-      ...(await resolveKiroProfileArnPatch(providerSpecificData, tokens.accessToken, tokens.profileArn)),
+      ...(await resolveKiroProfileArnPatch(
+        providerSpecificData,
+        tokens.accessToken,
+        tokens.profileArn,
+        refreshSignal,
+      )),
     };
   }
 
@@ -428,18 +494,19 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
     body: JSON.stringify({
       refreshToken: refreshToken,
     }),
+    signal: refreshSignal,
   }, proxyOptions);
 
   if (!response.ok) {
-    const errorText = await response.text();
+    const errorText = await readRefreshText(response, refreshSignal);
     log?.error?.("TOKEN_REFRESH", "Failed to refresh Kiro social token", {
       status: response.status,
-      error: errorText,
+      error: errorText.slice(0, 4096),
     });
     return null;
   }
 
-  const tokens = await response.json();
+  const tokens = await readRefreshJson(response, refreshSignal);
 
   log?.info?.("TOKEN_REFRESH", "Successfully refreshed Kiro social token", {
     hasNewAccessToken: !!tokens.accessToken,
@@ -450,9 +517,22 @@ export async function refreshKiroToken(refreshToken, providerSpecificData, log, 
     accessToken: tokens.accessToken,
     refreshToken: tokens.refreshToken || refreshToken,
     expiresIn: tokens.expiresIn,
-    ...(await resolveKiroProfileArnPatch(providerSpecificData, tokens.accessToken, tokens.profileArn)),
+    ...(await resolveKiroProfileArnPatch(
+      providerSpecificData,
+      tokens.accessToken,
+      tokens.profileArn,
+      refreshSignal,
+    )),
   };
+  });
+  } catch (error) {
+    log?.error?.("TOKEN_REFRESH", "Error refreshing Kiro token", {
+      error: error?.message || String(error),
+    });
+    return null;
+  }
   }, log);
+  return awaitWithSignal(sharedRefresh, requestOptions?.signal);
 }
 
 // iFlow: Basic Auth + client_id+client_secret in body. Delegate to refreshAccessToken("iflow", ...).
@@ -465,10 +545,15 @@ export async function refreshGitHubToken(refreshToken, log) {
   return refreshAccessToken("github", refreshToken, {}, log);
 }
 
-export async function refreshCopilotToken(githubAccessToken, log) {
+export async function refreshCopilotToken(githubAccessToken, log, requestOptions = null) {
   if (!githubAccessToken) return null;
-  return dedupRefresh("copilot", githubAccessToken, async () => {
-  try {
+  throwIfAborted(requestOptions?.signal);
+  const sharedRefresh = dedupRefresh("copilot", githubAccessToken, async () => {
+    try {
+      return await runTokenRefreshWithDeadline(
+        "Copilot token refresh",
+        COPILOT_REFRESH_TIMEOUT_MS,
+        async (refreshSignal) => {
     const response = await fetch(PROVIDER_OAUTH["github"]?.copilotTokenUrl, {
       headers: {
         "Authorization": `token ${githubAccessToken}`,
@@ -477,19 +562,20 @@ export async function refreshCopilotToken(githubAccessToken, log) {
         "Editor-Plugin-Version": `copilot-chat/${GITHUB_COPILOT.COPILOT_CHAT_VERSION}`,
         "Accept": "application/json",
         "x-github-api-version": GITHUB_COPILOT.API_VERSION
-      }
+      },
+      signal: refreshSignal,
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
+      const errorText = await readRefreshText(response, refreshSignal);
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Copilot token", {
         status: response.status,
-        error: errorText
+        error: errorText.slice(0, 4096),
       });
       return null;
     }
 
-    const data = await response.json();
+    const data = await readRefreshJson(response, refreshSignal);
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed Copilot token", {
       hasToken: !!data.token,
@@ -500,13 +586,16 @@ export async function refreshCopilotToken(githubAccessToken, log) {
       token: data.token,
       expiresAt: data.expires_at
     };
-  } catch (error) {
-    log?.error?.("TOKEN_REFRESH", "Error refreshing Copilot token", {
-      error: error.message
-    });
-    return null;
-  }
+        },
+      );
+    } catch (error) {
+      log?.error?.("TOKEN_REFRESH", "Error refreshing Copilot token", {
+        error: error?.message || String(error),
+      });
+      return null;
+    }
   }, log);
+  return awaitWithSignal(sharedRefresh, requestOptions?.signal);
 }
 
 // CodeBuddy (Tencent) refresh — POST /v2/plugin/auth/token/refresh with the

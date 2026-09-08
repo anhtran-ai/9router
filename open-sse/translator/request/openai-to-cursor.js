@@ -10,16 +10,26 @@ import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
 import { DEFAULT_MIN_TOKENS } from "../../config/runtimeConfig.js";
+import { ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
+import { extractReasoningText } from "../concerns/reasoning.js";
+
+function rejectCursorUnsupportedMedia(part) {
+  if ([OPENAI_BLOCK.IMAGE_URL, OPENAI_BLOCK.IMAGE, OPENAI_BLOCK.INPUT_AUDIO,
+    OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE].includes(part?.type)) {
+    throw new ToolCompatibilityError("Cursor transport supports text and tool content only");
+  }
+}
 
 function extractContent(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .filter(part => {
-        if (!part || typeof part !== "object") return false;
-        return part.type === OPENAI_BLOCK.TEXT && typeof part.text === "string";
+      .map(part => {
+        if (!part || typeof part !== "object") return "";
+        rejectCursorUnsupportedMedia(part);
+        if (part.type === OPENAI_BLOCK.TEXT && typeof part.text === "string") return part.text;
+        return "";
       })
-      .map(part => part.text || "")
       .join("");
   }
   return "";
@@ -81,7 +91,7 @@ function convertMessages(messages) {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
 
-    if (msg.role === ROLE.SYSTEM) {
+    if (msg.role === ROLE.SYSTEM || msg.role === ROLE.DEVELOPER) {
       result.push({
         role: ROLE.USER,
         content: `[System Instructions]\n${extractContent(msg.content)}`
@@ -102,10 +112,14 @@ function convertMessages(messages) {
     }
 
     if (msg.role === ROLE.USER || msg.role === ROLE.ASSISTANT) {
+      if (msg.role === ROLE.ASSISTANT && extractReasoningText(msg)) {
+        throw new ToolCompatibilityError("Cursor transport cannot preserve assistant reasoning history");
+      }
       if (msg.role === ROLE.USER && Array.isArray(msg.content)) {
         const parts = [];
         for (const block of msg.content) {
           if (!block || typeof block !== "object") continue;
+          rejectCursorUnsupportedMedia(block);
           if (block.type === CLAUDE_BLOCK.TEXT) {
             if (typeof block.text === "string") {
               parts.push(block.text || "");
@@ -178,7 +192,7 @@ export function openaiToCursorRequest(model, body, stream, credentials) {
   return {
     ...rest,
     messages,
-    max_tokens: DEFAULT_MIN_TOKENS
+    max_tokens: body.max_tokens ?? body.max_output_tokens ?? DEFAULT_MIN_TOKENS
   };
 }
 

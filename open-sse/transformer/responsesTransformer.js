@@ -17,7 +17,13 @@ export function createResponsesLogger(model, logsDir = null) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
   const uniqueId = Math.random().toString(36).slice(2, 8);
   const baseDir = logsDir || (typeof process !== "undefined" ? process.cwd() : ".");
-  const logDir = path.join(baseDir, "logs", `responses_${model}_${timestamp}_${uniqueId}`);
+  // Model ids are externally controlled and may contain slashes, drive
+  // prefixes, or traversal segments. Keep them inside one bounded filename.
+  const safeModel = String(model || "unknown")
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^\.+/, "")
+    .slice(0, 80) || "unknown";
+  const logDir = path.join(baseDir, "logs", `responses_${safeModel}_${timestamp}_${uniqueId}`);
   
   try {
     fs.mkdirSync(logDir, { recursive: true });
@@ -73,11 +79,27 @@ export function createResponsesApiTransformStream(logger = null) {
     funcArgsDone: {},
     funcItemDone: {},
     buffer: "",
-    completedSent: false
+    completedSent: false,
+    terminalSeen: false,
+    semanticEvents: 0,
   };
 
   const encoder = new TextEncoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const maxBufferedEventChars = 1024 * 1024;
+  let previousChunkEndedWithCR = false;
   const nextSeq = () => ++state.seq;
+
+  const normalizeSseLineEndings = (text) => {
+    let normalized = text;
+    // A CRLF pair can be split across network chunks. The preceding CR was
+    // already normalized to LF, so suppress the matching LF on this chunk.
+    if (previousChunkEndedWithCR && normalized.startsWith("\n")) {
+      normalized = normalized.slice(1);
+    }
+    previousChunkEndedWithCR = normalized.endsWith("\r");
+    return normalized.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  };
   
   const emit = (controller, eventType, data) => {
     data.sequence_number = nextSeq();
@@ -239,196 +261,244 @@ export function createResponsesApiTransformStream(logger = null) {
     }
   };
 
+  const closeOutput = (controller) => {
+    for (const i in state.msgItemAdded) closeMessage(controller, i);
+    closeReasoning(controller);
+    for (const i in state.funcCallIds) closeToolCall(controller, i);
+    sendCompleted(controller);
+  };
+
+  const protocolError = (message) => new Error(`Invalid upstream Chat Completions stream: ${message}`);
+
+  const processMessage = (msg, controller) => {
+    if (!msg.trim()) return;
+
+    const dataLines = msg
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^\s/, ""));
+    // SSE comments and named events without data are harmless keepalives.
+    if (dataLines.length === 0) return;
+
+    const dataStr = dataLines.join("\n").trim();
+    if (dataStr === "[DONE]") {
+      if (state.semanticEvents === 0) throw protocolError("received [DONE] before any response event");
+      if (!state.terminalSeen) closeOutput(controller);
+      state.terminalSeen = true;
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(dataStr);
+    } catch {
+      throw protocolError("malformed JSON event");
+    }
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw protocolError("event is not a JSON object");
+    }
+    if (parsed.error) {
+      const detail = typeof parsed.error === "string"
+        ? parsed.error
+        : parsed.error?.message || "upstream returned an error envelope";
+      throw protocolError(String(detail).slice(0, 300));
+    }
+
+    // OpenAI may send one usage-only chunk after all choices have finished and
+    // before [DONE]. It carries no response data and cannot reopen completion.
+    if (Array.isArray(parsed.choices) && parsed.choices.length === 0 && parsed.usage && state.completedSent) {
+      return;
+    }
+    if (state.terminalSeen) throw protocolError("received response data after the terminal event");
+    if (!Array.isArray(parsed.choices) || parsed.choices.length === 0) {
+      throw protocolError("event has no completion choice");
+    }
+
+    const choice = parsed.choices[0];
+    if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
+      throw protocolError("completion choice is invalid");
+    }
+    state.semanticEvents += 1;
+    const idx = choice.index || 0;
+    const delta = choice.delta || {};
+
+    // Emit initial events
+    if (!state.started) {
+      state.started = true;
+      state.responseId = parsed.id ? `resp_${parsed.id}` : state.responseId;
+
+      emit(controller, "response.created", {
+        type: "response.created",
+        response: {
+          id: state.responseId,
+          object: "response",
+          created_at: state.created,
+          status: "in_progress",
+          background: false,
+          error: null,
+          output: []
+        }
+      });
+
+      emit(controller, "response.in_progress", {
+        type: "response.in_progress",
+        response: {
+          id: state.responseId,
+          object: "response",
+          created_at: state.created,
+          status: "in_progress"
+        }
+      });
+    }
+
+    // Handle reasoning_content (OpenAI native format)
+    if (delta.reasoning_content) {
+      startReasoning(controller, idx);
+      emitReasoningDelta(controller, delta.reasoning_content);
+    }
+
+    // Handle text content (may contain <think> tags)
+    if (delta.content) {
+      let content = delta.content;
+
+      if (content.includes("<think>")) {
+        state.inThinking = true;
+        content = content.replace("<think>", "");
+        startReasoning(controller, idx);
+      }
+
+      if (content.includes("</think>")) {
+        const parts = content.split("</think>");
+        const thinkPart = parts[0];
+        const textPart = parts.slice(1).join("</think>");
+
+        if (thinkPart) emitReasoningDelta(controller, thinkPart);
+        closeReasoning(controller);
+        state.inThinking = false;
+        content = textPart;
+      }
+
+      if (state.inThinking && content) {
+        emitReasoningDelta(controller, content);
+      } else if (content) {
+        if (!state.msgItemAdded[idx]) {
+          state.msgItemAdded[idx] = true;
+          const msgId = `msg_${state.responseId}_${idx}`;
+
+          emit(controller, "response.output_item.added", {
+            type: "response.output_item.added",
+            output_index: idx,
+            item: { id: msgId, type: "message", content: [], role: "assistant" }
+          });
+        }
+
+        if (!state.msgContentAdded[idx]) {
+          state.msgContentAdded[idx] = true;
+
+          emit(controller, "response.content_part.added", {
+            type: "response.content_part.added",
+            item_id: `msg_${state.responseId}_${idx}`,
+            output_index: idx,
+            content_index: 0,
+            part: { type: "output_text", annotations: [], logprobs: [], text: "" }
+          });
+        }
+
+        emit(controller, "response.output_text.delta", {
+          type: "response.output_text.delta",
+          item_id: `msg_${state.responseId}_${idx}`,
+          output_index: idx,
+          content_index: 0,
+          delta: content,
+          logprobs: []
+        });
+
+        if (!state.msgTextBuf[idx]) state.msgTextBuf[idx] = "";
+        state.msgTextBuf[idx] += content;
+      }
+    }
+
+    // Handle tool_calls
+    if (delta.tool_calls) {
+      closeMessage(controller, idx);
+
+      for (const tc of delta.tool_calls) {
+        const tcIdx = tc.index ?? 0;
+        const newCallId = tc.id;
+        const funcName = tc.function?.name;
+
+        if (funcName) state.funcNames[tcIdx] = funcName;
+
+        if (!state.funcCallIds[tcIdx] && newCallId) {
+          state.funcCallIds[tcIdx] = newCallId;
+
+          emit(controller, "response.output_item.added", {
+            type: "response.output_item.added",
+            output_index: tcIdx,
+            item: {
+              id: `fc_${newCallId}`,
+              type: "function_call",
+              arguments: "",
+              call_id: newCallId,
+              name: state.funcNames[tcIdx] || ""
+            }
+          });
+        }
+
+        if (!state.funcArgsBuf[tcIdx]) state.funcArgsBuf[tcIdx] = "";
+
+        if (tc.function?.arguments) {
+          const refCallId = state.funcCallIds[tcIdx] || newCallId;
+          if (refCallId) {
+            emit(controller, "response.function_call_arguments.delta", {
+              type: "response.function_call_arguments.delta",
+              item_id: `fc_${refCallId}`,
+              output_index: tcIdx,
+              delta: tc.function.arguments
+            });
+          }
+          state.funcArgsBuf[tcIdx] += tc.function.arguments;
+        }
+      }
+    }
+
+    if (choice.finish_reason) {
+      closeOutput(controller);
+      state.terminalSeen = true;
+    }
+  };
+
   return new TransformStream({
     transform(chunk, controller) {
-      const text = new TextDecoder().decode(chunk);
+      // Keep one decoder for the stream so split UTF-8 code points are not
+      // replaced/corrupted at arbitrary network chunk boundaries.
+      const text = normalizeSseLineEndings(decoder.decode(chunk, { stream: true }));
       logger?.logInput(text.trim());
       state.buffer += text;
+
+      if (state.buffer.length > maxBufferedEventChars) {
+        throw protocolError("SSE event exceeds the 1 MiB buffer limit");
+      }
 
       const messages = state.buffer.split("\n\n");
       state.buffer = messages.pop() || "";
 
       for (const msg of messages) {
-        if (!msg.trim()) continue;
-
-        const dataMatch = msg.match(/^data:\s*(.+)$/m);
-        if (!dataMatch) continue;
-
-        const dataStr = dataMatch[1].trim();
-        if (dataStr === "[DONE]") continue;
-
-        let parsed;
-        try {
-          parsed = JSON.parse(dataStr);
-        } catch {
-          continue;
-        }
-
-        if (!parsed.choices?.length) continue;
-        
-        const choice = parsed.choices[0];
-        const idx = choice.index || 0;
-        const delta = choice.delta || {};
-
-        // Emit initial events
-        if (!state.started) {
-          state.started = true;
-          state.responseId = parsed.id ? `resp_${parsed.id}` : state.responseId;
-          
-          emit(controller, "response.created", {
-            type: "response.created",
-            response: {
-              id: state.responseId,
-              object: "response",
-              created_at: state.created,
-              status: "in_progress",
-              background: false,
-              error: null,
-              output: []
-            }
-          });
-
-          emit(controller, "response.in_progress", {
-            type: "response.in_progress",
-            response: {
-              id: state.responseId,
-              object: "response",
-              created_at: state.created,
-              status: "in_progress"
-            }
-          });
-        }
-
-        // Handle reasoning_content (OpenAI native format)
-        if (delta.reasoning_content) {
-          startReasoning(controller, idx);
-          emitReasoningDelta(controller, delta.reasoning_content);
-        }
-
-        // Handle text content (may contain <think> tags)
-        if (delta.content) {
-          let content = delta.content;
-
-          if (content.includes("<think>")) {
-            state.inThinking = true;
-            content = content.replace("<think>", "");
-            startReasoning(controller, idx);
-          }
-
-          if (content.includes("</think>")) {
-            const parts = content.split("</think>");
-            const thinkPart = parts[0];
-            const textPart = parts.slice(1).join("</think>");
-            
-            if (thinkPart) emitReasoningDelta(controller, thinkPart);
-            closeReasoning(controller);
-            state.inThinking = false;
-            content = textPart;
-          }
-
-          if (state.inThinking && content) {
-            emitReasoningDelta(controller, content);
-            continue;
-          }
-
-          // Regular text content
-          if (content) {
-            if (!state.msgItemAdded[idx]) {
-              state.msgItemAdded[idx] = true;
-              const msgId = `msg_${state.responseId}_${idx}`;
-              
-              emit(controller, "response.output_item.added", {
-                type: "response.output_item.added",
-                output_index: idx,
-                item: { id: msgId, type: "message", content: [], role: "assistant" }
-              });
-            }
-
-            if (!state.msgContentAdded[idx]) {
-              state.msgContentAdded[idx] = true;
-              
-              emit(controller, "response.content_part.added", {
-                type: "response.content_part.added",
-                item_id: `msg_${state.responseId}_${idx}`,
-                output_index: idx,
-                content_index: 0,
-                part: { type: "output_text", annotations: [], logprobs: [], text: "" }
-              });
-            }
-
-            emit(controller, "response.output_text.delta", {
-              type: "response.output_text.delta",
-              item_id: `msg_${state.responseId}_${idx}`,
-              output_index: idx,
-              content_index: 0,
-              delta: content,
-              logprobs: []
-            });
-
-            if (!state.msgTextBuf[idx]) state.msgTextBuf[idx] = "";
-            state.msgTextBuf[idx] += content;
-          }
-        }
-
-        // Handle tool_calls
-        if (delta.tool_calls) {
-          closeMessage(controller, idx);
-
-          for (const tc of delta.tool_calls) {
-            const tcIdx = tc.index ?? 0;
-            const newCallId = tc.id;
-            const funcName = tc.function?.name;
-
-            if (funcName) state.funcNames[tcIdx] = funcName;
-
-            if (!state.funcCallIds[tcIdx] && newCallId) {
-              state.funcCallIds[tcIdx] = newCallId;
-              
-              emit(controller, "response.output_item.added", {
-                type: "response.output_item.added",
-                output_index: tcIdx,
-                item: {
-                  id: `fc_${newCallId}`,
-                  type: "function_call",
-                  arguments: "",
-                  call_id: newCallId,
-                  name: state.funcNames[tcIdx] || ""
-                }
-              });
-            }
-
-            if (!state.funcArgsBuf[tcIdx]) state.funcArgsBuf[tcIdx] = "";
-
-            if (tc.function?.arguments) {
-              const refCallId = state.funcCallIds[tcIdx] || newCallId;
-              if (refCallId) {
-                emit(controller, "response.function_call_arguments.delta", {
-                  type: "response.function_call_arguments.delta",
-                  item_id: `fc_${refCallId}`,
-                  output_index: tcIdx,
-                  delta: tc.function.arguments
-                });
-              }
-              state.funcArgsBuf[tcIdx] += tc.function.arguments;
-            }
-          }
-        }
-
-        // Handle finish_reason
-        if (choice.finish_reason) {
-          for (const i in state.msgItemAdded) closeMessage(controller, i);
-          closeReasoning(controller);
-          for (const i in state.funcCallIds) closeToolCall(controller, i);
-          sendCompleted(controller);
-        }
+        processMessage(msg, controller);
       }
     },
 
     flush(controller) {
-      for (const i in state.msgItemAdded) closeMessage(controller, i);
-      closeReasoning(controller);
-      for (const i in state.funcCallIds) closeToolCall(controller, i);
-      sendCompleted(controller);
+      const decoderTail = normalizeSseLineEndings(decoder.decode());
+      if (decoderTail) state.buffer += decoderTail;
+
+      if (state.buffer.trim()) {
+        throw protocolError("stream ended with an unterminated SSE event");
+      }
+      if (!state.terminalSeen || !state.completedSent) {
+        throw protocolError("stream ended before a terminal event");
+      }
 
       logger?.logOutput("data: [DONE]");
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));

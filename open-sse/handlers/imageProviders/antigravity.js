@@ -27,7 +27,7 @@ export default {
   buildHeaders: () => ({}),
   buildBody: () => ({}),
 
-  async executeViaExecutor(model, body, credentials, log) {
+  async executeViaExecutor(model, body, credentials, log, { signal, readJson, readText }) {
     const executor = getExecutor("antigravity");
     if (!executor) throw new Error("Antigravity executor not found");
 
@@ -61,15 +61,16 @@ export default {
       body: chatBody,
       stream: false,
       credentials,
+      signal,
       log,
     });
 
     if (!result.response.ok) {
-      const text = await result.response.text();
+      const text = await readText(result.response);
       throw new Error(text || `HTTP ${result.response.status}`);
     }
 
-    return result.response.json();
+    return readJson(result.response);
   },
 
   normalize: (responseBody, prompt) => {
@@ -80,7 +81,7 @@ export default {
     }));
     return {
       created: nowSec(),
-      data: images.length > 0 ? images : [{ b64_json: "", revised_prompt: prompt }],
+      data: images.map((image) => ({ ...image, revised_prompt: prompt })),
     };
   },
 };

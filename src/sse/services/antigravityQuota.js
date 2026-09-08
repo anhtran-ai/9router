@@ -300,8 +300,15 @@ async function evaluateAntigravityQuotaError(
   }
 
   // Healthy-but-exhausted reading: clear strikes and use the exact resetAt.
-  strikeCounts.delete(key);
-  if (!strikeBlocks.has(key)) strikeFailureAttempts.delete(key);
+  // A late older quota evaluation must not erase ordering/state established by
+  // a newer failed request while both were waiting on the shared quota source.
+  const hasNewerAttemptFailure = attempt?.key === key
+    && Number.isFinite(attempt.id)
+    && attempt.id < getLatestFailureAttemptId(key);
+  if (!hasNewerAttemptFailure) {
+    strikeCounts.delete(key);
+    if (!strikeBlocks.has(key)) strikeFailureAttempts.delete(key);
+  }
   if (!quota.resetAt) return null;
 
   const resetMs = new Date(quota.resetAt).getTime();

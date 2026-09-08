@@ -31,6 +31,7 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 }));
 
 import { handleEmbeddingsCore } from "../../open-sse/handlers/embeddingsCore.js";
+import { refreshWithRetry } from "../../open-sse/services/tokenRefresh.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -424,16 +425,15 @@ describe("handleEmbeddingsCore — input validation", () => {
     expect(result.status).toBe(400);
   });
 
-  it("empty array input passes validation and reaches provider", async () => {
+  it("empty array input is rejected before reaching the provider", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(
       makeProviderResponse(VALID_EMBEDDING_RESPONSE)
     ));
     const result = await handleEmbeddingsCore(makeOptions({
       body: { model: "text-embedding-ada-002", input: [] },
     }));
-    // Empty array is truthy → passes, fetch is called
-    expect(fetch).toHaveBeenCalledOnce();
-    expect(result.success).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ success: false, status: 400 });
   });
 });
 
@@ -494,6 +494,34 @@ describe("handleEmbeddingsCore — success path", () => {
     expect(onRequestSuccess).toHaveBeenCalledOnce();
   });
 
+  it("keeps a validated success when account cleanup rejects", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(makeProviderResponse(VALID_EMBEDDING_RESPONSE));
+    const onRequestSuccess = vi.fn(() => Promise.reject(new Error("cleanup failed")));
+
+    const result = await handleEmbeddingsCore(makeOptions({ onRequestSuccess }));
+
+    expect(result.success).toBe(true);
+    expect(result.response.status).toBe(200);
+    expect(onRequestSuccess).toHaveBeenCalledOnce();
+  });
+
+  it("rejects invalid UTF-8 in an HTTP 200 JSON response before success", async () => {
+    const invalid = new Uint8Array([
+      ...new TextEncoder().encode('{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"model":"'),
+      0xff,
+      ...new TextEncoder().encode('"}'),
+    ]);
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(invalid, {
+      headers: { "content-type": "application/json" },
+    }));
+    const onRequestSuccess = vi.fn();
+
+    const result = await handleEmbeddingsCore(makeOptions({ onRequestSuccess }));
+
+    expect(result).toMatchObject({ success: false, status: 502 });
+    expect(onRequestSuccess).not.toHaveBeenCalled();
+  });
+
   it("does not call onRequestSuccess on provider error", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(makeProviderErrorResponse(500, "Server exploded"));
     const onRequestSuccess = vi.fn();
@@ -503,14 +531,15 @@ describe("handleEmbeddingsCore — success path", () => {
     expect(onRequestSuccess).not.toHaveBeenCalled();
   });
 
-  it("provider response with non-standard format is passed through as-is", async () => {
+  it("rejects a non-standard provider response instead of marking it successful", async () => {
     const nonStandardBody = { embeddings: [[0.1, 0.2]], model: "custom" };
     vi.mocked(fetch).mockResolvedValueOnce(makeProviderResponse(nonStandardBody));
+    const onRequestSuccess = vi.fn();
 
-    const result = await handleEmbeddingsCore(makeOptions());
-    const body = await result.response.json();
+    const result = await handleEmbeddingsCore(makeOptions({ onRequestSuccess }));
 
-    expect(body).toEqual(nonStandardBody);
+    expect(result).toMatchObject({ success: false, status: 502 });
+    expect(onRequestSuccess).not.toHaveBeenCalled();
   });
 });
 
@@ -642,5 +671,171 @@ describe("handleEmbeddingsCore — token refresh on 401/403", () => {
     // Should return an error result, not throw
     expect(result).toHaveProperty("success");
     expect(result.success).toBe(false);
+  });
+});
+
+describe("handleEmbeddingsCore — response lifecycle hardening", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    vi.mocked(refreshWithRetry).mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stalledProviderResponse({ initial = "", status = 200 } = {}) {
+    const cancel = vi.fn();
+    const body = new ReadableStream({
+      start(controller) {
+        if (initial) controller.enqueue(new TextEncoder().encode(initial));
+      },
+      cancel,
+    });
+    return { response: new Response(body, { status }), body, cancel };
+  }
+
+  it("does not clear account state when provider normalization rejects JSON", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(makeProviderResponse(null));
+    const onRequestSuccess = vi.fn();
+
+    const result = await handleEmbeddingsCore(makeOptions({
+      modelInfo: { provider: "gemini", model: "gemini-embedding-2-preview" },
+      credentials: { apiKey: "gemini-key" },
+      onRequestSuccess,
+    }));
+
+    expect(result).toMatchObject({ success: false, status: 502 });
+    expect(onRequestSuccess).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing contract", {}, "hello"],
+    ["200 error envelope", { error: { message: "intercepted" } }, "hello"],
+    ["empty list", { object: "list", data: [] }, "hello"],
+    ["count mismatch", { object: "list", data: [VALID_EMBEDDING_RESPONSE.data[0]] }, ["first", "second"]],
+    ["non-finite vector", {
+      object: "list",
+      data: [{ object: "embedding", index: 0, embedding: [0.1, null] }],
+    }, "hello"],
+  ])("rejects %s without clearing account state", async (_label, payload, input) => {
+    vi.mocked(fetch).mockResolvedValueOnce(makeProviderResponse(payload));
+    const onRequestSuccess = vi.fn();
+
+    const result = await handleEmbeddingsCore(makeOptions({
+      body: { model: "text-embedding-ada-002", input },
+      onRequestSuccess,
+    }));
+
+    expect(result).toMatchObject({ success: false, status: 502 });
+    expect(onRequestSuccess).not.toHaveBeenCalled();
+  });
+
+  it("accepts canonical base64 embeddings when the client requested base64", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(makeProviderResponse({
+      object: "list",
+      data: [{ object: "embedding", index: 0, embedding: "AQIDBA==" }],
+      model: "text-embedding-ada-002",
+      usage: { prompt_tokens: 1, total_tokens: 1 },
+    }));
+
+    const result = await handleEmbeddingsCore(makeOptions({
+      body: {
+        model: "text-embedding-ada-002",
+        input: "hello",
+        encoding_format: "base64",
+      },
+    }));
+
+    expect(result.success).toBe(true);
+  });
+
+  it("caps a successful JSON body and does not clear account state", async () => {
+    const upstream = stalledProviderResponse({ initial: "{\"data\":[]}" });
+    vi.mocked(fetch).mockResolvedValueOnce(upstream.response);
+    const onRequestSuccess = vi.fn();
+
+    const result = await handleEmbeddingsCore(makeOptions({
+      maxResponseBytes: 5,
+      onRequestSuccess,
+    }));
+
+    expect(result).toMatchObject({ success: false, status: 502 });
+    expect(onRequestSuccess).not.toHaveBeenCalled();
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+    expect(upstream.body.locked).toBe(false);
+  });
+
+  it("times out a stalled success body and cancels/releases its reader", async () => {
+    const upstream = stalledProviderResponse({ initial: "{\"data\":" });
+    vi.mocked(fetch).mockResolvedValueOnce(upstream.response);
+    const onRequestSuccess = vi.fn();
+
+    const result = await handleEmbeddingsCore(makeOptions({
+      responseStallTimeoutMs: 10,
+      requestTimeoutMs: 10_000,
+      onRequestSuccess,
+    }));
+    await Promise.resolve();
+
+    expect(result).toMatchObject({ success: false, status: 502 });
+    expect(onRequestSuccess).not.toHaveBeenCalled();
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+    expect(upstream.body.locked).toBe(false);
+  });
+
+  it("keeps the absolute fetch deadline active through the success body", async () => {
+    const upstream = stalledProviderResponse({ initial: "{\"data\":" });
+    vi.mocked(fetch).mockResolvedValueOnce(upstream.response);
+
+    const result = await handleEmbeddingsCore(makeOptions({
+      responseStallTimeoutMs: 10_000,
+      requestTimeoutMs: 10,
+    }));
+    await Promise.resolve();
+
+    expect(result).toMatchObject({ success: false, status: 504 });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+    expect(upstream.body.locked).toBe(false);
+  });
+
+  it("propagates client cancellation through a stalled success body", async () => {
+    const upstream = stalledProviderResponse();
+    vi.mocked(fetch).mockResolvedValueOnce(upstream.response);
+    const controller = new AbortController();
+    const pending = handleEmbeddingsCore(makeOptions({
+      signal: controller.signal,
+      responseStallTimeoutMs: 10_000,
+      requestTimeoutMs: 10_000,
+    }));
+
+    controller.abort(new DOMException("client left", "AbortError"));
+    const result = await pending;
+    await Promise.resolve();
+
+    expect(result).toMatchObject({ success: false, status: 499 });
+    expect(upstream.cancel).toHaveBeenCalledOnce();
+    expect(upstream.body.locked).toBe(false);
+  });
+
+  it("uses the same full-response deadline for the refreshed retry", async () => {
+    const retry = stalledProviderResponse({ initial: "{\"data\":" });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(makeProviderErrorResponse(401, "expired"))
+      .mockResolvedValueOnce(retry.response);
+    vi.mocked(refreshWithRetry).mockResolvedValueOnce({ apiKey: "sk-refreshed" });
+
+    const result = await handleEmbeddingsCore(makeOptions({
+      requestTimeoutMs: 10,
+      responseStallTimeoutMs: 10_000,
+    }));
+    await Promise.resolve();
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(fetch).mock.calls[0][1].signal)
+      .toBe(vi.mocked(fetch).mock.calls[1][1].signal);
+    expect(result).toMatchObject({ success: false, status: 504 });
+    expect(retry.cancel).toHaveBeenCalledOnce();
+    expect(retry.body.locked).toBe(false);
   });
 });

@@ -22,6 +22,12 @@
 import { v4 as uuidv4 } from "uuid";
 import { createHash } from "crypto";
 import { refreshKiroToken } from "./tokenRefresh.js";
+import {
+  cancelModelCatalogBody,
+  readModelCatalogJson,
+  readModelCatalogText,
+  runModelCatalogRefresh,
+} from "./modelCatalogResponse.js";
 
 const KIRO_RUNTIME_SDK_VERSION = "1.0.0";
 const KIRO_AGENT_OS = "windows";
@@ -170,10 +176,18 @@ async function fetchKiroCatalogRaw(credentials, signal) {
   };
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("Kiro model catalog timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  let abortListener = null;
   // Forward outer cancellation if any.
   if (signal && typeof signal.addEventListener === "function") {
-    signal.addEventListener("abort", () => controller.abort(signal.reason));
+    if (signal.aborted) controller.abort(signal.reason);
+    else {
+      abortListener = () => controller.abort(signal.reason);
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
   }
 
   let response;
@@ -183,21 +197,34 @@ async function fetchKiroCatalogRaw(credentials, signal) {
       headers,
       signal: controller.signal
     });
+    if (!response.ok) {
+      let text;
+      try {
+        text = await readModelCatalogText(response, { signal: controller.signal });
+      } catch (error) {
+        error.status = response.status;
+        throw error;
+      }
+      const diagnostic = text.slice(0, 4096);
+      const err = new Error(`Kiro ListAvailableModels ${response.status}: ${diagnostic || response.statusText}`);
+      err.status = response.status;
+      err.body = diagnostic;
+      throw err;
+    }
+
+    // The transport deadline covers JSON consumption too, not just headers.
+    const data = await readModelCatalogJson(response, { signal: controller.signal });
+    const models = Array.isArray(data?.models) ? data.models : [];
+    return models;
+  } catch (error) {
+    if (controller.signal.aborted) {
+      cancelModelCatalogBody(response, error);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
+    if (signal && abortListener) signal.removeEventListener("abort", abortListener);
   }
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    const err = new Error(`Kiro ListAvailableModels ${response.status}: ${text || response.statusText}`);
-    err.status = response.status;
-    err.body = text;
-    throw err;
-  }
-
-  const data = await response.json();
-  const models = Array.isArray(data?.models) ? data.models : [];
-  return models;
 }
 
 /**
@@ -227,6 +254,7 @@ function cacheKey(credentials) {
  *   providerSpecificData {profileArn, authMethod, clientId, clientSecret, region})
  * @param {object} [options]
  * @param {boolean} [options.forceRefresh] Bypass the per-credential cache.
+ * @param {AbortSignal} [options.signal] Cancel this caller's catalog/refresh wait.
  * @param {object}  [options.log] Logger.
  * @param {function} [options.onCredentialsRefreshed] Persist refreshed token
  *   back to your credential store. Called with `{ accessToken, refreshToken,
@@ -252,20 +280,53 @@ export async function resolveKiroModels(credentials, options = {}) {
   try {
     raw = await fetchKiroCatalogRaw(credentials, options.signal);
   } catch (err) {
+    if (options.signal?.aborted) {
+      options.log?.debug?.("KIRO_MODELS", "Caller aborted live model fetch");
+      return null;
+    }
     if (err && err.status === 401 && credentials.refreshToken) {
       options.log?.info?.("KIRO_MODELS", "Got 401 from Kiro; refreshing token");
-      const refreshed = await refreshKiroToken(
-        credentials.refreshToken,
-        credentials.providerSpecificData,
-        options.log
-      );
+      let refreshed;
+      try {
+        refreshed = await runModelCatalogRefresh(
+          (refreshSignal) => refreshKiroToken(
+            credentials.refreshToken,
+            credentials.providerSpecificData,
+            options.log,
+            null,
+            { signal: refreshSignal },
+          ),
+          {
+            signal: options.signal,
+            timeoutMs: FETCH_TIMEOUT_MS,
+            label: "Kiro model catalog token refresh",
+          },
+        );
+      } catch (refreshError) {
+        const detail = options.signal?.aborted
+          ? "Caller aborted Kiro token refresh"
+          : `Kiro token refresh failed: ${refreshError?.message || refreshError}`;
+        options.log?.warn?.("KIRO_MODELS", detail);
+        return null;
+      }
+      if (options.signal?.aborted) return null;
       if (refreshed?.accessToken) {
         const next = { ...credentials, ...refreshed };
         if (typeof options.onCredentialsRefreshed === "function") {
-          try { await options.onCredentialsRefreshed(refreshed); } catch (e) {
+          try {
+            await runModelCatalogRefresh(
+              () => options.onCredentialsRefreshed(refreshed),
+              {
+                signal: options.signal,
+                timeoutMs: FETCH_TIMEOUT_MS,
+                label: "Kiro model catalog credential persistence",
+              },
+            );
+          } catch (e) {
             options.log?.warn?.("KIRO_MODELS", `onCredentialsRefreshed failed: ${e?.message || e}`);
           }
         }
+        if (options.signal?.aborted) return null;
         try {
           raw = await fetchKiroCatalogRaw(next, options.signal);
           // Update the in-memory credential reference too so retry logic uses

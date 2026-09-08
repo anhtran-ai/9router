@@ -20,17 +20,23 @@ import {
 import { parseDataUri } from "../concerns/image.js";
 import { DEFAULT_IMAGE_MIME } from "../schema/index.js";
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
+import { ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
+import { extractReasoningText } from "../concerns/reasoning.js";
 import {
   canonicalizeKiroConversation,
   normalizeKiroToolSpecs,
 } from "../concerns/kiroConversation.js";
 
 /**
- * Safely parse JSON string, returning fallback on failure.
+ * Parse tool arguments without silently replacing malformed JSON.
  */
-function safeJSONParse(str, fallback) {
+function parseToolArguments(str, fallback) {
   if (typeof str !== "string") return str ?? fallback;
-  try { return JSON.parse(str); } catch { return fallback; }
+  try {
+    return JSON.parse(str);
+  } catch {
+    throw new ToolCompatibilityError("Kiro requires valid JSON function arguments");
+  }
 }
 
 /**
@@ -121,8 +127,11 @@ function convertMessages(messages, model) {
               const format = parsed.mimeType.split("/")[1] || parsed.mimeType;
               pendingImages.push({ format, source: { bytes: parsed.base64 } });
             } else if (url.startsWith("http://") || url.startsWith("https://")) {
-              // Kiro only supports base64 — fallback to URL text
-              textParts.push(`[Image: ${url}]`);
+              // chatCore prefetches remote images before translation. If a URL
+              // remains, fetching failed and Kiro cannot represent it safely.
+              throw new ToolCompatibilityError("Kiro requires remote images to be prefetched as base64");
+            } else {
+              throw new ToolCompatibilityError("Kiro requires valid inline base64 image content");
             }
           } else if (c.type === CLAUDE_BLOCK.IMAGE) {
             // Claude format: source.type = "base64", source.media_type, source.data
@@ -130,7 +139,11 @@ function convertMessages(messages, model) {
               const mediaType = c.source.media_type || DEFAULT_IMAGE_MIME;
               const format = mediaType.split("/")[1] || mediaType;
               pendingImages.push({ format, source: { bytes: c.source.data } });
+            } else {
+              throw new ToolCompatibilityError("Kiro requires inline base64 image content");
             }
+          } else if ([OPENAI_BLOCK.INPUT_AUDIO, OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE].includes(c.type)) {
+            throw new ToolCompatibilityError("Kiro transport does not support audio or file content");
           }
         }
         content = textParts.join("\n");
@@ -167,11 +180,18 @@ function convertMessages(messages, model) {
         );
       }
     } else if (role === ROLE.ASSISTANT) {
+      if (extractReasoningText(msg)) {
+        throw new ToolCompatibilityError("Kiro transport cannot preserve assistant reasoning history");
+      }
       // Extract text content and tool uses
       let textContent = "";
       let toolUses = [];
 
       if (Array.isArray(msg.content)) {
+        if (msg.content.some(c => [OPENAI_BLOCK.IMAGE_URL, OPENAI_BLOCK.IMAGE,
+          OPENAI_BLOCK.INPUT_AUDIO, OPENAI_BLOCK.AUDIO_URL, OPENAI_BLOCK.FILE].includes(c?.type))) {
+          throw new ToolCompatibilityError("Kiro assistant history supports text and tool content only");
+        }
         const textBlocks = msg.content.filter(c => c.type === OPENAI_BLOCK.TEXT);
         textContent = textBlocks.map(b => b.text).join("\n").trim();
 
@@ -201,7 +221,7 @@ function convertMessages(messages, model) {
               return {
                 toolUseId: tc.id || uuidv4(),
                 name: tc.function.name,
-                input: safeJSONParse(tc.function.arguments, {})
+                input: parseToolArguments(tc.function.arguments, {})
               };
             } else {
               return {
@@ -306,7 +326,7 @@ function convertMessages(messages, model) {
 export function openaiToKiroRequest(model, body, stream, credentials) {
   const messages = body.messages || [];
   const tools = body.tools || [];
-  const maxTokens = 32000;
+  const maxTokens = body.max_tokens ?? body.max_output_tokens ?? 32000;
   const temperature = body.temperature;
   const topP = body.top_p;
 

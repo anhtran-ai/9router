@@ -36,7 +36,6 @@ export default function LoginPage() {
         const res = await fetch(`${baseUrl}/api/auth/status`, {
           signal: controller.signal,
         });
-        clearTimeout(timeoutId);
 
         if (res.ok) {
           const data = await res.json();
@@ -56,8 +55,12 @@ export default function LoginPage() {
           setHasPassword(true);
         }
       } catch (err) {
-        clearTimeout(timeoutId);
         setHasPassword(true);
+      } finally {
+        // Cover response-body parsing as well as the initial headers. Without
+        // this, a partial auth-status response can leave the login screen in
+        // its indefinite loading state.
+        clearTimeout(timeoutId);
       }
     }
     checkAuth();

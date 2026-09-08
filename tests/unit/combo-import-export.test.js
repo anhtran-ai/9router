@@ -69,7 +69,7 @@ describe("Combo Import/Export", () => {
       { index: 0, name: "balanced", action: "created", detail: "Combo created" },
     ]);
 
-    const response = await route.POST(importRequest({
+    const request = importRequest({
       format: "9router-combos",
       version: 1,
       conflictPolicy: "update",
@@ -79,7 +79,8 @@ describe("Combo Import/Export", () => {
         models: [" cx/gpt ", "cc/claude"],
         settings: { fallbackStrategy: "round-robin" },
       }],
-    }));
+    });
+    const response = await route.POST(request);
     const payload = await response.json();
 
     expect(response.status).toBe(200);
@@ -93,6 +94,7 @@ describe("Combo Import/Export", () => {
     }], { conflictPolicy: "update" });
     expect(mocks.resetComboRotation).toHaveBeenCalledWith("balanced");
     expect(payload.summary.created).toBe(1);
+    expect(request.body.locked).toBe(false);
   });
 
   it("reports invalid strategies without mutating storage", async () => {
@@ -112,6 +114,37 @@ describe("Combo Import/Export", () => {
       { "content-length": String(2 * 1024 * 1024 + 1) },
     ));
     expect(response.status).toBe(413);
+    expect(mocks.importComboItems).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized streamed payload when Content-Length is absent", async () => {
+    const request = importRequest({
+      combos: [{ name: "small", models: ["cx/gpt"] }],
+      padding: "x".repeat(2 * 1024 * 1024),
+    });
+    request.headers.delete("content-length");
+
+    const response = await route.POST(request);
+
+    expect(response.status).toBe(413);
+    expect(mocks.importComboItems).not.toHaveBeenCalled();
+    expect(request.body.locked).toBe(false);
+  });
+
+  it("rejects invalid UTF-8 instead of importing replacement-decoded data", async () => {
+    const request = new Request("https://router.example/api/import-export/combos", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: new Uint8Array([
+        0x7b, 0x22, 0x63, 0x6f, 0x6d, 0x62, 0x6f, 0x73, 0x22, 0x3a, 0x5b,
+        0x7b, 0x22, 0x6e, 0x61, 0x6d, 0x65, 0x22, 0x3a, 0x22, 0xff, 0x22,
+        0x2c, 0x22, 0x6d, 0x6f, 0x64, 0x65, 0x6c, 0x73, 0x22, 0x3a, 0x5b,
+        0x22, 0x78, 0x22, 0x5d, 0x7d, 0x5d, 0x7d,
+      ]),
+    });
+
+    const response = await route.POST(request);
+    expect(response.status).toBe(400);
     expect(mocks.importComboItems).not.toHaveBeenCalled();
   });
 });

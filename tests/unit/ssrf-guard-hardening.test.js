@@ -94,7 +94,7 @@ describe("assertPublicUrl: literal hostname/IP bypasses from #3714", () => {
 });
 
 describe("assertPublicUrlResolved: DNS-resolving hostname bypass from #3714", () => {
-  beforeEach(() => lookupMock.mockReset());
+  beforeEach(() => { lookupMock.mockReset(); });
 
   it("blocks a hostname that resolves to a loopback address (nip.io-style wildcard DNS)", async () => {
     lookupMock.mockResolvedValue([{ address: "127.0.0.1", family: 4 }]);
@@ -124,6 +124,33 @@ describe("assertPublicUrlResolved: DNS-resolving hostname bypass from #3714", ()
   it("skips DNS lookup entirely for literal IP hosts (already covered by the sync check)", async () => {
     await expect(assertPublicUrlResolved("http://127.0.0.1/")).rejects.toThrow();
     expect(lookupMock).not.toHaveBeenCalled();
+  });
+
+  it("honors an already-aborted caller signal before starting DNS", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(assertPublicUrlResolved("https://aborted.example.test/", {
+      signal: controller.signal,
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(lookupMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a stalled DNS resolver within the internal deadline", async () => {
+    lookupMock.mockImplementation(() => new Promise(() => {}));
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout").mockImplementationOnce((callback, delay) => {
+      expect(delay).toBe(10);
+      queueMicrotask(callback);
+      return 1;
+    });
+
+    try {
+      await expect(assertPublicUrlResolved("https://stalled.example.test/", {
+        dnsTimeoutMs: 10,
+      })).rejects.toThrow(/DNS resolution timed out/i);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 });
 
@@ -160,6 +187,23 @@ describe("fetchPublic: redirect-target re-validation from #3714", () => {
     expect(global.fetch.mock.calls[1][0]).toBe("https://hop2.example.test/");
     expect(global.fetch.mock.calls[0][1].dispatcher).toBeDefined();
     expect(global.fetch.mock.calls[1][1].dispatcher).toBeDefined();
+  });
+
+  it("does not await a redirect body cancel hook that never settles", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const redirect = new Response(new ReadableStream({ cancel }), {
+      status: 302,
+      headers: { Location: "https://hop2.example.test/" },
+    });
+    global.fetch = vi.fn()
+      .mockResolvedValueOnce(redirect)
+      .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+
+    const response = await fetchPublic("https://hop1.example.test/");
+
+    expect(await response.text()).toBe("ok");
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(global.fetch).toHaveBeenCalledTimes(2);
   });
 
   it("strips credentials before following a cross-origin redirect", async () => {
@@ -208,9 +252,34 @@ describe("fetchPublic: redirect-target re-validation from #3714", () => {
     await expect(fetchPublic("https://loop.example.test/a", {}, { maxRedirects: 3 })).rejects.toThrow(/too many redirects/i);
   });
 
+  it.each([300, 304, 305, 306])("returns non-redirect status %s even when it carries a Location header", async (status) => {
+    global.fetch = vi.fn(async () => new Response(null, {
+      status,
+      headers: { Location: "https://other.example.test/unexpected" },
+    }));
+
+    const res = await fetchPublic("https://origin.example.test/not-modified");
+    expect(res.status).toBe(status);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects the initial URL before ever calling fetch", async () => {
     global.fetch = vi.fn();
     await expect(fetchPublic("http://127.0.0.1/steal")).rejects.toThrow();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("honors caller abort while DNS resolution is stalled", async () => {
+    lookupMock.mockImplementation(() => new Promise(() => {}));
+    global.fetch = vi.fn();
+    const controller = new AbortController();
+
+    const resultPromise = fetchPublic("https://stalled.example.test/", {
+      signal: controller.signal,
+    });
+    controller.abort();
+
+    await expect(resultPromise).rejects.toMatchObject({ name: "AbortError" });
     expect(global.fetch).not.toHaveBeenCalled();
   });
 });

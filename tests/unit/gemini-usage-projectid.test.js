@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: vi.fn(),
@@ -6,6 +6,7 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 
 import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
 import { getUsageForProvider } from "../../open-sse/services/usage.js";
+import { fetchWithTimeout } from "../../open-sse/services/usage/shared.js";
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -17,6 +18,24 @@ function jsonResponse(body, status = 200) {
 describe("Gemini CLI usage project id resolution", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("keeps the deadline signal active after response headers are returned", async () => {
+    vi.useFakeTimers();
+    let fetchSignal;
+    proxyAwareFetch.mockImplementationOnce(async (_url, options) => {
+      fetchSignal = options.signal;
+      return { ok: true };
+    });
+
+    await fetchWithTimeout("https://usage.example.test/quota", {}, 25);
+    expect(fetchSignal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(25);
+    expect(fetchSignal.aborted).toBe(true);
   });
 
   it("uses the projectId stored on the provider connection", async () => {

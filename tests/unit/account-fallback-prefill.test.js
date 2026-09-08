@@ -103,7 +103,11 @@ describe("assistant prefill error classification", () => {
       autoSwitch: false,
     });
 
-    expect(response).toBe(response400);
+    expect(response.status).toBe(response400.status);
+    expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    expect(await response.json()).toEqual({
+      error: { type: "invalid_request_error", message: "max_tokens must be positive" },
+    });
     expect(handleSingleModel).toHaveBeenCalledTimes(1);
   });
 

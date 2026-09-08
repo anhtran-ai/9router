@@ -3,15 +3,12 @@ import crypto from "crypto";
 const API_KEY_SECRET = process.env.API_KEY_SECRET || "endpoint-proxy-api-key-secret";
 
 /**
- * Generate 6-char random keyId
+ * Generate a cryptographically random 128-bit key id. Hex deliberately avoids
+ * `-`, preserving the existing sk-{machineId}-{keyId}-{crc8} wire format and
+ * keeping previously generated 6-character key ids parseable.
  */
 function generateKeyId() {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let result = "";
-  for (let i = 0; i < 6; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
+  return crypto.randomBytes(16).toString("hex");
 }
 
 /**
@@ -47,7 +44,7 @@ export function generateApiKeyWithMachine(machineId) {
  * @returns {{ machineId: string, keyId: string, isNewFormat: boolean } | null}
  */
 export function parseApiKey(apiKey) {
-  if (!apiKey || !apiKey.startsWith("sk-")) return null;
+  if (typeof apiKey !== "string" || !apiKey.startsWith("sk-")) return null;
 
   const parts = apiKey.split("-");
   
@@ -57,7 +54,12 @@ export function parseApiKey(apiKey) {
     
     // Validate CRC
     const expectedCrc = generateCrc(machineId, keyId);
-    if (crc !== expectedCrc) return null;
+    const suppliedCrc = Buffer.from(crc, "utf8");
+    const expectedCrcBytes = Buffer.from(expectedCrc, "utf8");
+    if (
+      suppliedCrc.length !== expectedCrcBytes.length ||
+      !crypto.timingSafeEqual(suppliedCrc, expectedCrcBytes)
+    ) return null;
     
     return { machineId, keyId, isNewFormat: true };
   }

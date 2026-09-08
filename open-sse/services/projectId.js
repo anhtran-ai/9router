@@ -214,7 +214,14 @@ function waitForCaller(promise, { signal, timeoutMs } = {}) {
  * Call this when a connection's credentials are fully revoked or refreshed.
  */
 export function invalidateProjectId(connectionId) {
+    if (!connectionId) return;
     projectIdCache.delete(connectionId);
+    const pending = pendingFetches.get(connectionId);
+    if (pending) {
+        try { pending.controller.abort(); } catch (_) { /* ignore */ }
+        clearTimeout(pending.deadlineTimer);
+        pendingFetches.delete(connectionId);
+    }
 }
 
 /**
@@ -224,14 +231,7 @@ export function invalidateProjectId(connectionId) {
  * @param {string} connectionId
  */
 export function removeConnection(connectionId) {
-    if (!connectionId) return;
-    projectIdCache.delete(connectionId);
-    const pending = pendingFetches.get(connectionId);
-    if (pending) {
-        try { pending.controller.abort(); } catch (_) { /* ignore */ }
-        clearTimeout(pending.deadlineTimer);
-        pendingFetches.delete(connectionId);
-    }
+    invalidateProjectId(connectionId);
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -313,14 +313,15 @@ async function onboardUser(accessToken, tierID, externalSignal, endpoints, provi
                 signal: localCtrl.signal
             });
 
-            clearTimeout(timeoutId);
-
             if (!response.ok) {
                 const errorText = await response.text().catch(() => "");
                 throw new Error(`onboardUser HTTP ${response.status}: ${errorText.slice(0, 200)}`);
             }
 
             const data = await response.json();
+            // Keep the attempt timeout active through body consumption. A
+            // provider can return headers and then stall forever mid-JSON.
+            clearTimeout(timeoutId);
 
             if (data.done === true) {
                 const projectId = extractProjectIdFromOnboard(data);

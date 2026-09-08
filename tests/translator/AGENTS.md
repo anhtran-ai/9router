@@ -68,57 +68,39 @@ Only add a dedicated test when a provider has a special format that does not rou
 
 - `kiro` (binary AWS EventStream), `cursor` (protobuf ConnectRPC), `commandcode` (NDJSON) → responses do NOT round-trip cleanly through openai; test via their executors, not just the translator.
 - Single-provider-two-formats (most fragile): `opencode-go` (minimax models → claude, others openai), `github` (escalates `/chat/completions` → `/responses` at runtime), `xiaomi-tokenplan` (claude alias).
-- `gemini`/`gemini-cli`: only the LAST system message is kept → earlier system messages are lost.
+- `gemini`/`gemini-cli`: system and developer messages are collected into ordered `systemInstruction.parts`.
 
-## 8. Current known bugs (currently `it.fails`)
+## 8. Current known bugs and boundary policies
 
-Grouped per CLI/provider test file. Each row is an `it.fails` case.
+There are currently no executable `it.fails` cases in `tests/translator/`.
+Every former expected-fail case now has a normal passing regression.
 
-**Claude (`bugs-openai-bridge.test.js`, `bugs-claudeCode-context.test.js`)**
-| Bug | Source |
+**Lossless repairs**
+
+| Boundary | Guaranteed behavior |
 |---|---|
-| Claude image `source.type="url"` dropped (only base64) | `request/claude-to-openai.js:133-141` |
-| `tool_result` image block → raw JSON | `request/claude-to-openai.js:155-173` |
-| `tool_result.is_error` lost | `request/claude-to-openai.js:155-173` |
-| `thinking`/`redacted_thinking` dropped via bridge | `request/claude-to-openai.js:128` |
+| Claude → OpenAI | Remote image URLs and ordinary thinking text survive; tool errors become explicit `[Tool error]` content. |
+| OpenAI → Claude | `reasoning_content` becomes thinking; Claude Code identity is injected only for provider `claude`. |
+| Chat → Responses | Every system/developer message is retained in ordered `instructions`. |
+| Responses → Chat | Nameless calls cannot create `tool_calls: []`; valid image URLs remain image URLs. |
+| OpenAI → Gemini | All system/developer instructions and empty-string tool results survive; tool-id maps are prototype-safe. |
+| OpenAI → Cursor/Kiro | Client `max_tokens` is retained. |
+| OpenAI/Claude → Ollama | Assistant reasoning text is retained as native `message.thinking`, including reasoning-only and tool-call turns. |
 
-**OpenAI → Claude (`bugs-toClaude-context.test.js`)**
-| Bug | Source |
+**Fail-closed policies**
+
+All rows throw `ToolCompatibilityError` (`400`, code `unsupported_tool_constraint`)
+instead of silently dropping or reinterpreting input.
+
+| Boundary | Reason |
 |---|---|
-| Always injects "You are Claude Code" system prompt | `request/openai-to-claude.js:124-134` |
-| `reasoning_content` not mapped to a thinking block | `request/openai-to-claude.js:268-273` |
-| `input_audio` dropped | `request/openai-to-claude.js` (no audio branch) |
-
-`tool_choice:"none"` is preserved by the #35 / SR-03 repair and now has a
-regular passing regression in `bugs-toClaude-context.test.js`.
-
-**Codex Responses (`bugs-codexCli-responses.test.js`)**
-| Bug | Source |
-|---|---|
-| Empty-name function_call can leave `tool_calls: []` | `request/openai-responses.js:103` |
-| `arguments` not coerced to string | `request/openai-responses.js:109-110` |
-| `input_image` uses `file_id` as raw url | `request/openai-responses.js:75-77` |
-
-**Antigravity (`bugs-antigravity.test.js`)**
-| Bug | Source |
-|---|---|
-| functionResponse + functionCall in same content → tool calls dropped | `request/antigravity-to-openai.js:177-189` |
-| functionCall without id → random unstable id | `request/antigravity-to-openai.js:167` |
-
-**Kiro (`bugs-kiro.test.js`)**
-| Bug | Source |
-|---|---|
-| `JSON.parse(arguments)` throws on bad JSON (no try/catch) | `request/openai-to-kiro.js:214-216` |
-| `max_tokens` hardcoded to 32000 | `request/openai-to-kiro.js:309` |
-| Remote image → `[Image: url]` text | `request/openai-to-kiro.js:132-134` |
-
-**Gemini / Cursor / CommandCode (`bugs-gemini-cursor-commandcode.test.js`)**
-| Bug | Source |
-|---|---|
-| Only the last system message kept | `request/openai-to-gemini.js:92-96` |
-| Cursor drops image content | `request/openai-to-cursor.js:12-24` |
-| Cursor `max_tokens` hardcoded to 32000 | `request/openai-to-cursor.js:179` |
-| CommandCode bad JSON args → `{}` silently | `request/openai-to-commandcode.js:53-57` |
-| CommandCode image → `[image omitted]` | `request/openai-to-commandcode.js:41-42` |
-
-Fixing a bug → rerun; the matching `it.fails` test turns RED → switch it to a regular `it` and verify correct behavior.
+| Responses `input_image.file_id` / `input_file.file_id` → Chat | Chat targets have no generic OpenAI file resolver/upload equivalent; a file id is not transferable content. Inline file data remains lossless. |
+| Claude `redacted_thinking` → Chat | Chat has no lossless encrypted-thinking representation. |
+| Claude image inside `tool_result` → Chat | Chat tool-result content cannot carry the Claude image block losslessly. |
+| OpenAI `input_audio` → Claude Messages | Claude Messages has no audio input block. |
+| OpenAI rich media → Cursor | The implemented Cursor protobuf transport is text-only. |
+| OpenAI rich media → CommandCode | The verified `/alpha/generate` request schema exposes text/tool blocks only. |
+| OpenAI audio/file → Kiro | The Kiro conversation transport implemented here exposes text, tools, and inline images only. |
+| Remote image still present at Kiro translation | Kiro requires inline base64; chatCore must prefetch the URL first. |
+| Malformed tool arguments → Kiro/CommandCode | Replacing invalid JSON with `{}` can invoke a tool with different arguments. |
+| OpenAI/Claude reasoning history → Cursor/CommandCode/Kiro | These request transports have no assistant-history field/block that can carry reasoning without exposing it as visible text. |

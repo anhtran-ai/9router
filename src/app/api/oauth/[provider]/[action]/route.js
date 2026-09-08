@@ -37,10 +37,40 @@ import {
 import { detectIdeInstalled } from "@/lib/oauth/utils/ideDetect";
 import { ZED_HOSTED_CONFIG } from "@/lib/oauth/constants/oauth";
 
-async function completeXaiManualCode(code, state) {
+class OAuthConnectionCommitRejectedError extends Error {
+  constructor() {
+    super("Contribution reservation is no longer valid");
+    this.name = "OAuthConnectionCommitRejectedError";
+    this.status = 409;
+  }
+}
+
+async function persistOAuthConnection(data, internalOptions = {}) {
+  const commit = internalOptions?.commitProviderConnection;
+  if (typeof commit !== "function") return createProviderConnection(data);
+  const connection = await commit(data);
+  if (!connection) throw new OAuthConnectionCommitRejectedError();
+  return connection;
+}
+
+function oauthErrorStatus(error, fallback = 500) {
+  const status = Number(error?.status);
+  return Number.isInteger(status) && status >= 400 && status <= 599 ? status : fallback;
+}
+
+async function completeXaiManualCode(code, state, internalOptions = {}) {
   const session = state ? getXaiSessionStatus(state) : null;
   if (!session) {
     throw new Error("xAI OAuth session not found; restart the login flow and paste the code again");
+  }
+  if (
+    typeof internalOptions?.commitProviderConnection === "function"
+    && (
+      !internalOptions.contributorReservationHash
+      || session.contributorReservationHash !== internalOptions.contributorReservationHash
+    )
+  ) {
+    throw new OAuthConnectionCommitRejectedError();
   }
   if (!code) throw new Error("Missing xAI authorization code");
 
@@ -52,7 +82,7 @@ async function completeXaiManualCode(code, state) {
       session.codeVerifier,
       state
     );
-    const connection = await createProviderConnection({
+    const connection = await persistOAuthConnection({
       provider: "xai",
       authType: "oauth",
       ...tokenData,
@@ -60,9 +90,9 @@ async function completeXaiManualCode(code, state) {
         ? new Date(Date.now() + tokenData.expiresIn * 1000).toISOString()
         : null,
       testStatus: "active",
-    });
+    }, internalOptions);
     clearXaiSession(state);
-    stopXaiProxy();
+    stopXaiProxy(internalOptions.contributorReservationHash);
     return {
       id: connection.id,
       provider: connection.provider,
@@ -71,7 +101,7 @@ async function completeXaiManualCode(code, state) {
     };
   } catch (err) {
     clearXaiSession(state);
-    stopXaiProxy();
+    stopXaiProxy(internalOptions.contributorReservationHash);
     throw err;
   }
 }
@@ -83,7 +113,7 @@ async function completeXaiManualCode(code, state) {
 
 // GET /api/oauth/[provider]/authorize - Generate auth URL
 // GET /api/oauth/[provider]/device-code - Request device code (for device_code flow)
-export async function GET(request, { params }) {
+export async function GET(request, { params }, internalOptions = {}) {
   try {
     const { provider, action } = await params;
     const { searchParams } = new URL(request.url);
@@ -107,17 +137,20 @@ export async function GET(request, { params }) {
       // Trae/Windsurf/Zed use a dynamic-port local callback server (singleton session,
       // state is registered separately via /register-session after /authorize).
       if (provider === "trae") {
-        const result = await startTraeProxy();
+        const result = await startTraeProxy(internalOptions.contributorReservationHash);
         return NextResponse.json(result);
       }
       if (provider === "windsurf") {
-        const result = await startWindsurfProxy();
+        const result = await startWindsurfProxy(internalOptions.contributorReservationHash);
         return NextResponse.json(result);
       }
       if (provider === "zed") {
         // Prefer ZED_HOSTED_CONFIG.defaultNativeAppPort (58443) so the browser redirect
         // matches what Zed expects; falls back to a random port if it's busy.
-        const result = await startZedProxy(searchParams.get("native_app_port") || ZED_HOSTED_CONFIG.defaultNativeAppPort);
+        const result = await startZedProxy(
+          searchParams.get("native_app_port") || ZED_HOSTED_CONFIG.defaultNativeAppPort,
+          internalOptions.contributorReservationHash,
+        );
         return NextResponse.json(result);
       }
       if (!["codex", "xai"].includes(provider)) {
@@ -130,14 +163,49 @@ export async function GET(request, { params }) {
       const state = searchParams.get("state");
       const codeVerifier = searchParams.get("code_verifier");
       const redirectUri = searchParams.get("redirect_uri");
+      const contributorCommit = typeof internalOptions?.commitProviderConnection === "function";
+      if (
+        contributorCommit
+        && (
+          !internalOptions.contributorReservationHash
+          || !state
+          || !codeVerifier
+          || !redirectUri
+        )
+      ) {
+        return NextResponse.json(
+          { error: "Contributor proxy requires its reservation, state, code_verifier, and redirect_uri" },
+          { status: 400 },
+        );
+      }
       const result = provider === "xai"
-        ? await startXaiProxy(Number(appPort))
-        : await startCodexProxy(Number(appPort));
+        ? await startXaiProxy(Number(appPort), internalOptions.contributorReservationHash)
+        : await startCodexProxy(Number(appPort), internalOptions.contributorReservationHash);
       let serverSide = false;
       if (result.success && state && codeVerifier && redirectUri) {
         serverSide = provider === "xai"
-          ? registerXaiSession({ state, codeVerifier, redirectUri })
-          : registerCodexSession({ state, codeVerifier, redirectUri });
+          ? registerXaiSession({
+              state,
+              codeVerifier,
+              redirectUri,
+              commitProviderConnection: internalOptions.commitProviderConnection,
+              contributorReservationHash: internalOptions.contributorReservationHash,
+            })
+          : registerCodexSession({
+              state,
+              codeVerifier,
+              redirectUri,
+              commitProviderConnection: internalOptions.commitProviderConnection,
+              contributorReservationHash: internalOptions.contributorReservationHash,
+            });
+      }
+      if (result.success && contributorCommit && !serverSide) {
+        if (provider === "xai") stopXaiProxy();
+        else stopCodexProxy();
+        return NextResponse.json(
+          { error: "Unable to register the contributor proxy session" },
+          { status: 409 },
+        );
       }
       return NextResponse.json({ ...result, serverSide });
     }
@@ -155,8 +223,25 @@ export async function GET(request, { params }) {
       else if (provider === "codex") session = getCodexSessionStatus(state);
       else return NextResponse.json({ error: "Poll only supported for codex/xai/trae/windsurf/zed" }, { status: 400 });
       if (!session) return NextResponse.json({ status: "unknown" });
+      if (
+        internalOptions?.contributorReservationHash
+        && session.contributorReservationHash !== internalOptions.contributorReservationHash
+      ) {
+        return NextResponse.json(
+          { error: "Proxy session does not belong to this contribution" },
+          { status: 409 },
+        );
+      }
       if (session.status === "done" || session.status === "error") {
-        const payload = { ...session };
+        // Proxy session objects may contain an internal persistence callback.
+        // Return only the fields the browser UI consumes instead of depending
+        // on JSON.stringify to silently drop function-valued internals.
+        const payload = {
+          status: session.status,
+          ...(typeof session.connectionId === "string" ? { connectionId: session.connectionId } : {}),
+          ...(typeof session.email === "string" ? { email: session.email } : {}),
+          ...(typeof session.error === "string" ? { error: session.error } : {}),
+        };
         if (provider === "trae") clearTraeSession(state);
         else if (provider === "windsurf") clearWindsurfSession(state);
         else if (provider === "zed") clearZedSession(state);
@@ -168,12 +253,19 @@ export async function GET(request, { params }) {
     }
 
     if (action === "stop-proxy") {
-      if (provider === "trae") stopTraeProxy();
-      else if (provider === "windsurf") stopWindsurfProxy();
-      else if (provider === "zed") stopZedProxy();
-      else if (provider === "xai") stopXaiProxy();
-      else if (provider === "codex") stopCodexProxy();
+      let stopped;
+      if (provider === "trae") stopped = stopTraeProxy(internalOptions.contributorReservationHash);
+      else if (provider === "windsurf") stopped = stopWindsurfProxy(internalOptions.contributorReservationHash);
+      else if (provider === "zed") stopped = stopZedProxy(internalOptions.contributorReservationHash);
+      else if (provider === "xai") stopped = stopXaiProxy(internalOptions.contributorReservationHash);
+      else if (provider === "codex") stopped = stopCodexProxy(internalOptions.contributorReservationHash);
       else return NextResponse.json({ error: "Proxy only supported for codex/xai/trae/windsurf/zed" }, { status: 400 });
+      if (stopped === false) {
+        return NextResponse.json(
+          { error: "Proxy session does not belong to this contribution" },
+          { status: 409 },
+        );
+      }
       return NextResponse.json({ success: true });
     }
 
@@ -241,7 +333,7 @@ export async function GET(request, { params }) {
 
 // POST /api/oauth/[provider]/exchange - Exchange code for tokens and save
 // POST /api/oauth/[provider]/poll - Poll for token (device_code flow)
-export async function POST(request, { params }) {
+export async function POST(request, { params }, internalOptions = {}) {
   try {
     const { provider, action } = await params;
     let body;
@@ -257,11 +349,38 @@ export async function POST(request, { params }) {
       const searchParams = new URL(request.url).searchParams;
       const state = searchParams.get("state") || body?.state;
       if (!state) return NextResponse.json({ error: "Missing state" }, { status: 400 });
+      if (
+        typeof internalOptions?.commitProviderConnection === "function"
+        && !internalOptions.contributorReservationHash
+      ) {
+        return NextResponse.json(
+          { error: "Missing contributor proxy reservation" },
+          { status: 409 },
+        );
+      }
       let ok = false;
-      if (provider === "trae") ok = registerTraeSession({ state });
-      else if (provider === "windsurf") ok = registerWindsurfSession({ state });
-      else if (provider === "zed") ok = registerZedSession({ state, codeVerifier: body?.codeVerifier });
+      if (provider === "trae") ok = registerTraeSession({
+        state,
+        commitProviderConnection: internalOptions.commitProviderConnection,
+        contributorReservationHash: internalOptions.contributorReservationHash,
+      });
+      else if (provider === "windsurf") ok = registerWindsurfSession({
+        state,
+        commitProviderConnection: internalOptions.commitProviderConnection,
+        contributorReservationHash: internalOptions.contributorReservationHash,
+      });
+      else if (provider === "zed") ok = registerZedSession({
+        state,
+        codeVerifier: body?.codeVerifier,
+        commitProviderConnection: internalOptions.commitProviderConnection,
+        contributorReservationHash: internalOptions.contributorReservationHash,
+      });
       else return NextResponse.json({ error: "register-session only supported for trae/windsurf/zed" }, { status: 400 });
+      if (!ok && typeof internalOptions?.commitProviderConnection === "function") {
+        if (provider === "trae") stopTraeProxy(internalOptions.contributorReservationHash);
+        else if (provider === "windsurf") stopWindsurfProxy(internalOptions.contributorReservationHash);
+        else stopZedProxy(internalOptions.contributorReservationHash);
+      }
       return NextResponse.json({ success: ok });
     }
 
@@ -277,7 +396,7 @@ export async function POST(request, { params }) {
         }
         try {
           const tokenData = await exchangeTokens(provider, token, null, null, state);
-          const connection = await createProviderConnection({
+          const connection = await persistOAuthConnection({
             provider,
             authType: provider === "windsurf" ? "api_key" : "oauth",
             ...tokenData,
@@ -285,7 +404,7 @@ export async function POST(request, { params }) {
               ? new Date(Date.now() + tokenData.expiresIn * 1000).toISOString()
               : null,
             testStatus: "active",
-          });
+          }, internalOptions);
           return NextResponse.json({
             success: true,
             connection: {
@@ -296,7 +415,7 @@ export async function POST(request, { params }) {
             }
           });
         } catch (err) {
-          return NextResponse.json({ error: err.message }, { status: 500 });
+          return NextResponse.json({ error: err.message }, { status: oauthErrorStatus(err) });
         }
       }
 
@@ -322,14 +441,14 @@ export async function POST(request, { params }) {
         if (accountId) providerSpecificData.chatgptAccountId = accountId;
         if (planType) providerSpecificData.chatgptPlanType = planType;
 
-        const connection = await createProviderConnection({
+        const connection = await persistOAuthConnection({
           provider,
           authType: "access_token",
           accessToken: code,
           email: email || null,
           providerSpecificData,
           testStatus: "active",
-        });
+        }, internalOptions);
 
         return NextResponse.json({
           success: true,
@@ -352,7 +471,7 @@ export async function POST(request, { params }) {
       const tokenData = await exchangeTokens(provider, code, redirectUri, codeVerifier, state, meta);
 
       // Save to database
-      const connection = await createProviderConnection({
+      const connection = await persistOAuthConnection({
         provider,
         authType: "oauth",
         ...tokenData,
@@ -360,7 +479,7 @@ export async function POST(request, { params }) {
           ? new Date(Date.now() + tokenData.expiresIn * 1000).toISOString() 
           : null,
         testStatus: "active",
-      });
+      }, internalOptions);
 
       return NextResponse.json({ 
         success: true, 
@@ -408,7 +527,7 @@ export async function POST(request, { params }) {
       if (result.success) {
         // Save to database (legacy kimi-coding OAuth → dual-auth kimi)
         const providerId = provider === "kimi-coding" ? "kimi" : provider;
-        const connection = await createProviderConnection({
+        const connection = await persistOAuthConnection({
           provider: providerId,
           authType: "oauth",
           ...result.tokens,
@@ -416,7 +535,7 @@ export async function POST(request, { params }) {
             ? new Date(Date.now() + result.tokens.expiresIn * 1000).toISOString() 
             : null,
           testStatus: "active",
-        });
+        }, internalOptions);
 
         return NextResponse.json({ 
           success: true, 
@@ -443,13 +562,17 @@ export async function POST(request, { params }) {
         return NextResponse.json({ error: "Manual code only supported for xai" }, { status: 400 });
       }
       const { code, state } = body;
-      const connection = await completeXaiManualCode(String(code || "").trim(), String(state || "").trim());
+      const connection = await completeXaiManualCode(
+        String(code || "").trim(),
+        String(state || "").trim(),
+        internalOptions,
+      );
       return NextResponse.json({ success: true, connection });
     }
 
     return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   } catch (error) {
     console.log("OAuth POST error:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: error.message }, { status: oauthErrorStatus(error) });
   }
 }

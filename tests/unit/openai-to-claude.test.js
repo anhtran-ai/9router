@@ -72,23 +72,18 @@ describe("openaiToClaudeRequest", () => {
       expect(systemText).toContain("Respond ONLY with a JSON object");
     });
 
-    it("should not modify system prompt when response_format is missing", () => {
+    it("does not invent a system prompt when response_format and client instructions are missing", () => {
       const body = {
         messages: [{ role: "user", content: "Hello" }]
       };
 
       const result = openaiToClaudeRequest("claude-sonnet-4.5", body, false);
 
-      // Should have system but without JSON instructions
-      expect(result.system).toBeDefined();
-      
-      const systemText = result.system
-        .filter(s => s.type === "text")
-        .map(s => s.text)
-        .join("\n");
-      
-      // Should NOT contain JSON-specific instructions
-      expect(systemText).not.toContain("You must respond with valid JSON");
+      // Provider identity is added only by prepareClaudeRequest at the official
+      // Claude boundary; the format translator must preserve an empty channel.
+      expect(result.system).toBeUndefined();
+      expect(JSON.stringify(result)).not.toContain("You are Claude Code");
+      expect(JSON.stringify(result)).not.toContain("You must respond with valid JSON");
     });
 
     it("should preserve existing system messages when adding response_format", () => {

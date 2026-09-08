@@ -24,6 +24,8 @@ import { Agent } from "undici";
 const BLOCKED_HOSTNAMES = new Set(["localhost", "ip6-localhost", "ip6-loopback"]);
 const BLOCKED_SUFFIXES = [".internal", ".local", ".localhost"];
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
+const DNS_LOOKUP_TIMEOUT_MS = 5_000;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const SENSITIVE_REDIRECT_HEADERS = new Set([
   "authorization",
   "proxy-authorization",
@@ -209,6 +211,48 @@ function isBlockedHost(host) {
   return false;
 }
 
+function abortReason(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+async function lookupWithDeadline(host, { signal, dnsTimeoutMs = DNS_LOOKUP_TIMEOUT_MS } = {}) {
+  if (signal?.aborted) throw abortReason(signal);
+
+  const requestedTimeout = Number(dnsTimeoutMs);
+  const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+    ? Math.min(requestedTimeout, DNS_LOOKUP_TIMEOUT_MS)
+    : DNS_LOOKUP_TIMEOUT_MS;
+  let timer;
+  let onAbort;
+  const racers = [dns.promises.lookup(host, { all: true, verbatim: true })];
+
+  racers.push(new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error("Blocked URL: DNS resolution timed out");
+      error.code = "DNS_LOOKUP_TIMEOUT";
+      reject(error);
+    }, timeoutMs);
+  }));
+
+  if (signal?.addEventListener) {
+    racers.push(new Promise((_, reject) => {
+      onAbort = () => reject(abortReason(signal));
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    }));
+  }
+
+  try {
+    return await Promise.race(racers);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 // Throw if URL targets a non-public host by literal hostname/IP alone (no DNS
 // resolution — see assertPublicUrlResolved for that). Caller should map to 400.
 export function assertPublicUrl(rawUrl) {
@@ -220,7 +264,9 @@ export function assertPublicUrl(rawUrl) {
   if (isBlockedHost(host)) throw new Error("Blocked URL: internal host");
 }
 
-async function resolvePublicUrl(rawUrl) {
+async function resolvePublicUrl(rawUrl, options = {}) {
+  const { signal } = options;
+  if (signal?.aborted) throw abortReason(signal);
   const parsed = new URL(rawUrl);
   if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
     throw new Error("Blocked URL: only http(s) is allowed");
@@ -241,8 +287,10 @@ async function resolvePublicUrl(rawUrl) {
 
   let addresses;
   try {
-    addresses = await dns.promises.lookup(host, { all: true, verbatim: true });
+    addresses = await lookupWithDeadline(host, options);
   } catch (error) {
+    if (signal?.aborted) throw abortReason(signal);
+    if (error?.code === "DNS_LOOKUP_TIMEOUT") throw error;
     // Fail closed. Letting fetch resolve the hostname again after our lookup
     // failed would bypass both address validation and DNS pinning.
     throw new Error("Blocked URL: DNS resolution failed", { cause: error });
@@ -263,8 +311,8 @@ async function resolvePublicUrl(rawUrl) {
 // domain that merely *resolves* to a private/loopback/metadata address (wildcard-DNS
 // services like nip.io/sslip.io, or an attacker-controlled domain with an A record
 // pointed at 127.0.0.1) is rejected too, not just IPs typed directly into the URL.
-export async function assertPublicUrlResolved(rawUrl) {
-  await resolvePublicUrl(rawUrl);
+export async function assertPublicUrlResolved(rawUrl, options = {}) {
+  await resolvePublicUrl(rawUrl, options);
 }
 
 function createPinnedDispatcher(host, addresses) {
@@ -325,20 +373,25 @@ function switchRedirectToGet(status, method) {
 // validated public URL can't 30x its way to an internal target. Bounded to
 // maxRedirects hops (fetch's own default following behavior has no bound
 // relevant here since we never let it auto-follow).
-export async function fetchPublic(url, init = {}, { maxRedirects = 5 } = {}) {
+export async function fetchPublic(url, init = {}, { maxRedirects = 5, dnsTimeoutMs } = {}) {
   let currentUrl = new URL(url).toString();
   let currentInit = { ...init, headers: new Headers(init.headers || {}) };
   for (let hop = 0; ; hop++) {
-    const { parsed, host, addresses } = await resolvePublicUrl(currentUrl);
+    const { parsed, host, addresses } = await resolvePublicUrl(currentUrl, {
+      signal: currentInit.signal,
+      dnsTimeoutMs,
+    });
     const dispatcher = createPinnedDispatcher(host, addresses);
     let res;
     try {
       res = await fetch(currentUrl, { ...currentInit, redirect: "manual", dispatcher });
     } catch (error) {
-      await dispatcher.close().catch(() => {});
+      // A broken dispatcher must not make the caller wait forever after the
+      // request has already failed.
+      dispatcher.close().catch(() => {});
       throw error;
     }
-    const isRedirect = res.status >= 300 && res.status < 400;
+    const isRedirect = REDIRECT_STATUSES.has(res.status);
     const location = isRedirect ? res.headers.get("location") : null;
     if (!location) {
       // close() drains once the response body is consumed; do not await it here,
@@ -347,8 +400,10 @@ export async function fetchPublic(url, init = {}, { maxRedirects = 5 } = {}) {
       return res;
     }
 
-    try { await res.body?.cancel(); } catch { /* ignore redirect-body cleanup errors */ }
-    await dispatcher.close().catch(() => {});
+    // Redirect bodies are never consumed. Fire cleanup without awaiting
+    // third-party cancel/close hooks, which are allowed to remain pending.
+    try { Promise.resolve(res.body?.cancel()).catch(() => {}); } catch { /* best effort */ }
+    dispatcher.close().catch(() => {});
     if (hop >= maxRedirects) throw new Error("Blocked URL: too many redirects");
 
     const nextUrl = new URL(location, currentUrl).toString();

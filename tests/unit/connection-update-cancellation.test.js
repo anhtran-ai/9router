@@ -41,22 +41,46 @@ describe("provider connection update cancellation", () => {
     expect(db.transaction).not.toHaveBeenCalled();
   });
 
-  it("records a failure watermark immediately before a guarded transaction", async () => {
+  it("publishes ordering metadata only after a guarded transaction commits", async () => {
     const order = [];
     const db = {
       transaction: vi.fn((callback) => {
         order.push("transaction");
         callback();
+        order.push("committed");
       }),
-      get: vi.fn(() => null),
+      get: vi.fn(() => ({
+        id: "connection-a",
+        provider: "fixture",
+        authType: "apikey",
+        isActive: 1,
+        data: "{}",
+      })),
+      run: vi.fn(),
     };
     mocks.getAdapter.mockResolvedValue(db);
 
     await updateProviderConnection("connection-a", { lastError: "fixture" }, {
       shouldCommit: () => true,
-      beforeCommit: () => order.push("watermark"),
+      beforeCommit: () => order.push("guard"),
+      afterCommit: () => order.push("watermark"),
     });
 
-    expect(order).toEqual(["watermark", "transaction"]);
+    expect(order).toEqual(["guard", "transaction", "committed", "watermark"]);
+  });
+
+  it("does not publish ordering metadata when the transaction fails", async () => {
+    const afterCommit = vi.fn();
+    const dbError = new Error("fixture transaction failed");
+    mocks.getAdapter.mockResolvedValue({
+      transaction: vi.fn(() => { throw dbError; }),
+    });
+
+    await expect(updateProviderConnection("connection-a", { lastError: "fixture" }, {
+      beforeCommit: vi.fn(),
+      afterCommit,
+    })).rejects.toBe(dbError);
+
+    expect(afterCommit).not.toHaveBeenCalled();
   });
 });

@@ -14,6 +14,8 @@ import { FORMATS } from "../formats.js";
 import { randomUUID } from "crypto";
 import { ROLE, OPENAI_BLOCK } from "../schema/index.js";
 import { DEFAULT_MAX_TOKENS } from "../../config/runtimeConfig.js";
+import { ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
+import { extractReasoningText } from "../concerns/reasoning.js";
 
 function flattenText(content) {
   if (content == null) return "";
@@ -22,7 +24,12 @@ function flattenText(content) {
     const parts = [];
     for (const p of content) {
       if (typeof p === "string") parts.push(p);
-      else if (p && typeof p === "object" && typeof p.text === "string") parts.push(p.text);
+      else if (p && typeof p === "object") {
+        if (p.type && p.type !== OPENAI_BLOCK.TEXT) {
+          throw new ToolCompatibilityError("CommandCode transport supports text and tool content only");
+        }
+        if (typeof p.text === "string") parts.push(p.text);
+      }
     }
     return parts.join("\n");
   }
@@ -40,8 +47,8 @@ function toContentBlocks(content) {
       } else if (part && typeof part === "object") {
         if (part.type === OPENAI_BLOCK.TEXT && typeof part.text === "string") {
           blocks.push({ type: OPENAI_BLOCK.TEXT, text: part.text });
-        } else if (part.type === OPENAI_BLOCK.IMAGE_URL || part.type === OPENAI_BLOCK.IMAGE) {
-          blocks.push({ type: OPENAI_BLOCK.TEXT, text: "[image omitted]" });
+        } else if (part.type) {
+          throw new ToolCompatibilityError("CommandCode transport supports text and tool content only");
         } else if (typeof part.text === "string") {
           blocks.push({ type: OPENAI_BLOCK.TEXT, text: part.text });
         }
@@ -52,10 +59,14 @@ function toContentBlocks(content) {
   return [{ type: OPENAI_BLOCK.TEXT, text: String(content) }];
 }
 
-function safeParseJson(s) {
+function parseToolArguments(s) {
   if (s == null) return {};
   if (typeof s !== "string") return s;
-  try { return JSON.parse(s); } catch { return {}; }
+  try {
+    return JSON.parse(s);
+  } catch {
+    throw new ToolCompatibilityError("CommandCode requires valid JSON function arguments");
+  }
 }
 
 function convertMessages(messages = []) {
@@ -66,7 +77,7 @@ function convertMessages(messages = []) {
     if (!m) continue;
     const role = m.role;
 
-    if (role === ROLE.SYSTEM) {
+    if (role === ROLE.SYSTEM || role === ROLE.DEVELOPER) {
       const t = flattenText(m.content);
       if (t) systemTexts.push(t);
       continue;
@@ -87,6 +98,9 @@ function convertMessages(messages = []) {
     }
 
     if (role === ROLE.ASSISTANT) {
+      if (extractReasoningText(m)) {
+        throw new ToolCompatibilityError("CommandCode transport cannot preserve assistant reasoning history");
+      }
       const blocks = [];
       const text = flattenText(m.content);
       if (text) blocks.push({ type: OPENAI_BLOCK.TEXT, text });
@@ -97,7 +111,7 @@ function convertMessages(messages = []) {
             type: "tool-call",
             toolCallId: tc.id || "",
             toolName: fn.name || "",
-            input: safeParseJson(fn.arguments),
+            input: parseToolArguments(fn.arguments),
           });
         }
       }

@@ -61,7 +61,16 @@ vi.mock("@/lib/usageDb.js", () => ({
 
 import { getRotatedModels, resetComboRotation, handleComboChat } from "../../open-sse/services/combo.js";
 import { handleChat } from "../../src/sse/handlers/chat.js";
-import { getProviderCredentials } from "../../src/sse/services/auth.js";
+import {
+  ACCOUNT_MUTATION_STATE_MAX_ENTRIES,
+  __getAccountMutationStateStatsForTests,
+  beginAccountMutationAttempt,
+  clearAccountError,
+  endAccountMutationAttempt,
+  getProviderCredentials,
+  markAccountUnavailable,
+  recordAccountMutationSuccess,
+} from "../../src/sse/services/auth.js";
 import { handleChatCore } from "../../open-sse/handlers/chatCore.js";
 import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 import * as translator from "../../open-sse/translator/index.js";
@@ -162,6 +171,7 @@ describe("actual app, account selection, core and combo boundaries", () => {
       if (options?.shouldCommit && !options.shouldCommit()) return null;
       state.updates.push({ id, ...structuredClone(update) });
       Object.assign(state.connections.find((connection) => connection.id === id) || {}, update);
+      options?.afterCommit?.();
     });
     let quotaAttemptId = 0;
     state.latestQuotaSuccessId = 0;
@@ -451,8 +461,11 @@ describe("actual app, account selection, core and combo boundaries", () => {
     expect(state.updates).toEqual([]);
   });
 
-  it("returns a stale Antigravity 429 without cooldown or fallback after a newer success", async () => {
-    state.connections = [makeConnection("antigravity")];
+  it("skips a stale Antigravity cooldown but continues account fallback after a newer success", async () => {
+    state.connections = [
+      makeConnection("antigravity"),
+      makeConnection("antigravity", { id: "ag-second" }),
+    ];
     state.execute
       .mockResolvedValueOnce(executorResult(new Response(
         JSON.stringify({ error: { message: "older quota error" } }),
@@ -475,8 +488,8 @@ describe("actual app, account selection, core and combo boundaries", () => {
 
     releaseOlderQuota();
     const olderResponse = await older;
-    expect(olderResponse.status).toBe(429);
-    expect(state.execute).toHaveBeenCalledTimes(2);
+    expect(olderResponse.status).toBe(200);
+    expect(state.execute).toHaveBeenCalledTimes(3);
     expect(state.updates).toEqual([]);
     expect(state.isQuotaAttemptSuperseded).toHaveReturnedWith(true);
   });
@@ -538,6 +551,376 @@ describe("actual app, account selection, core and combo boundaries", () => {
     expect(state.updates).toHaveLength(1);
     expect(state.connections[0]["modelLock_model-a"]).not.toBeNull();
     expect(state.connections[0].testStatus).toBe("unavailable");
+  });
+
+  it("does not let an older Antigravity failure overwrite a newer failure at the DB boundary", async () => {
+    state.connections = [makeConnection("antigravity")];
+    state.execute
+      .mockResolvedValueOnce(executorResult(new Response(
+        JSON.stringify({ error: { message: "older overload" } }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      )))
+      .mockResolvedValueOnce(executorResult(new Response(
+        JSON.stringify({ error: { message: "newer auth failure" } }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      )));
+
+    let releaseOlderWrite;
+    let markOlderWriteStarted;
+    const olderWriteStarted = new Promise((resolve) => { markOlderWriteStarted = resolve; });
+    const defaultWrite = state.writeConnection.getMockImplementation();
+    state.writeConnection.mockImplementation(async (id, update, options = {}) => {
+      if (update.errorCode === 503) {
+        markOlderWriteStarted();
+        await new Promise((resolve) => { releaseOlderWrite = resolve; });
+      }
+      return defaultWrite(id, update, options);
+    });
+
+    const older = handleChat(makeRequest("antigravity/model-a"));
+    await olderWriteStarted;
+
+    const newerResponse = await handleChat(makeRequest("antigravity/model-a"));
+    expect(newerResponse.status).toBe(401);
+    expect(state.updates).toHaveLength(1);
+    expect(state.updates[0]).toMatchObject({
+      id: "fixture-antigravity",
+      testStatus: "unavailable",
+      errorCode: 401,
+      lastError: "[401]: newer auth failure",
+    });
+
+    releaseOlderWrite();
+    const olderResponse = await older;
+    expect(olderResponse.status).toBe(503);
+    expect(state.updates).toHaveLength(1);
+    expect(state.connections[0]).toMatchObject({
+      testStatus: "unavailable",
+      errorCode: 401,
+      lastError: "[401]: newer auth failure",
+    });
+    expect(state.recordQuotaAttemptFailure).toHaveBeenCalledTimes(1);
+    expect(state.recordQuotaAttemptFailure).toHaveBeenCalledWith(expect.objectContaining({ id: 2 }));
+  });
+
+  it("does not let an older non-Antigravity success clear a newer failure", async () => {
+    state.connections = [makeConnection("openrouter", {
+      testStatus: "unavailable",
+      lastError: "expired failure",
+      errorCode: 429,
+      "modelLock_model-a": new Date(fixedNow - 1_000).toISOString(),
+    })];
+    state.execute
+      .mockResolvedValueOnce(executorResult())
+      .mockResolvedValueOnce(executorResult(new Response(
+        JSON.stringify({ error: { message: "newer auth failure" } }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      )));
+
+    let releaseOlderCleanupRead;
+    let markOlderCleanupReadStarted;
+    let markOlderCleanupReadFinished;
+    const olderCleanupReadStarted = new Promise((resolve) => { markOlderCleanupReadStarted = resolve; });
+    const olderCleanupReadFinished = new Promise((resolve) => { markOlderCleanupReadFinished = resolve; });
+    let unfilteredReads = 0;
+    const defaultRead = state.readConnections.getMockImplementation();
+    state.readConnections.mockImplementation(async (query = {}) => {
+      if (query.provider === "openrouter" && query.isActive === undefined) {
+        unfilteredReads += 1;
+        if (unfilteredReads === 1) {
+          markOlderCleanupReadStarted();
+          await new Promise((resolve) => { releaseOlderCleanupRead = resolve; });
+          markOlderCleanupReadFinished();
+        }
+      }
+      return defaultRead(query);
+    });
+
+    const olderSuccess = await handleChat(makeRequest("openrouter/model-a"));
+    expect(olderSuccess.status).toBe(200);
+    await olderCleanupReadStarted;
+
+    const newerFailure = await handleChat(makeRequest("openrouter/model-a"));
+    expect(newerFailure.status).toBe(401);
+    expect(state.updates).toHaveLength(1);
+    expect(state.updates[0]).toMatchObject({
+      id: "fixture-openrouter",
+      testStatus: "unavailable",
+      errorCode: 401,
+      lastError: "[401]: newer auth failure",
+    });
+
+    releaseOlderCleanupRead();
+    await olderCleanupReadFinished;
+    // Let clearAccountError resume from the DB read and evaluate its boundary guard.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(state.updates).toHaveLength(1);
+    expect(state.connections[0]).toMatchObject({
+      testStatus: "unavailable",
+      errorCode: 401,
+      lastError: "[401]: newer auth failure",
+    });
+    expect(state.connections[0]["modelLock_model-a"]).not.toBeNull();
+  });
+
+  it("does not retain a phantom failure watermark after a DB transaction error", async () => {
+    const connection = makeConnection("openrouter", {
+      testStatus: "unavailable",
+      lastError: "expired failure",
+      errorCode: 503,
+      "modelLock_model-a": new Date(fixedNow - 1_000).toISOString(),
+    });
+    state.connections = [connection];
+    const olderSuccess = beginAccountMutationAttempt(connection.id, "model-a");
+    const newerFailure = beginAccountMutationAttempt(connection.id, "model-a");
+    const defaultWrite = state.writeConnection.getMockImplementation();
+    state.writeConnection.mockImplementationOnce(async (_id, _update, options = {}) => {
+      options?.beforeCommit?.();
+      throw new Error("fixture DB transaction failed");
+    });
+
+    await expect(markAccountUnavailable(
+      connection.id,
+      503,
+      "newer upstream failure",
+      "openrouter",
+      "model-a",
+      null,
+      { mutationAttempt: newerFailure },
+    )).rejects.toThrow("fixture DB transaction failed");
+
+    state.writeConnection.mockImplementation(defaultWrite);
+    await clearAccountError(connection.id, { _connection: connection }, "model-a", {
+      mutationAttempt: olderSuccess,
+    });
+
+    expect(state.updates).toHaveLength(1);
+    expect(state.connections[0]).toMatchObject({
+      testStatus: "active",
+      lastError: null,
+      errorCode: null,
+      "modelLock_model-a": null,
+    });
+    endAccountMutationAttempt(olderSuccess);
+    endAccountMutationAttempt(newerFailure);
+  });
+
+  it("keeps retry classification when a newer success supersedes the cooldown write", async () => {
+    const connection = makeConnection("openrouter");
+    state.connections = [connection];
+    const olderFailure = beginAccountMutationAttempt(connection.id, "model-a");
+    const newerSuccess = beginAccountMutationAttempt(connection.id, "model-a");
+    recordAccountMutationSuccess(newerSuccess);
+
+    const result = await markAccountUnavailable(
+      connection.id,
+      503,
+      "older provider overload",
+      "openrouter",
+      "model-a",
+      null,
+      { mutationAttempt: olderFailure },
+    );
+
+    expect(result).toMatchObject({
+      shouldFallback: true,
+      cooldownMs: expect.any(Number),
+      superseded: true,
+    });
+    expect(result.cooldownMs).toBeGreaterThan(0);
+    expect(state.updates).toEqual([]);
+    endAccountMutationAttempt(olderFailure);
+    endAccountMutationAttempt(newerSuccess);
+  });
+
+  it("caps dormant mutation watermarks created by unbounded model names", async () => {
+    const connectionId = "cardinality-fixture";
+    const connection = makeConnection("openrouter", { id: connectionId });
+    // Start from an expired/swept map so the oldest retained generation below
+    // is deterministic even when earlier cases exercised account failures.
+    vi.mocked(Date.now).mockReturnValue(fixedNow + 366 * 24 * 60 * 60 * 1000);
+    expect(__getAccountMutationStateStatsForTests().activeEntries).toBe(0);
+    vi.mocked(Date.now).mockReturnValue(fixedNow);
+    state.readConnections.mockImplementation(async () => [connection]);
+    state.writeConnection.mockImplementation(async (id, _update, options = {}) => {
+      if (options?.shouldCommit && !options.shouldCommit()) return null;
+      options?.beforeCommit?.();
+      if (options?.shouldCommit && !options.shouldCommit()) return null;
+      const result = { id };
+      options?.afterCommit?.(result);
+      return result;
+    });
+
+    // A prior failure retains the key after the streaming request wrapper
+    // returns. Its success callback is deliberately delayed until after cap
+    // eviction and reuse of this exact model key.
+    const priorFailure = beginAccountMutationAttempt(connectionId, "victim-model");
+    await markAccountUnavailable(
+      connectionId, 503, "fixture overload", null, "victim-model", null,
+      { mutationAttempt: priorFailure },
+    );
+    endAccountMutationAttempt(priorFailure);
+    const lateStreamingSuccess = beginAccountMutationAttempt(connectionId, "victim-model");
+    endAccountMutationAttempt(lateStreamingSuccess);
+
+    // This attempt predates cap eviction but remains active. The tombstone is
+    // only a fallback for missing states and must not invalidate live work.
+    const activeAttempt = beginAccountMutationAttempt("active-cardinality-fixture", "active-model");
+
+    for (let index = 0; index < ACCOUNT_MUTATION_STATE_MAX_ENTRIES + 16; index += 1) {
+      const attempt = beginAccountMutationAttempt(connectionId, `attacker-model-${index}`);
+      const result = await markAccountUnavailable(
+        connectionId,
+        503,
+        "fixture overload",
+        null,
+        `attacker-model-${index}`,
+        null,
+        { mutationAttempt: attempt },
+      );
+      expect(result.shouldFallback).toBe(true);
+      endAccountMutationAttempt(attempt);
+    }
+
+    expect(__getAccountMutationStateStatsForTests()).toMatchObject({
+      size: ACCOUNT_MUTATION_STATE_MAX_ENTRIES,
+      activeEntries: 2,
+      dormantEntries: ACCOUNT_MUTATION_STATE_MAX_ENTRIES - 2,
+    });
+
+    const writesBeforeActiveFailure = state.writeConnection.mock.calls.length;
+    const activeResult = await markAccountUnavailable(
+      "active-cardinality-fixture",
+      503,
+      "active request overload",
+      null,
+      "active-model",
+      null,
+      { mutationAttempt: activeAttempt },
+    );
+    expect(activeResult).toMatchObject({ shouldFallback: true });
+    expect(activeResult.superseded).toBeUndefined();
+    expect(state.writeConnection).toHaveBeenCalledTimes(writesBeforeActiveFailure + 1);
+    endAccountMutationAttempt(activeAttempt);
+
+    // Reusing an evicted key starts a new generation. A callback from the old
+    // generation must not clear the replacement failure.
+    const replacementFailure = beginAccountMutationAttempt(connectionId, "victim-model");
+    await markAccountUnavailable(
+      connectionId, 503, "replacement overload", null, "victim-model", null,
+      { mutationAttempt: replacementFailure },
+    );
+    endAccountMutationAttempt(replacementFailure);
+    const writesBeforeLateSuccess = state.writeConnection.mock.calls.length;
+    recordAccountMutationSuccess(lateStreamingSuccess);
+    await clearAccountError(
+      connectionId,
+      {
+        _connection: {
+          ...connection,
+          testStatus: "unavailable",
+          lastError: "replacement overload",
+          "modelLock_victim-model": new Date(fixedNow + 30_000).toISOString(),
+        },
+      },
+      "victim-model",
+      { mutationAttempt: lateStreamingSuccess },
+    );
+    expect(state.writeConnection).toHaveBeenCalledTimes(writesBeforeLateSuccess);
+
+    // Expired entries are swept without a timer and do not leak across tests.
+    vi.mocked(Date.now).mockReturnValue(fixedNow + 366 * 24 * 60 * 60 * 1000);
+    expect(__getAccountMutationStateStatsForTests()).toEqual({
+      size: 0,
+      activeEntries: 0,
+      dormantEntries: 0,
+    });
+  });
+
+  it("does not let an older cross-model GitHub monthly failure write an account-wide lock after a newer success", async () => {
+    state.connections = [makeConnection("github")];
+    state.execute
+      .mockResolvedValueOnce(executorResult(new Response(
+        JSON.stringify({ error: { message: "You've reached your additional usage limit for your plan" } }),
+        { status: 402, headers: { "Content-Type": "application/json" } },
+      )))
+      .mockResolvedValueOnce(executorResult());
+
+    let releaseOlderWrite;
+    let markOlderWriteStarted;
+    const olderWriteStarted = new Promise((resolve) => { markOlderWriteStarted = resolve; });
+    const defaultWrite = state.writeConnection.getMockImplementation();
+    state.writeConnection.mockImplementation(async (id, update, options = {}) => {
+      if (update.errorCode === 402) {
+        markOlderWriteStarted();
+        await new Promise((resolve) => { releaseOlderWrite = resolve; });
+      }
+      return defaultWrite(id, update, options);
+    });
+
+    const olderFailure = handleChat(makeRequest("github/model-a"));
+    await olderWriteStarted;
+    const newerSuccess = await handleChat(makeRequest("github/model-b"));
+    expect(newerSuccess.status).toBe(200);
+
+    releaseOlderWrite();
+    expect((await olderFailure).status).toBe(402);
+    expect(state.updates).toEqual([]);
+    expect(state.connections[0].modelLock___all).toBeUndefined();
+  });
+
+  it("does not let an older cross-model success clear a newer GitHub account-wide lock", async () => {
+    state.connections = [makeConnection("github", {
+      testStatus: "unavailable",
+      lastError: "expired monthly limit",
+      errorCode: 402,
+      modelLock___all: new Date(fixedNow - 1_000).toISOString(),
+    })];
+    state.execute
+      .mockResolvedValueOnce(executorResult())
+      .mockResolvedValueOnce(executorResult(new Response(
+        JSON.stringify({ error: { message: "You've reached your additional usage limit for your plan" } }),
+        { status: 402, headers: { "Content-Type": "application/json" } },
+      )));
+
+    let releaseOlderCleanupRead;
+    let markOlderCleanupReadStarted;
+    const olderCleanupReadStarted = new Promise((resolve) => { markOlderCleanupReadStarted = resolve; });
+    let unfilteredReads = 0;
+    const defaultRead = state.readConnections.getMockImplementation();
+    state.readConnections.mockImplementation(async (query = {}) => {
+      if (query.provider === "github" && query.isActive === undefined) {
+        unfilteredReads += 1;
+        if (unfilteredReads === 1) {
+          markOlderCleanupReadStarted();
+          await new Promise((resolve) => { releaseOlderCleanupRead = resolve; });
+        }
+      }
+      return defaultRead(query);
+    });
+
+    const olderSuccess = await handleChat(makeRequest("github/model-a"));
+    expect(olderSuccess.status).toBe(200);
+    await olderCleanupReadStarted;
+
+    const newerFailure = await handleChat(makeRequest("github/model-b"));
+    expect(newerFailure.status).toBe(402);
+    expect(state.updates).toHaveLength(1);
+    expect(state.updates[0]).toMatchObject({
+      id: "fixture-github",
+      testStatus: "unavailable",
+      errorCode: 402,
+    });
+
+    releaseOlderCleanupRead();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(state.updates).toHaveLength(1);
+    expect(state.connections[0]).toMatchObject({
+      testStatus: "unavailable",
+      errorCode: 402,
+    });
+    expect(state.connections[0].modelLock___all).not.toBeNull();
   });
 
   it("stops during a cold project-ID lookup without dispatching or mutating account state", async () => {
@@ -654,6 +1037,36 @@ describe("actual app, account selection, core and combo boundaries", () => {
     expect(state.execute.mock.calls[0][0].signal.aborted).toBe(false);
   });
 
+  it("does not publish account success from headers when an omitted stream flag defaults to streaming", async () => {
+    state.connections = [makeConnection("antigravity")];
+    let upstreamController;
+    const upstream = new ReadableStream({
+      start(controller) {
+        upstreamController = controller;
+        controller.enqueue(new TextEncoder().encode(
+          `data: ${JSON.stringify({ response: { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "hello" }] } }] } })}\n\n`,
+        ));
+      },
+    });
+    state.execute.mockResolvedValueOnce(executorResult(new Response(upstream, {
+      headers: { "Content-Type": "text/event-stream" },
+    })));
+
+    // Ollama and the core chat endpoint both default to streaming when the
+    // request omits `stream`; successful HTTP headers are not a terminal.
+    const response = await handleChat(makeRequest("antigravity/model-a", undefined, { stream: undefined }));
+    expect(response.status).toBe(200);
+    expect(state.clearQuotaStrikes).not.toHaveBeenCalled();
+
+    const body = response.text();
+    upstreamController.enqueue(new TextEncoder().encode(
+      `data: ${JSON.stringify({ response: { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" }] } })}\n\n`,
+    ));
+    upstreamController.close();
+    expect(await body).toContain('"finish_reason":"stop"');
+    await vi.waitFor(() => expect(state.clearQuotaStrikes).toHaveBeenCalledOnce());
+  });
+
   it("does not disguise unrelated translation exceptions as tool constraints", async () => {
     const error = new Error("fixture translation defect");
     vi.spyOn(translator, "translateRequest").mockImplementationOnce(() => { throw error; });
@@ -703,6 +1116,151 @@ describe("actual app, account selection, core and combo boundaries", () => {
     expect(state.pending.mock.calls.filter(args => args[3] === false)).toHaveLength(1);
   });
 
+  it("persists a model cooldown when a live HTTP 200 stream ends malformed", async () => {
+    const model = "stream-malformed-model";
+    state.connections = [makeConnection("openrouter")];
+    state.execute.mockResolvedValueOnce(executorResult(new Response(
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }] })}\n\n`,
+      { headers: { "Content-Type": "text/event-stream" } },
+    )));
+
+    const response = await handleChat(makeRequest(`openrouter/${model}`, undefined, { stream: true }));
+    const text = await response.text();
+
+    expect(text).toContain('"code":"invalid_upstream_response"');
+    await vi.waitFor(() => expect(state.updates).toContainEqual(expect.objectContaining({
+      id: "fixture-openrouter",
+      errorCode: 502,
+      [`modelLock_${model}`]: expect.any(String),
+    })));
+  });
+
+  it("releases a cancelled live stream without cooling down the provider account", async () => {
+    const model = "stream-cancel-model";
+    state.connections = [makeConnection("openrouter")];
+    const upstreamCancel = vi.fn();
+    state.execute.mockResolvedValueOnce(executorResult(new Response(new ReadableStream({
+      start() {},
+      cancel: upstreamCancel,
+    }), { headers: { "Content-Type": "text/event-stream" } })));
+    const activeBefore = __getAccountMutationStateStatsForTests().activeEntries;
+
+    const response = await handleChat(makeRequest(`openrouter/${model}`, undefined, { stream: true }));
+    await response.body.cancel("fixture client closed");
+
+    await vi.waitFor(() => {
+      expect(upstreamCancel).toHaveBeenCalledOnce();
+      expect(__getAccountMutationStateStatsForTests().activeEntries).toBe(activeBefore);
+    });
+    expect(state.updates).toEqual([]);
+  });
+
+  it("does not let an older malformed stream cooldown overwrite a newer streaming success", async () => {
+    const model = "stream-terminal-race-model";
+    state.connections = [makeConnection("openrouter")];
+    let olderController;
+    const olderStream = new ReadableStream({
+      start(controller) {
+        olderController = controller;
+        controller.enqueue(new TextEncoder().encode(
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "older-partial" }, finish_reason: null }] })}\n\n`,
+        ));
+      },
+    });
+    const newerStream = [
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "newer-ok" }, finish_reason: null }] })}`,
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
+      "data: [DONE]",
+      "",
+    ].join("\n\n");
+    state.execute
+      .mockResolvedValueOnce(executorResult(new Response(olderStream, { headers: { "Content-Type": "text/event-stream" } })))
+      .mockResolvedValueOnce(executorResult(new Response(newerStream, { headers: { "Content-Type": "text/event-stream" } })));
+
+    let unfilteredReads = 0;
+    let markOlderFailureRead;
+    const olderFailureRead = new Promise(resolve => { markOlderFailureRead = resolve; });
+    const defaultRead = state.readConnections.getMockImplementation();
+    state.readConnections.mockImplementation(async (query = {}) => {
+      if (query.provider === "openrouter" && query.isActive === undefined) {
+        unfilteredReads += 1;
+        if (unfilteredReads === 2) markOlderFailureRead();
+      }
+      return defaultRead(query);
+    });
+
+    const activeBefore = __getAccountMutationStateStatsForTests().activeEntries;
+    const olderResponse = await handleChat(makeRequest(`openrouter/${model}`, undefined, { stream: true }));
+    expect(__getAccountMutationStateStatsForTests().activeEntries).toBe(activeBefore + 2);
+    const olderBody = olderResponse.text();
+    const newerResponse = await handleChat(makeRequest(`openrouter/${model}`, undefined, { stream: true }));
+    expect(__getAccountMutationStateStatsForTests().activeEntries).toBe(activeBefore + 2);
+    expect(await newerResponse.text()).toContain("newer-ok");
+    expect(__getAccountMutationStateStatsForTests().activeEntries).toBe(activeBefore + 2);
+
+    olderController.close();
+    expect(await olderBody).toContain('"code":"invalid_upstream_response"');
+    await olderFailureRead;
+    await Promise.resolve();
+
+    expect(state.updates).toEqual([]);
+    expect(state.connections[0]).toMatchObject({ testStatus: "active" });
+    expect(state.connections[0][`modelLock_${model}`]).toBeUndefined();
+  });
+
+  it("does not let an older streaming success clear a newer provider failure", async () => {
+    const model = "stream-success-race-model";
+    state.connections = [makeConnection("openrouter")];
+    let olderController;
+    const olderStream = new ReadableStream({
+      start(controller) {
+        olderController = controller;
+        controller.enqueue(new TextEncoder().encode(
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "older-partial" }, finish_reason: null }] })}\n\n`,
+        ));
+      },
+    });
+    state.execute
+      .mockResolvedValueOnce(executorResult(new Response(olderStream, { headers: { "Content-Type": "text/event-stream" } })))
+      .mockResolvedValueOnce(executorResult(new Response(
+        JSON.stringify({ error: { message: "newer overload" } }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      )));
+
+    let unfilteredReads = 0;
+    const defaultRead = state.readConnections.getMockImplementation();
+    state.readConnections.mockImplementation(async (query = {}) => {
+      if (query.provider === "openrouter" && query.isActive === undefined) {
+        unfilteredReads += 1;
+      }
+      return defaultRead(query);
+    });
+
+    const olderResponse = await handleChat(makeRequest(`openrouter/${model}`, undefined, { stream: true }));
+    const olderBody = olderResponse.text();
+    const newerResponse = await handleChat(makeRequest(`openrouter/${model}`));
+    expect(newerResponse.status).toBe(503);
+    expect(state.updates).toHaveLength(1);
+
+    olderController.enqueue(new TextEncoder().encode(
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+    ));
+    olderController.close();
+    expect(await olderBody).toContain("older-partial");
+    await Promise.resolve();
+
+    // The stale success is rejected by the in-memory watermark before a DB
+    // reload, so only the newer failure performs an unfiltered account read.
+    expect(unfilteredReads).toBe(1);
+    expect(state.updates).toHaveLength(1);
+    expect(state.connections[0]).toMatchObject({
+      testStatus: "unavailable",
+      errorCode: 503,
+      lastError: "[503]: newer overload",
+    });
+    expect(state.connections[0][`modelLock_${model}`]).not.toBeNull();
+  });
+
   it("keeps a pre-header client abort499 even when the returned stream media type is invalid", async () => {
     const client = new AbortController();
     state.execute.mockImplementationOnce(async () => {
@@ -743,6 +1301,38 @@ describe("actual app, account selection, core and combo boundaries", () => {
     const handler = vi.fn(async () => { client.abort(); return new Response("{}", { status: 429 }); });
     const response = await handleComboChat({ body: {}, models: state.models, handleSingleModel: handler, log, autoSwitch: false, signal: client.signal });
     expect(response.status).toBe(499);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves a bounded non-fallback error body after inspecting it", async () => {
+    const handler = vi.fn(async () => new Response(JSON.stringify({ error: { message: "invalid fixture" } }), {
+      status: 400,
+      headers: { "content-type": "application/json", "content-encoding": "gzip" },
+    }));
+
+    const response = await handleComboChat({
+      body: {}, models: state.models, handleSingleModel: handler, log, autoSwitch: false,
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("content-encoding")).toBeNull();
+    expect(await response.json()).toEqual({ error: { message: "invalid fixture" } });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a stalled error body and never starts fallback after caller abort", async () => {
+    const client = new AbortController();
+    const cancel = vi.fn();
+    const handler = vi.fn(async () => new Response(new ReadableStream({ cancel }), { status: 503 }));
+    const pending = handleComboChat({
+      body: {}, models: state.models, handleSingleModel: handler, log, autoSwitch: false, signal: client.signal,
+    });
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    client.abort(new DOMException("client left", "AbortError"));
+
+    expect((await pending).status).toBe(499);
+    await Promise.resolve();
+    expect(cancel).toHaveBeenCalledTimes(1);
     expect(handler).toHaveBeenCalledTimes(1);
   });
 

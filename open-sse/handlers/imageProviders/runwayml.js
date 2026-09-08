@@ -1,5 +1,5 @@
 // Runway ML — async submit + /tasks/{id} polling
-import { sleep, nowSec, sizeToAspectRatio, POLL_INTERVAL_MS, POLL_TIMEOUT_MS } from "./_base.js";
+import { cancelResponseBody, nowSec, sizeToAspectRatio, POLL_INTERVAL_MS, POLL_TIMEOUT_MS } from "./_base.js";
 import { PROVIDER_MEDIA } from "../../providers/index.js";
 
 const BASE_URL = PROVIDER_MEDIA["runwayml"]?.imageConfig?.baseUrl;
@@ -26,16 +26,19 @@ export default {
     }
     return { promptText: body.prompt, model, ratio, ...(body.image ? { referenceImages: [{ uri: body.image }] } : {}) };
   },
-  async parseResponse(response, { headers }) {
-    const { id } = await response.json();
+  async parseResponse(response, { headers, fetch, sleep, readJson, signal }) {
+    const { id } = await readJson(response);
     if (!id) throw new Error("Runway: no task id returned");
     const taskUrl = `${BASE_URL}/tasks/${id}`;
     const deadline = Date.now() + POLL_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      await sleep(POLL_INTERVAL_MS);
-      const r = await fetch(taskUrl, { headers });
-      if (!r.ok) throw new Error(`Runway status ${r.status}`);
-      const s = await r.json();
+      await sleep(POLL_INTERVAL_MS, signal);
+      const r = await fetch(taskUrl, { headers, redirect: "error" });
+      if (!r.ok) {
+        cancelResponseBody(r);
+        throw new Error(`Runway status ${r.status}`);
+      }
+      const s = await readJson(r);
       if (s.status === "SUCCEEDED") return s;
       if (s.status === "FAILED" || s.status === "CANCELLED") throw new Error(s.failure || "Runway task failed");
     }

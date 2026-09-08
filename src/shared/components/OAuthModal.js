@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import PropTypes from "prop-types";
 import { Modal, Button, Input } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { isTrustedOAuthMessageEvent } from "@/shared/utils/oauthOrigin";
 
 // Providers using the dynamic-port local callback proxy.
 // Browser OAuth: popup → auto callback → auto exchange → poll-status.
@@ -204,7 +205,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       body: JSON.stringify(regBody),
     });
     // 4. Open popup; proxy auto-exchanges on callback, modal polls poll-status.
-    setAuthData({ ...authData, proxyProvider: providerId });
+    setAuthData({ ...authData, redirectUri: startData.callbackUrl, proxyProvider: providerId });
     setStep("waiting");
     popupRef.current = window.open(authData.authUrl, "oauth_popup", "width=600,height=700");
     if (!popupRef.current) setStep("input"); // popup blocked → fall back to manual paste
@@ -499,8 +500,14 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     // Handler for callback data - only process once
     const handleCallback = async (data) => {
       if (callbackProcessedRef.current) return; // Already processed
+      if (!data || typeof data !== "object") return;
 
       const { code, token, state, error: callbackError, errorDescription } = data;
+
+      // All automatic callback transports are untrusted shared channels.
+      // Ignore stale/foreign flows unless the provider echoed this modal's
+      // high-entropy state exactly.
+      if (typeof authData.state !== "string" || !authData.state || state !== authData.state) return;
 
       if (callbackError) {
         callbackProcessedRef.current = true;
@@ -517,12 +524,12 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
 
     // Method 1: postMessage from popup
     const handleMessage = (event) => {
-      // Allow messages from same origin or localhost (any port)
-      const isLocalhost = event.origin.includes("localhost") || event.origin.includes("127.0.0.1");
-      const isSameOrigin = event.origin === window.location.origin;
-      if (!isLocalhost && !isSameOrigin) return;
-      
-      if (event.data?.type === "oauth_callback") {
+      if (event.data?.type === "oauth_callback" && isTrustedOAuthMessageEvent(event, {
+        applicationOrigin: window.location.origin,
+        expectedCallbackOrigin: authData.redirectUri,
+        expectedPopup: popupRef.current,
+        expectedState: authData.state,
+      })) {
         handleCallback(event.data.data);
       }
     };
@@ -630,6 +637,10 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       const token = url.searchParams.get("token");
       const state = url.searchParams.get("state");
       const errorParam = url.searchParams.get("error");
+
+      if (authData?.state && state !== authData.state) {
+        throw new Error("OAuth callback state does not match this login attempt");
+      }
 
       if (errorParam) {
         throw new Error(url.searchParams.get("error_description") || errorParam);

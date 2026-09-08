@@ -62,9 +62,16 @@ export function normalizeCloudCodeProjectId(project) {
 export async function fetchWithTimeout(url, opts, ms = 10000, proxyOptions = null) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), ms);
+  timeoutId?.unref?.();
+  const signal = opts?.signal
+    ? AbortSignal.any([opts.signal, controller.signal])
+    : controller.signal;
   try {
-    return await proxyAwareFetch(url, { ...opts, signal: controller.signal }, proxyOptions);
-  } finally {
+    // Keep the deadline alive after headers arrive: callers consume JSON from
+    // the returned Response, and that body can otherwise stall indefinitely.
+    return await proxyAwareFetch(url, { ...opts, signal }, proxyOptions);
+  } catch (error) {
     clearTimeout(timeoutId);
+    throw error;
   }
 }

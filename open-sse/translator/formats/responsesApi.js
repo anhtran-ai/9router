@@ -1,4 +1,5 @@
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
+import { ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
 
 /**
  * Normalize Responses API input to array format.
@@ -90,12 +91,48 @@ export function coerceResponsesOutput(value) {
 }
 
 /**
+ * Convert a Responses input_image block for a Chat Completions target.
+ * Chat-compatible providers accept an image URL/data URI, but cannot resolve an
+ * OpenAI-managed file_id. Reject that constraint instead of emitting the file id
+ * as a URL and silently sending a different request.
+ */
+export function responsesInputImageToChatBlock(content) {
+  if (typeof content?.image_url === "string" && content.image_url) {
+    return {
+      type: OPENAI_BLOCK.IMAGE_URL,
+      image_url: { url: content.image_url, detail: content.detail || "auto" }
+    };
+  }
+  if (content?.file_id) {
+    throw new ToolCompatibilityError("Chat targets cannot resolve Responses input_image.file_id");
+  }
+  throw new ToolCompatibilityError("Chat targets require Responses input_image.image_url");
+}
+
+/** Convert inline Responses file data without leaking unresolved OpenAI file ids. */
+export function responsesInputFileToChatBlock(content) {
+  if (typeof content?.file_data === "string" && content.file_data) {
+    return {
+      type: OPENAI_BLOCK.FILE,
+      file: {
+        file_data: content.file_data,
+        ...(typeof content.filename === "string" && content.filename ? { filename: content.filename } : {}),
+      },
+    };
+  }
+  if (content?.file_id) {
+    throw new ToolCompatibilityError("Chat targets cannot resolve Responses input_file.file_id");
+  }
+  throw new ToolCompatibilityError("Chat targets require inline Responses input_file.file_data");
+}
+
+/**
  * Convert OpenAI Responses API format to standard chat completions format
  * Responses API uses: { input: [...], instructions: "..." }
  * Chat API uses: { messages: [...] }
  */
 export function convertResponsesApiFormat(body) {
-  if (!body.input) return body;
+  if (body?.input === undefined || body?.input === null) return body;
 
   const result = { ...body };
   result.messages = [];
@@ -109,6 +146,28 @@ export function convertResponsesApiFormat(body) {
   let currentAssistantMsg = null;
   let pendingToolCalls = [];
   let pendingToolResults = [];
+  let pendingReasoning = "";
+  let pendingReasoningEncrypted = "";
+
+  const attachPendingReasoning = (message) => {
+    if (pendingReasoning) message.reasoning_content = pendingReasoning;
+    if (pendingReasoningEncrypted) message.encrypted_content = pendingReasoningEncrypted;
+    pendingReasoning = "";
+    pendingReasoningEncrypted = "";
+  };
+
+  const flushPendingReasoning = () => {
+    if (!pendingReasoning && !pendingReasoningEncrypted) return;
+    const message = { role: ROLE.ASSISTANT, content: "" };
+    attachPendingReasoning(message);
+    result.messages.push(message);
+  };
+
+  const flushPendingToolResults = () => {
+    if (pendingToolResults.length === 0) return;
+    result.messages.push(...pendingToolResults);
+    pendingToolResults = [];
+  };
 
   const inputItems = normalizeResponsesInput(body.input);
   if (!inputItems) return body;
@@ -125,12 +184,7 @@ export function convertResponsesApiFormat(body) {
         currentAssistantMsg = null;
       }
       // Flush pending tool results
-      if (pendingToolResults.length > 0) {
-        for (const tr of pendingToolResults) {
-          result.messages.push(tr);
-        }
-        pendingToolResults = [];
-      }
+      flushPendingToolResults();
 
       // Convert content: input_text → text, output_text → text, input_image → image_url
       const content = Array.isArray(item.content)
@@ -138,15 +192,21 @@ export function convertResponsesApiFormat(body) {
           if (c.type === RESPONSES_ITEM.INPUT_TEXT) return { type: OPENAI_BLOCK.TEXT, text: c.text };
           if (c.type === RESPONSES_ITEM.OUTPUT_TEXT) return { type: OPENAI_BLOCK.TEXT, text: c.text };
           if (c.type === RESPONSES_ITEM.INPUT_IMAGE) {
-            const url = c.image_url || c.file_id || "";
-            return { type: OPENAI_BLOCK.IMAGE_URL, image_url: { url, detail: c.detail || "auto" } };
+            return responsesInputImageToChatBlock(c);
           }
+          if (c.type === RESPONSES_ITEM.INPUT_FILE) return responsesInputFileToChatBlock(c);
           return c;
         })
         : item.content;
-      result.messages.push({ role: item.role, content });
+      const message = { role: item.role, content };
+      if (item.role === ROLE.ASSISTANT) attachPendingReasoning(message);
+      else flushPendingReasoning();
+      result.messages.push(message);
     }
     else if (itemType === RESPONSES_ITEM.FUNCTION_CALL) {
+      // Skip items with empty/missing name — upstream APIs reject nameless tool calls (#444)
+      const name = typeof item.name === "string" ? item.name.trim() : "";
+      if (!name) continue;
       // Start or append to assistant message with tool_calls
       if (!currentAssistantMsg) {
         currentAssistantMsg = {
@@ -154,15 +214,14 @@ export function convertResponsesApiFormat(body) {
           content: null,
           tool_calls: []
         };
+        attachPendingReasoning(currentAssistantMsg);
       }
-      // Skip items with empty/missing name — upstream APIs reject nameless tool calls (#444)
-      if (!item.name || typeof item.name !== "string" || item.name.trim() === "") continue;
       currentAssistantMsg.tool_calls.push({
         id: item.call_id,
         type: OPENAI_BLOCK.FUNCTION,
         function: {
-          name: item.name,
-          arguments: item.arguments
+          name,
+          arguments: coerceResponsesArguments(item.arguments)
         }
       });
     }
@@ -172,15 +231,27 @@ export function convertResponsesApiFormat(body) {
         result.messages.push(currentAssistantMsg);
         currentAssistantMsg = null;
       }
+      flushPendingReasoning();
       // Add tool result
       pendingToolResults.push({
         role: ROLE.TOOL,
         tool_call_id: item.call_id,
-        content: typeof item.output === "string" ? item.output : JSON.stringify(item.output)
+        content: coerceResponsesOutput(item.output)
       });
     }
     else if (itemType === RESPONSES_ITEM.REASONING) {
-      // Skip reasoning items - they are for display only
+      if (currentAssistantMsg) {
+        result.messages.push(currentAssistantMsg);
+        currentAssistantMsg = null;
+      }
+      flushPendingToolResults();
+      const text = Array.isArray(item.summary)
+        ? item.summary.map((entry) => entry?.text || "").filter(Boolean).join("\n")
+        : "";
+      if (text) pendingReasoning = pendingReasoning ? `${pendingReasoning}\n${text}` : text;
+      if (typeof item.encrypted_content === "string" && item.encrypted_content) {
+        pendingReasoningEncrypted = item.encrypted_content;
+      }
       continue;
     }
   }
@@ -189,11 +260,8 @@ export function convertResponsesApiFormat(body) {
   if (currentAssistantMsg) {
     result.messages.push(currentAssistantMsg);
   }
-  if (pendingToolResults.length > 0) {
-    for (const tr of pendingToolResults) {
-      result.messages.push(tr);
-    }
-  }
+  flushPendingToolResults();
+  flushPendingReasoning();
 
   // Cleanup Responses API specific fields
   delete result.input;

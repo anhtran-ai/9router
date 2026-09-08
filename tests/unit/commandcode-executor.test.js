@@ -84,6 +84,26 @@ describe("inspectAndWrapCommandCodeResponse", () => {
     expect(body.error.code).toBe(503);
   });
 
+  it("returns a detected error without waiting for upstream cancellation", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          `${JSON.stringify({ type: "error", error: { message: "overloaded", statusCode: 503 } })}\n`,
+        ));
+      },
+      cancel,
+    });
+
+    const result = await inspectAndWrapCommandCodeResponse(
+      new Response(source, { headers: { "Content-Type": "text/event-stream" } }),
+      "poolside/laguna-s-2.1-free",
+    );
+
+    expect(result.status).toBe(503);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
   it("converts initial upstream 200 with start/start-step followed by error to 503 Response", async () => {
     const ndjsonBody = createNdjsonStream([
       JSON.stringify({ type: "start" }) + "\n",
@@ -131,6 +151,29 @@ describe("inspectAndWrapCommandCodeResponse", () => {
     const text = await result.text();
     expect(text).toContain("Hello from Laguna");
     expect(text).toContain("data: [DONE]");
+  });
+
+  it("reports EOF after content without a finish event", async () => {
+    const fakeResponse = new Response(createNdjsonStream([
+      JSON.stringify({ type: "text-delta", text: "partial" }) + "\n",
+    ]), { headers: { "Content-Type": "text/event-stream" } });
+
+    const result = await inspectAndWrapCommandCodeResponse(fakeResponse, "poolside/laguna-s-2.1-free");
+    const text = await result.text();
+    expect(text).toContain("partial");
+    expect(text).toContain("commandcode_missing_terminal");
+  });
+
+  it("reports a malformed trailing event instead of ending successfully", async () => {
+    const fakeResponse = new Response(createNdjsonStream([
+      JSON.stringify({ type: "text-delta", text: "partial" }) + "\n",
+      '{"type":"finish"',
+    ]), { headers: { "Content-Type": "text/event-stream" } });
+
+    const result = await inspectAndWrapCommandCodeResponse(fakeResponse, "poolside/laguna-s-2.1-free");
+    const text = await result.text();
+    expect(text).toContain("commandcode_malformed_stream");
+    expect(text).not.toContain("finish_reason\":\"stop");
   });
 });
 

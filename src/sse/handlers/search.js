@@ -2,6 +2,9 @@ import {
   getProviderCredentials,
   markAccountUnavailable,
   clearAccountError,
+  beginAccountMutationAttempt,
+  endAccountMutationAttempt,
+  recordAccountMutationSuccess,
   extractApiKey,
   isValidApiKey,
 } from "../services/auth.js";
@@ -14,6 +17,16 @@ import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
 
+function observeAccountCleanup(cleanup, connectionId) {
+  try {
+    Promise.resolve(cleanup()).catch((error) => {
+      log.warn("SEARCH", `Failed to clear account state after successful search (${connectionId}): ${error?.message || error}`);
+    });
+  } catch (error) {
+    log.warn("SEARCH", `Failed to start account-state cleanup after successful search (${connectionId}): ${error?.message || error}`);
+  }
+}
+
 /**
  * Handle web search request for the SSE/Next.js server.
  * Provider IS the model (no model field). Mirrors handleEmbeddings auth + fallback flow.
@@ -21,6 +34,9 @@ import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo
  * @param {Request} request
  */
 export async function handleSearch(request) {
+  if (request.signal?.aborted) {
+    return errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+  }
   let body;
   try {
     body = await request.json();
@@ -137,7 +153,8 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
       provider: resolvedProvider,
       providerConfig,
       credentials: null,
-      log
+      log,
+      signal: request.signal,
     });
     if (result.success) return result.response;
     return result.response;
@@ -195,37 +212,61 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
 
     const refreshedCredentials = await checkAndRefreshToken(providerId, credentials);
 
-    const result = await handleSearchCore({
-      body: coreBody,
-      provider: resolvedProvider,
-      providerConfig,
-      credentials: refreshedCredentials,
-      log,
-      onCredentialsRefreshed: async (newCreds) => {
-        await updateProviderCredentials(credentials.connectionId, {
-          accessToken: newCreds.accessToken,
-          refreshToken: newCreds.refreshToken,
-          providerSpecificData: newCreds.providerSpecificData,
-          testStatus: "active"
-        });
-      },
-      onRequestSuccess: async () => {
-        await clearAccountError(credentials.connectionId, credentials);
+    const mutationAttempt = beginAccountMutationAttempt(credentials.connectionId, searchLockKey);
+    try {
+      const result = await handleSearchCore({
+        body: coreBody,
+        provider: resolvedProvider,
+        providerConfig,
+        credentials: refreshedCredentials,
+        log,
+        signal: request.signal,
+        onCredentialsRefreshed: async (newCreds) => {
+          await updateProviderCredentials(credentials.connectionId, {
+            accessToken: newCreds.accessToken,
+            refreshToken: newCreds.refreshToken,
+            providerSpecificData: newCreds.providerSpecificData,
+            testStatus: "active"
+          });
+        },
+      });
+
+      if (result.success) {
+        recordAccountMutationSuccess(mutationAttempt);
+        // Account bookkeeping must never replace a verified provider result
+        // with a gateway error or keep the client waiting on a stuck database.
+        observeAccountCleanup(
+          () => clearAccountError(credentials.connectionId, credentials, searchLockKey, { mutationAttempt }),
+          credentials.connectionId,
+        );
+        return result.response;
       }
-    });
 
-    if (result.success) return result.response;
+      if (request.signal?.aborted || result.status === HTTP_STATUS.CLIENT_CLOSED_REQUEST) {
+        return result.response || errorResponse(HTTP_STATUS.CLIENT_CLOSED_REQUEST, "Request aborted");
+      }
 
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, credentialProviderId, searchLockKey);
+      const { shouldFallback } = await markAccountUnavailable(
+        credentials.connectionId,
+        result.status,
+        result.error,
+        credentialProviderId,
+        searchLockKey,
+        null,
+        { mutationAttempt },
+      );
 
-    if (shouldFallback) {
-      log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
-      excludeConnectionIds.add(credentials.connectionId);
-      lastError = result.error;
-      lastStatus = result.status;
-      continue;
+      if (shouldFallback) {
+        log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
+        excludeConnectionIds.add(credentials.connectionId);
+        lastError = result.error;
+        lastStatus = result.status;
+        continue;
+      }
+
+      return result.response;
+    } finally {
+      endAccountMutationAttempt(mutationAttempt);
     }
-
-    return result.response;
   }
 }

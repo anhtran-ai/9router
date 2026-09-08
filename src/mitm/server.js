@@ -12,6 +12,7 @@ const { DATA_DIR, MITM_DIR } = require("./paths");
 const { generateCert, getCertForDomain } = require("./cert/generate");
 const { getMitmAlias } = require("./dbReader");
 const { applyAntigravityIdeVersionOverride } = require("./antigravityIdeVersion");
+const { collectBodyRaw } = require("./bodyLimit");
 const LOCAL_PORT = 443;
 const IS_WIN = process.platform === "win32";
 const ENABLE_FILE_LOG = IS_DEV;
@@ -87,15 +88,6 @@ async function resolveTargetIP(hostname) {
   return cachedTargetIPs[hostname].ip;
 }
 
-function collectBodyRaw(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", chunk => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-
 function getMappedModel(tool, model) {
   if (!model) return null;
   try {
@@ -161,7 +153,7 @@ async function negotiateAlpn(host) {
   return new Promise((resolve, reject) => {
     const socket = tls.connect({
       host: ip, port: 443, servername: host,
-      ALPNProtocols: ["h2", "http/1.1"], rejectUnauthorized: false,
+      ALPNProtocols: ["h2", "http/1.1"], rejectUnauthorized: true,
     }, () => {
       const proto = socket.alpnProtocol || "http/1.1";
       alpnCache.set(host, proto);
@@ -194,7 +186,7 @@ async function passthroughHttp2(req, res, bodyBuffer, headers, targetHost, onRes
     const client = http2.connect(`https://${targetHost}`, {
       createConnection: () => tls.connect({
         host: targetIP, port: 443, servername: targetHost,
-        ALPNProtocols: ["h2"], rejectUnauthorized: false,
+        ALPNProtocols: ["h2"], rejectUnauthorized: true,
       }),
     });
     client.once("error", (e) => {
@@ -256,7 +248,7 @@ async function passthroughHttps(req, res, bodyBuffer, headers, targetHost, onRes
     method: req.method,
     headers,
     servername: targetHost,
-    rejectUnauthorized: false
+    rejectUnauthorized: true
   }, (forwardRes) => {
     res.writeHead(forwardRes.statusCode, forwardRes.headers);
     if (dumper) dumper.writeHeader(forwardRes.statusCode, forwardRes.headers);
@@ -337,8 +329,22 @@ const server = https.createServer(sslOptions, async (req, res) => {
     return handlers[tool].intercept(req, res, bodyBuffer, mappedModel, passthrough);
   } catch (e) {
     err(`Unhandled error: ${e.message}`);
-    if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: e.message, type: "mitm_error" } }));
+    const status = Number.isInteger(e?.statusCode) ? e.statusCode : 500;
+    const message = status === 413
+      ? "Request body too large"
+      : status === 408
+        ? "Request body timeout"
+        : status === 400
+          ? "Invalid request body"
+          : e.message;
+    res.shouldKeepAlive = false;
+    if (!res.headersSent) {
+      res.writeHead(status, { "Content-Type": "application/json", "Connection": "close" });
+    }
+    if (!res.writableEnded) {
+      res.end(JSON.stringify({ error: { message, type: "mitm_error" } }));
+    }
+    if (status !== 500) res.once("finish", () => req.destroy());
   }
 });
 
@@ -379,7 +385,10 @@ try {
   process.exit(1);
 }
 
-server.listen(LOCAL_PORT, () => log(`🚀 Server ready on :${LOCAL_PORT}`));
+// Hosts-file interception points every supported IDE at 127.0.0.1. Binding
+// only there prevents the privileged local CA endpoint from becoming a LAN-
+// reachable open TLS forwarder.
+server.listen(LOCAL_PORT, "127.0.0.1", () => log(`🚀 Server ready on 127.0.0.1:${LOCAL_PORT}`));
 
 server.on("error", (e) => {
   if (e.code === "EADDRINUSE") err(`Port ${LOCAL_PORT} already in use`);

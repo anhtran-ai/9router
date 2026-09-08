@@ -11,6 +11,8 @@ import {
   clampResponsesCallId,
   coerceResponsesArguments,
   coerceResponsesOutput,
+  responsesInputImageToChatBlock,
+  responsesInputFileToChatBlock,
 } from "../formats/responsesApi.js";
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM } from "../schema/index.js";
 import { isHostedTool } from "../concerns/hostedToolPolicy.js";
@@ -22,7 +24,7 @@ const MAX_TOOL_NAME_LEN = 128;
  * Convert OpenAI Responses API request to OpenAI Chat Completions format
  */
 export function openaiResponsesToOpenAIRequest(model, body, stream, credentials) {
-  if (!body.input) return body;
+  if (body?.input === undefined || body?.input === null) return body;
 
   const result = { ...body };
   result.messages = [];
@@ -63,6 +65,13 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
     pendingReasoningEncrypted = "";
   };
 
+  const flushPendingReasoning = () => {
+    if (!pendingReasoning && !pendingReasoningEncrypted) return;
+    const msg = { role: ROLE.ASSISTANT, content: "" };
+    attachPendingReasoning(msg);
+    result.messages.push(msg);
+  };
+
   for (const item of inputItems) {
     // Determine item type - Droid CLI sends role-based items without 'type' field
     // Fallback: if no type but has role property, treat as message
@@ -88,22 +97,22 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
           if (c.type === RESPONSES_ITEM.INPUT_TEXT) return { type: OPENAI_BLOCK.TEXT, text: c.text };
           if (c.type === RESPONSES_ITEM.OUTPUT_TEXT) return { type: OPENAI_BLOCK.TEXT, text: c.text };
           if (c.type === RESPONSES_ITEM.INPUT_IMAGE) {
-            const url = c.image_url || c.file_id || "";
-            return { type: OPENAI_BLOCK.IMAGE_URL, image_url: { url, detail: c.detail || "auto" } };
+            return responsesInputImageToChatBlock(c);
           }
+          if (c.type === RESPONSES_ITEM.INPUT_FILE) return responsesInputFileToChatBlock(c);
           return c;
         })
         : item.content;
       const msg = { role: item.role, content };
       // Attach buffered reasoning to assistant turn (required by xiaomi-mimo + store=false continuity)
       if (item.role === ROLE.ASSISTANT) attachPendingReasoning(msg);
-      else {
-        pendingReasoning = "";
-        pendingReasoningEncrypted = "";
-      }
+      else flushPendingReasoning();
       result.messages.push(msg);
     }
     else if (itemType === RESPONSES_ITEM.FUNCTION_CALL || itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL) {
+      // Skip items with empty/missing name — Codex/OpenAI reject nameless tool calls (#444)
+      const name = typeof item.name === "string" ? item.name.trim() : "";
+      if (!name) continue;
       // Start or append to assistant message with tool_calls
       if (!currentAssistantMsg) {
         currentAssistantMsg = {
@@ -113,9 +122,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         };
         attachPendingReasoning(currentAssistantMsg);
       }
-      // Skip items with empty/missing name — Codex/OpenAI reject nameless tool calls (#444)
-      if (!item.name || typeof item.name !== "string" || item.name.trim() === "") continue;
-      if (itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL) customToolNames.add(item.name);
+      if (itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL) customToolNames.add(name);
       const toolInput = itemType === RESPONSES_ITEM.CUSTOM_TOOL_CALL
         ? { input: typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? "") }
         : item.arguments;
@@ -123,7 +130,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         id: item.call_id,
         type: OPENAI_BLOCK.FUNCTION,
         function: {
-          name: item.name,
+          name,
           arguments: typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput ?? {})
         }
       });
@@ -134,6 +141,9 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
         result.messages.push(currentAssistantMsg);
         currentAssistantMsg = null;
       }
+      // A standalone reasoning item is an assistant turn in its own right. Do
+      // not let a following tool output consume or discard that continuity.
+      flushPendingReasoning();
       // Flush any pending tool results first
       if (pendingToolResults.length > 0) {
         for (const tr of pendingToolResults) {
@@ -152,6 +162,12 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
       if (Array.isArray(item.tools)) additionalTools.push(...item.tools);
     }
     else if (itemType === RESPONSES_ITEM.REASONING) {
+      // Preserve item order when a provider emits reasoning after a completed
+      // function-call item instead of before it.
+      if (currentAssistantMsg) {
+        result.messages.push(currentAssistantMsg);
+        currentAssistantMsg = null;
+      }
       // Buffer reasoning text; attached to next assistant message/function_call.
       // Also stash encrypted_content so a later openai→responses hop can restore
       // the store=false continuity blob (Grok CLI / Codex multi-turn).
@@ -174,6 +190,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
       result.messages.push(tr);
     }
   }
+  flushPendingReasoning();
 
   // Preserve recognized hosted tools in the intermediate format for compatible
   // targets. The final Chat boundary filters them; other translators render their
@@ -344,18 +361,14 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
     store: false
   };
 
-  // Extract system message as instructions
-  let hasSystemMessage = false;
+  // Preserve every system/developer instruction in encounter order.
+  const instructionTexts = [];
   const messages = body.messages || [];
 
   for (const msg of messages) {
     if (msg.role === ROLE.SYSTEM || msg.role === ROLE.DEVELOPER) {
-      // Use the first instruction-bearing message as instructions.
-      // OpenAI recommends role="developer" for GPT-5/Codex as the system-level prompt.
-      if (!hasSystemMessage) {
-        result.instructions = extractInstructionsText(msg.content);
-        hasSystemMessage = true;
-      }
+      const instruction = extractInstructionsText(msg.content);
+      if (instruction) instructionTexts.push(instruction);
       continue; // Skip instruction messages in input
     }
 
@@ -371,7 +384,9 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
 
       const contentType = msg.role === ROLE.USER ? RESPONSES_ITEM.INPUT_TEXT : RESPONSES_ITEM.OUTPUT_TEXT;
       const content = typeof msg.content === "string"
-        ? [{ type: contentType, text: msg.content }]
+        ? (msg.role === ROLE.ASSISTANT && msg.content.length === 0
+          ? []
+          : [{ type: contentType, text: msg.content }])
         : Array.isArray(msg.content)
           ? msg.content.map(c => {
             if (c.type === OPENAI_BLOCK.TEXT) return { type: contentType, text: c.text };
@@ -386,7 +401,7 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
             // Serialize any unknown type (tool_use, tool_result, thinking, etc.) as text
             const text = c.text || c.content || JSON.stringify(c);
             return { type: contentType, text: typeof text === "string" ? text : JSON.stringify(text) };
-          })
+          }).filter(c => !(msg.role === ROLE.ASSISTANT && c.type === contentType && c.text === ""))
           : [];
 
       // Only push a message block if content is non-empty.
@@ -426,10 +441,8 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
     }
   }
 
-  // If no system message, leave instructions empty (will be filled by executor)
-  if (!hasSystemMessage) {
-    result.instructions = "";
-  }
+  // Empty instructions are filled by the executor when appropriate.
+  result.instructions = instructionTexts.join("\n\n");
 
   // Convert tools format
   const toolBindings = [];

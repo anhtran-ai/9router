@@ -76,13 +76,13 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
   }
 
   // Build tool_call_id -> name map
-  const tcID2Name = {};
+  const tcID2Name = new Map();
   if (body.messages && Array.isArray(body.messages)) {
     for (const msg of body.messages) {
       if (msg.role === ROLE.ASSISTANT && msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           if (tc.type === OPENAI_BLOCK.FUNCTION && tc.id && tc.function?.name) {
-            tcID2Name[tc.id] = tc.function.name;
+            tcID2Name.set(tc.id, tc.function.name);
           }
         }
       }
@@ -90,28 +90,27 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
   }
 
   // Build tool responses cache
-  const toolResponses = {};
+  const toolResponses = new Map();
   if (body.messages && Array.isArray(body.messages)) {
     for (const msg of body.messages) {
       if (msg.role === ROLE.TOOL && msg.tool_call_id) {
-        toolResponses[msg.tool_call_id] = msg.content;
+        toolResponses.set(msg.tool_call_id, msg.content);
       }
     }
   }
 
   // Convert messages
   if (body.messages && Array.isArray(body.messages)) {
+    const instructionParts = [];
     for (let i = 0; i < body.messages.length; i++) {
       const msg = body.messages[i];
       const role = msg.role;
       const content = msg.content;
 
-      if (role === ROLE.SYSTEM && body.messages.length > 1) {
-        result.systemInstruction = {
-          role: GEMINI_ROLE.USER,
-          parts: [{ text: typeof content === "string" ? content : extractTextContent(content) }]
-        };
-      } else if (role === ROLE.USER || (role === ROLE.SYSTEM && body.messages.length === 1)) {
+      if (role === ROLE.SYSTEM || role === ROLE.DEVELOPER) {
+        const text = typeof content === "string" ? content : extractTextContent(content);
+        if (text) instructionParts.push({ text });
+      } else if (role === ROLE.USER) {
         const parts = convertOpenAIContentToParts(content);
         if (parts.length > 0) {
           result.contents.push({ role: GEMINI_ROLE.USER, parts });
@@ -169,14 +168,14 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
           }
 
           // Check if there are actual tool responses in the next messages
-          const hasActualResponses = toolCallIds.some(fid => toolResponses[fid]);
+          const hasActualResponses = toolCallIds.some(fid => toolResponses.has(fid));
 
           if (hasActualResponses) {
             const toolParts = [];
             for (const fid of toolCallIds) {
-              if (!toolResponses[fid]) continue;
+              if (!toolResponses.has(fid)) continue;
 
-              let name = tcID2Name[fid];
+              let name = tcID2Name.get(fid);
               if (!name) {
                 const idParts = fid.split("-");
                 if (idParts.length > 2) {
@@ -186,7 +185,7 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
                 }
               }
 
-              let resp = toolResponses[fid];
+              let resp = toolResponses.get(fid);
               let parsedResp = tryParseJSON(resp);
               if (parsedResp === null) {
                 parsedResp = { result: resp };
@@ -210,6 +209,9 @@ function openaiToGeminiBase(model, body, stream, signature = DEFAULT_THINKING_AG
           result.contents.push({ role: GEMINI_ROLE.MODEL, parts });
         }
       }
+    }
+    if (instructionParts.length > 0) {
+      result.systemInstruction = { role: GEMINI_ROLE.USER, parts: instructionParts };
     }
   }
 

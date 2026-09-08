@@ -8,48 +8,55 @@ function res(status, headers = {}, body = null) {
   return {
     status,
     headers: { get: (k) => headers[k.toLowerCase()] ?? null },
-    clone: () => ({ text: async () => (body == null ? "" : JSON.stringify(body)) }),
+    bodyText: body == null ? "" : JSON.stringify(body),
   };
 }
+
+const retry = (ag, response, attempt) => ag.computeRetryDelay(
+  response,
+  attempt,
+  0,
+  { bodyText: response.bodyText },
+);
 
 describe("antigravity computeRetryDelay hook (D3)", () => {
   const ag = new AntigravityExecutor();
 
   it("uses Retry-After header (seconds → ms) when within cap", async () => {
-    expect(await ag.computeRetryDelay(res(429, { "retry-after": "5" }), 1)).toBe(5000);
+    expect(await retry(ag, res(429, { "retry-after": "5" }), 1)).toBe(5000);
   });
 
   it("vetoes (false) when Retry-After exceeds cap", async () => {
-    expect(await ag.computeRetryDelay(res(429, { "retry-after": "60" }), 1)).toBe(false);
+    expect(await retry(ag, res(429, { "retry-after": "60" }), 1)).toBe(false);
   });
 
   it("parses retry time from error body when no header", async () => {
     const r = res(429, {}, { error: { message: "quota will reset after 3s" } });
-    expect(await ag.computeRetryDelay(r, 1)).toBe(3000);
+    expect(await retry(ag, r, 1)).toBe(3000);
   });
 
   it("exponential backoff for 429 when no retry info", async () => {
-    expect(await ag.computeRetryDelay(res(429), 1)).toBe(Math.min(1000 * 2 ** 1, MAX));
-    expect(await ag.computeRetryDelay(res(429), 3)).toBe(Math.min(1000 * 2 ** 3, MAX));
+    expect(await retry(ag, res(429), 1)).toBe(Math.min(1000 * 2 ** 1, MAX));
+    expect(await retry(ag, res(429), 3)).toBe(Math.min(1000 * 2 ** 3, MAX));
   });
 
   it("503 without retry info → transient backoff", async () => {
-    expect(await ag.computeRetryDelay(res(503), 1)).toBe(2000);
+    expect(await retry(ag, res(503), 1)).toBe(2000);
   });
 
   it("retries Antigravity agent terminated body even when status is not 429", async () => {
     const r = res(500, {}, { error: { message: "Agent execution terminated due to error" } });
-    expect(await ag.computeRetryDelay(r, 1)).toBe(2000);
+    expect(await retry(ag, r, 1)).toBe(2000);
   });
 
   it("retries high traffic body", async () => {
     const r = res(500, {}, { error: { message: "Our servers are experiencing high traffic" } });
-    expect(await ag.computeRetryDelay(r, 2)).toBe(4000);
+    expect(await retry(ag, r, 2)).toBe(4000);
   });
 
   it("does not retry non-transient 400 errors", async () => {
     const r = res(400, {}, { error: { message: "Invalid request" } });
-    expect(await ag.computeRetryDelay(r, 1)).toBe(false);
+    expect(await retry(ag, r, 1)).toBe(false);
   });
 
   it("deduplicates sanitized tool names", () => {

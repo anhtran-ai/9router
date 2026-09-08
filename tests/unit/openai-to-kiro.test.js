@@ -8,6 +8,7 @@
 
 import { describe, it, expect } from "vitest";
 import { openaiToKiroRequest } from "../../open-sse/translator/request/openai-to-kiro.js";
+import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 
 const contentOf = (result) =>
   result.conversationState.currentMessage.userInputMessage.content;
@@ -162,7 +163,7 @@ describe("openaiToKiroRequest", () => {
       expect(currentMsg.userInputMessage.images).toHaveLength(1);
     });
 
-    it("should treat http image URLs as text fallback (Kiro only supports base64)", () => {
+    it("fails closed when a remote image reaches the base64-only Kiro boundary", () => {
       const body = {
         messages: [
           {
@@ -175,12 +176,16 @@ describe("openaiToKiroRequest", () => {
         ]
       };
 
-      const result = openaiToKiroRequest("claude-sonnet-4.6", body, true, {});
+      let error;
+      try {
+        openaiToKiroRequest("claude-sonnet-4.6", body, true, {});
+      } catch (caught) {
+        error = caught;
+      }
 
-      const currentMsg = result.conversationState.currentMessage;
-      // HTTP URLs are not supported by Kiro — converted to text placeholder
-      expect(currentMsg.userInputMessage.images).toBeUndefined();
-      expect(currentMsg.userInputMessage.content).toContain("[Image: https://example.com/photo.jpg]");
+      expect(error).toBeInstanceOf(ToolCompatibilityError);
+      expect(error).toMatchObject({ status: 400, code: "unsupported_tool_constraint" });
+      expect(error.message).toContain("prefetched as base64");
     });
   });
 

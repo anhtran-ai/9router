@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   getProjectIdForConnection,
+  invalidateProjectId,
   PROJECT_ID_SHARED_FETCH_TIMEOUT_MS,
   removeConnection,
 } from "../../open-sse/services/projectId.js";
@@ -219,5 +220,81 @@ describe("project-ID request cancellation and timeout", () => {
 
     await expect(getProjectIdForConnection(connectionId, "new-access-token")).resolves.toBe("replacement-project");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts a fresh lookup after credential refresh invalidates an in-flight request", async () => {
+    const connectionId = track("project-id-refresh-replacement");
+    const pendingFetches = [];
+    const fetchMock = vi.fn((_url, options) => new Promise((resolve) => {
+      pendingFetches.push({ resolve, signal: options.signal });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const stale = getProjectIdForConnection(
+      connectionId,
+      "old-access-token",
+      "gemini-cli",
+      { timeoutMs: 1_000 },
+    );
+    invalidateProjectId(connectionId);
+
+    expect(pendingFetches[0].signal.aborted).toBe(true);
+    const replacement = getProjectIdForConnection(
+      connectionId,
+      "new-access-token",
+      "gemini-cli",
+      { timeoutMs: 1_000 },
+    );
+
+    pendingFetches[1].resolve(projectResponse("replacement-project"));
+    await expect(replacement).resolves.toBe("replacement-project");
+    pendingFetches[0].resolve(projectResponse("stale-project"));
+    await expect(stale).resolves.toBeNull();
+    await expect(getProjectIdForConnection(connectionId, "new-access-token")).resolves.toBe("replacement-project");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the onboarding attempt timeout active while parsing its response body", async () => {
+    vi.useFakeTimers();
+    const connectionId = track("project-id-onboard-body-timeout");
+    const previousMaxAttempts = process.env.ONBOARD_MAX_ATTEMPTS;
+    process.env.ONBOARD_MAX_ATTEMPTS = "1";
+    let onboardSignal;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ allowedTiers: [{ id: "fixture-tier", isDefault: true }] }),
+      })
+      .mockImplementationOnce((_url, options) => {
+        onboardSignal = options.signal;
+        return Promise.resolve({
+          ok: true,
+          json: () => new Promise((resolve, reject) => {
+            const abort = () => reject(new DOMException("onboard body timeout", "AbortError"));
+            if (options.signal.aborted) abort();
+            else options.signal.addEventListener("abort", abort, { once: true });
+          }),
+        });
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const pending = getProjectIdForConnection(
+        connectionId,
+        "access-token",
+        "gemini-cli",
+        { timeoutMs: 30_000 },
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(onboardSignal.aborted).toBe(true);
+      await expect(pending).resolves.toBeNull();
+    } finally {
+      if (previousMaxAttempts === undefined) delete process.env.ONBOARD_MAX_ATTEMPTS;
+      else process.env.ONBOARD_MAX_ATTEMPTS = previousMaxAttempts;
+    }
   });
 });

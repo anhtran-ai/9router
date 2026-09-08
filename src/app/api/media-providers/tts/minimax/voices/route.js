@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { getProviderConnections } from "@/lib/localDb";
+import {
+  VoiceListInvalidResponseError,
+  VoiceListUpstreamError,
+  assertVoiceListSuccessEnvelope,
+  fetchVoiceListJson,
+  voiceListErrorStatus,
+} from "open-sse/handlers/ttsProviders/voiceList.js";
 
 const MINIMAX_VOICE_ENDPOINTS = {
   minimax: "https://api.minimax.io/v1/get_voice",
@@ -75,27 +82,28 @@ export async function GET(request) {
       return NextResponse.json({ error: `No ${provider} connection found` }, { status: 400 });
     }
 
-    const res = await fetch(MINIMAX_VOICE_ENDPOINTS[provider], {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
+    const { response, data } = await fetchVoiceListJson(
+      MINIMAX_VOICE_ENDPOINTS[provider],
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ voice_type: voiceType }),
       },
-      body: JSON.stringify({ voice_type: voiceType }),
-    });
-
-    const rawText = await res.text();
-    let data = {};
-    if (rawText) {
-      try { data = JSON.parse(rawText); } catch { data = {}; }
-    }
+      { signal: request.signal },
+    );
+    if (!response.ok) throw new VoiceListUpstreamError("MiniMax", response.status);
+    assertVoiceListSuccessEnvelope(data, "MiniMax");
 
     const baseResp = data.base_resp || data.baseResp || {};
-    const statusCode = Number(baseResp.status_code ?? baseResp.statusCode ?? 0);
+    const rawStatusCode = baseResp.status_code ?? baseResp.statusCode;
+    const statusCode = Number(rawStatusCode);
     const statusMessage = baseResp.status_msg || baseResp.statusMsg || data.message || "";
 
-    if (!res.ok) {
-      return NextResponse.json({ error: `MiniMax API ${res.status}: ${statusMessage || rawText || "Failed"}` }, { status: 502 });
+    if (rawStatusCode == null || !Number.isFinite(statusCode)) {
+      throw new VoiceListInvalidResponseError("MiniMax returned an invalid voice-list status");
     }
     if (statusCode !== 0) {
       return NextResponse.json({ error: statusMessage || "MiniMax voice API error" }, { status: 502 });
@@ -108,6 +116,7 @@ export async function GET(request) {
 
     return NextResponse.json(normalized);
   } catch (err) {
-    return NextResponse.json({ error: err.message || "Failed to fetch MiniMax voices" }, { status: 502 });
+    const status = request.signal?.aborted ? 499 : voiceListErrorStatus(err);
+    return NextResponse.json({ error: err.message || "Failed to fetch MiniMax voices" }, { status });
   }
 }

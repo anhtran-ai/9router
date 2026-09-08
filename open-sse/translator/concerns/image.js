@@ -16,13 +16,17 @@ import { lookup } from "node:dns/promises";
 import { Agent } from "undici";
 import { MAX_IMAGE_BYTES, FETCH_TIMEOUT_MS, IMAGE_SIGNATURES, BLOCKED_HOSTS } from "../../config/mediaConfig.js";
 import { isPublicIpAddress } from "../../../src/shared/utils/ssrfGuard.js";
+import { awaitWithSignal } from "../../utils/abort.js";
 
 // Resolve host once and return only public IPs (SSRF guard).
 // Rejects if any resolved record is private/reserved (defeats multi-A tricks).
-async function resolvePinnedIps(hostname) {
+async function resolvePinnedIps(hostname, signal) {
   if (!hostname || BLOCKED_HOSTS.has(hostname.toLowerCase())) return null;
   try {
-    const records = await lookup(hostname, { all: true });
+    if (signal?.aborted) return null;
+    const lookupPromise = lookup(hostname, { all: true });
+    // Stop this request's wait while still observing a late DNS rejection.
+    const records = await awaitWithSignal(lookupPromise, signal);
     if (!records.length || records.some((r) => !isPublicIpAddress(r.address, r.family))) return null;
     return records;
   } catch {
@@ -64,14 +68,17 @@ export async function fetchImageAsBase64(imageUrl, options = {}) {
 
   let url;
   try { url = new URL(imageUrl); } catch { return null; }
-  const pinnedIps = await resolvePinnedIps(url.hostname);
-  if (!pinnedIps) return null;
-
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const fetchSignal = signal
     ? AbortSignal.any([signal, controller.signal])
     : controller.signal;
+
+  const pinnedIps = await resolvePinnedIps(url.hostname, fetchSignal);
+  if (!pinnedIps || fetchSignal.aborted) {
+    clearTimeout(timeout);
+    return null;
+  }
 
   // Pin connect to the validated IP so no second DNS resolution can rebind (TOCTOU fix).
   const dispatcher = new Agent({
@@ -93,11 +100,32 @@ export async function fetchImageAsBase64(imageUrl, options = {}) {
 
   let response;
   let reader;
+  let cancellation = null;
+  const cancelBestEffort = (body, reason) => {
+    try {
+      cancellation = Promise.resolve(body?.cancel?.(reason)).catch(() => {});
+    } catch {
+      cancellation = null;
+    }
+  };
   try {
     // redirect:"manual" prevents a public URL redirecting to a private one (SSRF bypass).
-    response = await fetch(imageUrl, { signal: fetchSignal, redirect: "manual", dispatcher });
+    const fetchPromise = Promise.resolve(fetch(imageUrl, {
+      signal: fetchSignal,
+      redirect: "manual",
+      dispatcher,
+    }));
+    // An injected fetch implementation may ignore AbortSignal. If it resolves
+    // after the deadline, discard its unread body instead of leaking it.
+    fetchPromise.then(
+      (lateResponse) => {
+        if (fetchSignal.aborted) cancelBestEffort(lateResponse?.body, fetchSignal.reason);
+      },
+      () => {},
+    );
+    response = await awaitWithSignal(fetchPromise, fetchSignal);
     if (!response.ok || !response.body) {
-      try { await response.body?.cancel(); } catch { /* best-effort connection release */ }
+      cancelBestEffort(response.body);
       return null;
     }
 
@@ -106,10 +134,10 @@ export async function fetchImageAsBase64(imageUrl, options = {}) {
     const chunks = [];
     let total = 0;
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await awaitWithSignal(reader.read(), fetchSignal);
       if (done) break;
       total += value.length;
-      if (total > maxBytes) { try { await reader.cancel(); } catch { /* ignore */ } return null; }
+      if (total > maxBytes) { cancelBestEffort(reader); return null; }
       chunks.push(value);
     }
 
@@ -119,13 +147,17 @@ export async function fetchImageAsBase64(imageUrl, options = {}) {
 
     return { url: `data:${mimeType};base64,${buf.toString("base64")}`, mimeType };
   } catch {
-    try {
-      if (reader) await reader.cancel();
-      else await response?.body?.cancel();
-    } catch { /* best-effort connection release */ }
+    cancelBestEffort(reader || response?.body);
     return null;
   } finally {
+    const release = () => {
+      try { reader?.releaseLock(); } catch { /* pending read or already released */ }
+    };
+    release();
+    cancellation?.finally(release);
     clearTimeout(timeout);
-    await dispatcher.close().catch(() => {});
+    // Never let a non-cooperative dispatcher cleanup extend the request
+    // deadline. The close still runs and its eventual rejection is observed.
+    try { Promise.resolve(dispatcher.close()).catch(() => {}); } catch { /* best effort */ }
   }
 }

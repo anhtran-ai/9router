@@ -4,14 +4,13 @@ import { describe, it, expect } from "vitest";
 import "./registerAll.js";
 import { translateRequest } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
+import { ToolCompatibilityError } from "../../open-sse/translator/concerns/hostedToolPolicy.js";
 
 const T = (src, tgt, body, provider = null) =>
   translateRequest(src, tgt, "m", body, true, null, provider);
 
 describe("bug: Claude → OpenAI bridge data loss", () => {
-  // claude-to-openai.js:133-141 — image source.type==="url" only handles base64
-  // KNOWN BUG: it.fails passes while app drops the url; flips to failing once fixed.
-  it.fails("image with source.type=url is preserved (NOT dropped)", () => {
+  it("preserves image source.type=url", () => {
     const out = T(FORMATS.CLAUDE, FORMATS.OPENAI, {
       messages: [{ role: "user", content: [
         { type: "text", text: "look" },
@@ -22,7 +21,6 @@ describe("bug: Claude → OpenAI bridge data loss", () => {
     expect(json, "remote image url silently dropped").toContain("a.png");
   });
 
-  // claude-to-openai.js:128 switch — missing thinking/redacted_thinking case
   it("thinking block survives round-trip Claude→OpenAI→Claude", () => {
     const body = {
       messages: [{ role: "assistant", content: [
@@ -30,15 +28,46 @@ describe("bug: Claude → OpenAI bridge data loss", () => {
         { type: "text", text: "answer" },
       ] }, { role: "user", content: "go" }],
     };
-    const out = T(FORMATS.CLAUDE, FORMATS.CLAUDE, body);
+    const chat = T(FORMATS.CLAUDE, FORMATS.OPENAI, body);
+    expect(chat.messages.find((message) => message.role === "assistant")?.reasoning_content)
+      .toBe("secret reasoning");
+    const out = T(FORMATS.OPENAI, FORMATS.CLAUDE, chat, "anthropic-compatible-x");
     const json = JSON.stringify(out);
     expect(json, "thinking content lost via OpenAI bridge").toContain("secret reasoning");
   });
 
-  // claude-to-openai.js:155-173 — tool_result image block dropped (text only)
-  // KNOWN BUG
-  it.fails("tool_result with image block is not turned into raw JSON / dropped", () => {
-    const out = T(FORMATS.CLAUDE, FORMATS.OPENAI, {
+  it("keeps a reasoning-only assistant turn through the OpenAI bridge", () => {
+    const body = {
+      messages: [
+        { role: "assistant", content: [{ type: "thinking", thinking: "private chain", signature: "sig" }] },
+        { role: "user", content: "continue" },
+      ],
+    };
+
+    const chat = T(FORMATS.CLAUDE, FORMATS.OPENAI, body);
+    expect(chat.messages).toContainEqual({
+      role: "assistant",
+      content: "",
+      reasoning_content: "private chain",
+    });
+    const out = T(FORMATS.OPENAI, FORMATS.CLAUDE, chat, "anthropic-compatible-x");
+    expect(out.messages[0].content).toContainEqual(expect.objectContaining({
+      type: "thinking",
+      thinking: "private chain",
+    }));
+  });
+
+  it("fails closed when Claude native cannot authenticate reasoning-only bridge history", () => {
+    expect(() => T(FORMATS.OPENAI, FORMATS.CLAUDE, {
+      messages: [
+        { role: "assistant", content: "", reasoning_content: "unsigned private chain" },
+        { role: "user", content: "continue" },
+      ],
+    }, "claude")).toThrowError(ToolCompatibilityError);
+  });
+
+  it("fails closed when a Chat target cannot represent a tool_result image", () => {
+    expect(() => T(FORMATS.CLAUDE, FORMATS.OPENAI, {
       messages: [
         { role: "assistant", content: [
           { type: "tool_use", id: "call_1", name: "shot", input: {} },
@@ -49,15 +78,10 @@ describe("bug: Claude → OpenAI bridge data loss", () => {
           ] },
         ] },
       ],
-    });
-    const toolMsg = out.messages.find((m) => m.role === "tool");
-    // Should keep the image; currently stringifies the whole array into raw JSON
-    expect(toolMsg?.content, "image in tool_result lost").not.toMatch(/^\[/);
+    })).toThrowError(ToolCompatibilityError);
   });
 
-  // claude-to-openai.js:155-173 — is_error lost
-  // KNOWN BUG
-  it.fails("tool_result is_error flag is preserved", () => {
+  it("preserves tool_result failure semantics in Chat text", () => {
     const out = T(FORMATS.CLAUDE, FORMATS.OPENAI, {
       messages: [
         { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "f", input: {} }] },
@@ -66,8 +90,8 @@ describe("bug: Claude → OpenAI bridge data loss", () => {
         ] },
       ],
     });
-    const json = JSON.stringify(out);
-    expect(json, "is_error dropped → model can't see tool failure").toContain("is_error");
+    const tool = out.messages.find((message) => message.role === "tool");
+    expect(tool?.content).toBe("[Tool error]\nboom");
   });
 
   // claude-to-openai.js:24-27 — system array only takes .text, drops cache_control/non-text
