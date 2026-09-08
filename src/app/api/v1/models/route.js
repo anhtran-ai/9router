@@ -12,6 +12,7 @@ import { resolveKimchiModels } from "open-sse/services/kimchiModels.js";
 import { resolveQoderModels } from "open-sse/services/qoderModels.js";
 import { resolveCopilotModels } from "open-sse/services/copilotModels.js";
 import {
+  awaitModelCatalogResponse,
   cancelModelCatalogBody,
   readModelCatalogJson,
 } from "open-sse/services/modelCatalogResponse.js";
@@ -22,8 +23,55 @@ import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { capabilitiesFromServiceKind, getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
+import { awaitWithSignal } from "open-sse/utils/abort.js";
 
-// Per-provider live model resolvers. Each receives a connection record and
+const LIVE_MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
+
+async function resolveLiveModelsWithDeadline(
+  resolver,
+  connection,
+  callerSignal = null,
+  deadlineAt = Date.now() + LIVE_MODEL_DISCOVERY_TIMEOUT_MS,
+) {
+  const remainingMs = Math.max(0, deadlineAt - Date.now());
+  if (remainingMs === 0) {
+    throw new DOMException("Live model discovery timed out", "TimeoutError");
+  }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(new DOMException("Live model discovery timed out", "TimeoutError")),
+    remainingMs,
+  );
+  let callerAbortListener = null;
+  if (callerSignal) {
+    callerAbortListener = () => controller.abort(
+      callerSignal.reason ?? new DOMException("Model list request aborted", "AbortError"),
+    );
+    if (callerSignal.aborted) callerAbortListener();
+    else callerSignal.addEventListener("abort", callerAbortListener, { once: true });
+  }
+
+  // Abort transports that cooperate, but also race the resolver itself. This
+  // keeps one abort-ignoring provider from hanging the entire /v1/models route.
+  const operation = Promise.resolve().then(() => {
+    if (controller.signal.aborted) {
+      throw controller.signal.reason ?? new DOMException("Model list request aborted", "AbortError");
+    }
+    return resolver(connection, controller.signal);
+  });
+
+  try {
+    return await awaitWithSignal(operation, controller.signal);
+  } finally {
+    clearTimeout(timeoutId);
+    if (callerSignal && callerAbortListener) {
+      callerSignal.removeEventListener("abort", callerAbortListener);
+    }
+  }
+}
+
+// Per-provider live model resolvers. Each receives a connection record plus an
+// AbortSignal bounded by the request-wide live-discovery deadline, and
 // returns { models: [{ id, name? }, ...] } | null on failure.
 // Adding a provider here makes /v1/models prefer the live catalog for it.
 const LIVE_MODEL_RESOLVERS = {
@@ -57,12 +105,12 @@ const LIVE_MODEL_RESOLVERS = {
       models: result.models.map((m) => ({ id: m.id, name: m.name })),
     };
   },
-  kimchi: async (conn) => {
+  kimchi: async (conn, signal) => {
     const result = await resolveKimchiModels({
       accessToken: conn.accessToken,
       apiKey: conn.apiKey,
       providerSpecificData: conn.providerSpecificData || {}
-    }, { log: console });
+    }, { log: console, signal });
     return result?.models?.length ? { models: result.models } : null;
   },
   github: async (conn, signal) => {
@@ -83,20 +131,21 @@ const LIVE_MODEL_RESOLVERS = {
     });
     return result?.models?.length ? { models: result.models } : null;
   },
-  clinepass: async (conn) => {
+  clinepass: async (conn, signal) => {
     const result = await resolveClinepassModels({
       accessToken: conn.accessToken,
       apiKey: conn.apiKey,
-    });
+    }, { signal });
     return result?.models?.length ? { models: result.models } : null;
   },
-  "grok-cli": async (conn) => {
+  "grok-cli": async (conn, signal) => {
     const proxy = await resolveConnectionProxyConfig(conn.providerSpecificData || {});
     const result = await resolveGrokCliModels({
       ...conn,
       connectionId: conn.id,
     }, {
       log: console,
+      signal,
       proxyOptions: {
         connectionProxyEnabled: proxy.connectionProxyEnabled === true,
         connectionProxyUrl: proxy.connectionProxyUrl || "",
@@ -113,18 +162,18 @@ const LIVE_MODEL_RESOLVERS = {
     });
     return result?.models?.length ? { models: result.models } : null;
   },
-  cursor: async (conn) => {
+  cursor: async (conn, signal) => {
     const result = await resolveCursorModels({
       accessToken: conn.accessToken,
       providerSpecificData: conn.providerSpecificData || {},
-    }, { log: console });
+    }, { log: console, signal });
     return result?.models?.length ? { models: result.models } : null;
   },
-  zed: async (conn) => {
+  zed: async (conn, signal) => {
     const result = await resolveZedModels({
       accessToken: conn.accessToken,
       providerSpecificData: conn.providerSpecificData || {},
-    });
+    }, { signal });
     if (!result?.models?.length) return null;
     return {
       models: result.models
@@ -177,7 +226,7 @@ function inferKindFromUnknownModelId(modelId) {
   return LLM_KIND;
 }
 
-async function fetchCompatibleModelIds(connection, callerSignal = null) {
+async function fetchCompatibleModelIds(connection, callerSignal = null, deadlineAt = null) {
   if (!connection?.apiKey) return [];
 
   const baseUrl = typeof connection?.providerSpecificData?.baseUrl === "string"
@@ -204,22 +253,27 @@ async function fetchCompatibleModelIds(connection, callerSignal = null) {
     return [];
   }
 
+  const timeoutMs = deadlineAt === null
+    ? 5000
+    : Math.min(5000, Math.max(0, deadlineAt - Date.now()));
+  if (timeoutMs === 0) return [];
+
   const controller = new AbortController();
   const timeoutId = setTimeout(
     () => controller.abort(new DOMException("Compatible model catalog timed out", "TimeoutError")),
-    5000,
+    timeoutMs,
   );
   const requestSignal = callerSignal
     ? AbortSignal.any([callerSignal, controller.signal])
     : controller.signal;
   let response;
   try {
-    response = await fetch(url, {
+    response = await awaitModelCatalogResponse(fetch(url, {
       method: "GET",
       headers: { ...headers, [INTERNAL_MODELS_FETCH_HEADER]: "1" },
       cache: "no-store",
       signal: requestSignal,
-    });
+    }), requestSignal);
 
     if (!response.ok) {
       cancelModelCatalogBody(response);
@@ -246,6 +300,8 @@ async function fetchCompatibleModelIds(connection, callerSignal = null) {
 export const __test__ = {
   fetchCompatibleModelIds,
   liveModelResolvers: LIVE_MODEL_RESOLVERS,
+  resolveLiveModelsWithDeadline,
+  liveModelDiscoveryTimeoutMs: LIVE_MODEL_DISCOVERY_TIMEOUT_MS,
 };
 
 // Provider matches kindFilter when its serviceKinds intersect the requested kinds.
@@ -270,6 +326,9 @@ function comboMatchesKinds(combo, kindFilter) {
  * @param {string[]} kindFilter - List of service kinds to include (e.g. ["llm"], ["webSearch","webFetch"]).
  */
 export async function buildModelsList(kindFilter, options = {}) {
+  // All compatible and provider-specific live discovery shares one absolute
+  // budget. Sequential providers therefore cannot each consume a fresh 30s.
+  const liveDiscoveryDeadlineAt = Date.now() + LIVE_MODEL_DISCOVERY_TIMEOUT_MS;
   // When this header is present, the /v1/models request came from another
   // 9router instance's fetchCompatibleModelIds — skip dynamic fetch to break
   // cross-instance recursive loops.
@@ -405,7 +464,7 @@ export async function buildModelsList(kindFilter, options = {}) {
         : providerModels.map((model) => model.id);
 
       if (isCompatibleProvider && rawModelIds.length === 0 && !skipDynamicFetch) {
-        rawModelIds = await fetchCompatibleModelIds(conn, signal);
+        rawModelIds = await fetchCompatibleModelIds(conn, signal, liveDiscoveryDeadlineAt);
       }
 
       // Config-driven live catalog override (e.g. Kiro returns dynamic
@@ -414,7 +473,12 @@ export async function buildModelsList(kindFilter, options = {}) {
       const liveResolver = LIVE_MODEL_RESOLVERS[providerId];
       if (liveResolver && !hasExplicitEnabledModels) {
         try {
-          const live = await liveResolver(conn, signal);
+          const live = await resolveLiveModelsWithDeadline(
+            liveResolver,
+            conn,
+            signal,
+            liveDiscoveryDeadlineAt,
+          );
           if (live?.models?.length) {
             rawModelIds = live.models.map((m) => m.id);
             liveModelKindById = new Map(
@@ -428,8 +492,11 @@ export async function buildModelsList(kindFilter, options = {}) {
                 .map((m) => [m.id, m.capabilities])
             );
           }
-        } catch (err) {
-          console.log(`Live model fetch failed for ${providerId}: ${err?.message || err}`);
+        } catch {
+          // Provider errors can embed raw upstream response bodies. Log only
+          // the provider identity so credentials echoed by an upstream never
+          // enter application logs.
+          console.log(`Live model fetch failed for ${providerId}`);
         }
       }
 
@@ -595,10 +662,10 @@ export async function GET(request) {
     return Response.json({ object: "list", data }, {
       headers: { "Access-Control-Allow-Origin": "*" },
     });
-  } catch (error) {
-    console.log("Error fetching models:", error);
+  } catch {
+    console.log("Error fetching models");
     return Response.json(
-      { error: { message: error.message, type: "server_error" } },
+      { error: { message: "Unable to fetch models", type: "server_error" } },
       { status: 500 }
     );
   }

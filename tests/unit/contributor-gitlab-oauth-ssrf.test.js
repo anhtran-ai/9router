@@ -38,7 +38,7 @@ vi.mock("@/models", () => ({ createProviderConnection: mocks.createConnection })
 vi.mock("@/lib/oauth/utils/ideDetect", () => ({ detectIdeInstalled: vi.fn() }));
 vi.mock("@/lib/oauth/utils/server", () => ({
   startCodexProxy: vi.fn(), stopCodexProxy: vi.fn(), registerCodexSession: vi.fn(), getCodexSessionStatus: vi.fn(), clearCodexSession: vi.fn(),
-  startXaiProxy: vi.fn(), stopXaiProxy: vi.fn(), registerXaiSession: vi.fn(), getXaiSessionStatus: vi.fn(), clearXaiSession: vi.fn(),
+  startXaiProxy: vi.fn(), stopXaiProxy: vi.fn(), registerXaiSession: vi.fn(), getXaiSessionStatus: vi.fn(), claimXaiSession: vi.fn(), isXaiSessionCurrent: vi.fn(), clearXaiSession: vi.fn(),
   startTraeProxy: vi.fn(), stopTraeProxy: vi.fn(), registerTraeSession: vi.fn(), getTraeSessionStatus: vi.fn(), clearTraeSession: vi.fn(),
   startWindsurfProxy: vi.fn(), stopWindsurfProxy: vi.fn(), registerWindsurfSession: vi.fn(), getWindsurfSessionStatus: vi.fn(), clearWindsurfSession: vi.fn(),
   startZedProxy: vi.fn(), stopZedProxy: vi.fn(), registerZedSession: vi.fn(), getZedSessionStatus: vi.fn(), clearZedSession: vi.fn(),
@@ -55,14 +55,8 @@ afterEach(() => {
 describe("contributor GitLab OAuth SSRF boundary", () => {
   it("never sends an authorization code, client secret, or bearer token to a client-selected host", async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ access_token: "gitlab-access-token", expires_in: 3600 }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ username: "contributor" }),
-      });
+      .mockResolvedValueOnce(Response.json({ access_token: "gitlab-access-token", expires_in: 3600 }))
+      .mockResolvedValueOnce(Response.json({ username: "contributor" }));
     vi.stubGlobal("fetch", fetchMock);
 
     const request = new Request("https://router.example/api/contribute/oauth/gitlab/exchange", {

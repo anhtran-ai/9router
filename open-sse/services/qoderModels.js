@@ -23,9 +23,9 @@ import { createHash } from "crypto";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { buildCosyHeaders } from "../shared/qoder/cosy.js";
 import {
+  awaitModelCatalogResponse,
   cancelModelCatalogBody,
   readModelCatalogJson,
-  readModelCatalogText,
 } from "./modelCatalogResponse.js";
 import {
   QODER_MODEL_LIST_URL,
@@ -57,7 +57,10 @@ async function withQoderResponse(url, init, proxyOptions, outerSignal, consume) 
     : controller.signal;
   let response;
   try {
-    response = await proxyAwareFetch(url, { ...init, signal }, proxyOptions);
+    response = await awaitModelCatalogResponse(
+      proxyAwareFetch(url, { ...init, signal }, proxyOptions),
+      signal,
+    );
     return await consume(response, signal);
   } catch (error) {
     if (signal.aborted) {
@@ -153,16 +156,15 @@ async function exchangeJobToken(pat, proxyOptions = null, signal = null) {
     },
     proxyOptions,
     signal,
-    async (res, requestSignal) => {
-      if (!res.ok) {
-        const text = await readModelCatalogText(res, { signal: requestSignal }).catch((error) => {
-          if (requestSignal.aborted) throw error;
-          return "";
-        });
-        throw new Error(`qoder PAT exchange failed: ${res.status} ${text.slice(0, 200)}`);
+      async (res, requestSignal) => {
+        if (!res.ok) {
+        cancelModelCatalogBody(res);
+        const error = new Error(`qoder PAT exchange failed with HTTP ${res.status}`);
+        error.status = res.status;
+        throw error;
       }
       const data = await readModelCatalogJson(res, { signal: requestSignal });
-      if (!data.token) throw new Error("qoder PAT exchange returned no job token");
+      if (!data?.token) throw new Error("qoder PAT exchange returned no job token");
 
       let expiresAt = Date.now() + PAT_DEFAULT_TTL_MS;
       if (data.expires_at) {
@@ -330,14 +332,17 @@ async function fetchQoderCatalogRaw(credentials, signal, proxyOptions = null) {
         signal.addEventListener("abort", abortListener);
       }
     }
-    response = await proxyAwareFetch(
-      modelListUrl,
-      {
-        method: "GET",
-        headers,
-        signal: controller.signal,
-      },
-      proxyOptions,
+    response = await awaitModelCatalogResponse(
+      proxyAwareFetch(
+        modelListUrl,
+        {
+          method: "GET",
+          headers,
+          signal: controller.signal,
+        },
+        proxyOptions,
+      ),
+      controller.signal,
     );
     if (!response.ok) {
       cancelModelCatalogBody(response);
@@ -416,7 +421,8 @@ export async function resolveQoderModels(credentials, options = {}) {
   try {
     resolved = await resolveQoderCredentials(credentials, options.proxyOptions, options.signal);
   } catch (error) {
-    options.log?.warn?.("QODER", `PAT exchange failed: ${error.message}`);
+    const details = Number.isInteger(error?.status) ? { status: error.status } : undefined;
+    options.log?.warn?.("QODER", "PAT exchange failed", details);
     return null;
   }
   if (!resolved?.accessToken || !(resolved.providerSpecificData || {}).userId) return null;

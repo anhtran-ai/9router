@@ -1,10 +1,15 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 describe("xai/oauth service", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.restoreAllMocks();
     vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it("validates discovered endpoints are https x.ai URLs", async () => {
@@ -121,5 +126,86 @@ describe("xai/oauth service", () => {
       refreshToken: "refresh-token",
       expiresIn: 3600,
     });
+  });
+
+  it("falls back to static discovery when headers never arrive", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(() => new Promise(() => {}));
+    vi.stubGlobal("fetch", fetchMock);
+    const { discoverEndpoints } = await import("../../src/lib/oauth/services/xai.js");
+
+    const pending = discoverEndpoints();
+    await vi.advanceTimersByTimeAsync(15_001);
+
+    await expect(pending).resolves.toEqual({
+      authorizeUrl: "https://auth.x.ai/oauth2/authorize",
+      tokenUrl: "https://auth.x.ai/oauth2/token",
+    });
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+  });
+
+  it("bounds a stalled refresh body without waiting for cancellation", async () => {
+    vi.useFakeTimers();
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const stalled = new Response(new ReadableStream({
+      pull: () => new Promise(() => {}),
+      cancel,
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        authorization_endpoint: "https://auth.x.ai/oauth2/authorize",
+        token_endpoint: "https://auth.x.ai/oauth2/token",
+      }), { status: 200 }))
+      .mockResolvedValueOnce(stalled);
+    vi.stubGlobal("fetch", fetchMock);
+    const { XaiService } = await import("../../src/lib/oauth/services/xai.js");
+
+    const pending = new XaiService().refreshAccessToken("refresh-token");
+    const rejection = expect(pending).rejects.toThrow(/^xAI token refresh failed$/);
+    await vi.advanceTimersByTimeAsync(15_001);
+
+    await rejection;
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["oversize", new Response("x".repeat(256 * 1024 + 1), { status: 200 })],
+    ["invalid UTF-8", new Response(new Uint8Array([0xc3, 0x28]), { status: 200 })],
+    ["malformed JSON", new Response('{"access_token":', { status: 200 })],
+  ])("rejects a %s xAI refresh response with a generic error", async (_case, tokenResponse) => {
+    fetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        authorization_endpoint: "https://auth.x.ai/oauth2/authorize",
+        token_endpoint: "https://auth.x.ai/oauth2/token",
+      }), { status: 200 }))
+      .mockResolvedValueOnce(tokenResponse);
+    const { XaiService } = await import("../../src/lib/oauth/services/xai.js");
+
+    await expect(new XaiService().refreshAccessToken("refresh-token"))
+      .rejects.toThrow(/^xAI token refresh failed$/);
+  });
+
+  it("does not echo a reflected OAuth code from dashboard exchange errors", async () => {
+    const reflectedSecret = "authorization-code-must-not-escape";
+    fetch.mockResolvedValueOnce(new Response(JSON.stringify({
+      error: "invalid_grant",
+      error_description: reflectedSecret,
+    }), { status: 400 }));
+    const { default: provider } = await import("../../src/lib/oauth/providers/xai.js");
+
+    let failure;
+    try {
+      await provider.exchangeToken(
+        provider.config,
+        reflectedSecret,
+        "http://127.0.0.1:56121/callback",
+        "verifier",
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure?.message).toBe("xAI token exchange failed");
+    expect(failure?.message).not.toContain(reflectedSecret);
   });
 });

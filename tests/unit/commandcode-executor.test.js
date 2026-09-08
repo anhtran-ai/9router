@@ -80,8 +80,31 @@ describe("inspectAndWrapCommandCodeResponse", () => {
     expect(result.status).toBe(503);
 
     const body = await result.json();
-    expect(body.error.message).toContain("Service temporarily unavailable");
+    expect(body.error.message).toBe("CommandCode is temporarily unavailable");
     expect(body.error.code).toBe(503);
+  });
+
+  it("does not reflect an initial upstream error message or type", async () => {
+    const marker = "SENSITIVE_COMMANDCODE_UPSTREAM_ERROR";
+    const source = createNdjsonStream([
+      JSON.stringify({
+        type: "error",
+        error: { message: marker, type: marker, statusCode: 503 },
+      }) + "\n",
+    ]);
+
+    const result = await inspectAndWrapCommandCodeResponse(
+      new Response(source, { headers: { "Content-Type": "text/event-stream" } }),
+      "poolside/laguna-s-2.1-free",
+    );
+    const body = await result.json();
+
+    expect(JSON.stringify(body)).not.toContain(marker);
+    expect(body.error).toEqual({
+      message: "CommandCode is temporarily unavailable",
+      type: "server_error",
+      code: 503,
+    });
   });
 
   it("returns a detected error without waiting for upstream cancellation", async () => {
@@ -101,6 +124,45 @@ describe("inspectAndWrapCommandCodeResponse", () => {
     );
 
     expect(result.status).toBe(503);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("times out a stalled first event without waiting for reader cancellation", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const source = new ReadableStream({ start() {}, cancel });
+
+    const result = await inspectAndWrapCommandCodeResponse(
+      new Response(source, { headers: { "Content-Type": "text/event-stream" } }),
+      "poolside/laguna-s-2.1-free",
+      { firstFrameTimeoutMs: 10 },
+    );
+
+    expect(result.status).toBe(504);
+    await expect(result.json()).resolves.toMatchObject({
+      error: { code: "upstream_stream_timeout" },
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an oversized unterminated stream prelude", async () => {
+    const cancel = vi.fn();
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(1024 * 1024 + 1)));
+      },
+      cancel,
+    });
+
+    const result = await inspectAndWrapCommandCodeResponse(
+      new Response(source, { headers: { "Content-Type": "text/event-stream" } }),
+      "poolside/laguna-s-2.1-free",
+      { firstFrameTimeoutMs: 100 },
+    );
+
+    expect(result.status).toBe(502);
+    await expect(result.json()).resolves.toMatchObject({
+      error: { code: "invalid_upstream_response" },
+    });
     expect(cancel).toHaveBeenCalledTimes(1);
   });
 
@@ -129,7 +191,7 @@ describe("inspectAndWrapCommandCodeResponse", () => {
     expect(result.status).toBe(503);
 
     const body = await result.json();
-    expect(body.error.message).toContain("Service temporarily unavailable");
+    expect(body.error.message).toBe("CommandCode is temporarily unavailable");
   });
 
   it("streams successful responses when content is emitted", async () => {
@@ -153,6 +215,36 @@ describe("inspectAndWrapCommandCodeResponse", () => {
     expect(text).toContain("data: [DONE]");
   });
 
+  it("finishes when content and finish share a chunk even if upstream stays open", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          `${JSON.stringify({ type: "text-delta", text: "same chunk" })}\n` +
+          `${JSON.stringify({ type: "finish" })}\n`,
+        ));
+      },
+      cancel,
+    });
+    const result = await inspectAndWrapCommandCodeResponse(
+      new Response(source, { headers: { "Content-Type": "text/event-stream" } }),
+      "poolside/laguna-s-2.1-free",
+    );
+
+    let timeout;
+    const text = await Promise.race([
+      result.text(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("CommandCode output did not terminate")), 500);
+      }),
+    ]).finally(() => clearTimeout(timeout));
+
+    expect(text).toContain("same chunk");
+    expect(text).toContain('"finish_reason":"stop"');
+    expect(text).toContain("data: [DONE]");
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
   it("reports EOF after content without a finish event", async () => {
     const fakeResponse = new Response(createNdjsonStream([
       JSON.stringify({ type: "text-delta", text: "partial" }) + "\n",
@@ -173,6 +265,25 @@ describe("inspectAndWrapCommandCodeResponse", () => {
     const result = await inspectAndWrapCommandCodeResponse(fakeResponse, "poolside/laguna-s-2.1-free");
     const text = await result.text();
     expect(text).toContain("commandcode_malformed_stream");
+    expect(text).not.toContain("finish_reason\":\"stop");
+  });
+
+  it("terminates when an oversized line arrives after the first content event", async () => {
+    const first = JSON.stringify({ type: "text-delta", text: "bounded" });
+    const oversized = "x".repeat(1024 * 1024 + 1);
+    const fakeResponse = new Response(createNdjsonStream([
+      `${first}\n${oversized}\n`,
+    ]), { headers: { "Content-Type": "text/event-stream" } });
+
+    const result = await inspectAndWrapCommandCodeResponse(
+      fakeResponse,
+      "poolside/laguna-s-2.1-free",
+      { firstFrameTimeoutMs: 100 },
+    );
+    const text = await result.text();
+
+    expect(text).toContain("bounded");
+    expect(text).toContain("commandcode_frame_too_large");
     expect(text).not.toContain("finish_reason\":\"stop");
   });
 });

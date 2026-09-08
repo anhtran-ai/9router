@@ -4,9 +4,27 @@ const mocks = vi.hoisted(() => ({ getAdapter: vi.fn() }));
 
 vi.mock("@/lib/db/driver.js", () => ({ getAdapter: mocks.getAdapter }));
 
-const { updateProviderConnection } = await import("@/lib/db/repos/connectionsRepo.js");
+const { createProviderConnection, updateProviderConnection } = await import("@/lib/db/repos/connectionsRepo.js");
 
 describe("provider connection update cancellation", () => {
+  it("rechecks create ownership after the adapter wait and skips the transaction", async () => {
+    let releaseAdapter;
+    const adapterReady = new Promise((resolve) => { releaseAdapter = resolve; });
+    const db = { transaction: vi.fn() };
+    mocks.getAdapter.mockReturnValue(adapterReady);
+    let ownsMutation = true;
+
+    const pending = createProviderConnection(
+      { provider: "fixture", authType: "oauth", email: "stale@example.test" },
+      { shouldCommit: () => ownsMutation },
+    );
+    ownsMutation = false;
+    releaseAdapter(db);
+
+    await expect(pending).resolves.toBeNull();
+    expect(db.transaction).not.toHaveBeenCalled();
+  });
+
   it("rechecks the signal after the adapter wait and before the synchronous commit", async () => {
     let releaseAdapter;
     const adapterReady = new Promise((resolve) => { releaseAdapter = resolve; });

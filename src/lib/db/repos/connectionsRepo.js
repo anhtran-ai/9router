@@ -190,11 +190,16 @@ export function createProviderConnectionInTransaction(db, data) {
   return conn;
 }
 
-export async function createProviderConnection(data) {
+export async function createProviderConnection(data, options = {}) {
   const db = await getAdapter();
+  if (options?.shouldCommit && !options.shouldCommit()) return null;
   let result;
 
   db.transaction(() => {
+    if (options?.shouldCommit && !options.shouldCommit()) {
+      result = null;
+      return;
+    }
     result = createProviderConnectionInTransaction(db, data);
   });
 

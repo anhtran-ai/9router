@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
@@ -11,8 +11,10 @@ function createBuildFixture(distDir) {
   mkdirSync(join(buildRoot, "standalone"), { recursive: true });
   mkdirSync(join(buildRoot, "static", "chunks"), { recursive: true });
   mkdirSync(join(projectRoot, "public"), { recursive: true });
+  mkdirSync(join(projectRoot, "node_modules", "sql.js", "dist"), { recursive: true });
   writeFileSync(join(buildRoot, "static", "chunks", "app.js"), "static asset");
   writeFileSync(join(projectRoot, "public", "favicon.svg"), "public asset");
+  writeFileSync(join(projectRoot, "node_modules", "sql.js", "dist", "sql-wasm.wasm"), "wasm asset");
   return projectRoot;
 }
 
@@ -26,6 +28,8 @@ describe("standalone build assets", () => {
       .toBe("static asset");
     expect(readFileSync(join(projectRoot, ".next", "standalone", "public", "favicon.svg"), "utf8"))
       .toBe("public asset");
+    expect(readFileSync(join(projectRoot, ".next", "standalone", "node_modules", "sql.js", "dist", "sql-wasm.wasm"), "utf8"))
+      .toBe("wasm asset");
   });
 
   it("uses a custom Next dist directory", () => {
@@ -62,5 +66,13 @@ describe("standalone build assets", () => {
 
     expect(() => readFileSync(join(projectRoot, ".next-cli-build", "standalone", ".next-cli-build", "static", "chunks", "app.js")))
       .toThrow();
+  });
+
+  it("fails the standalone postbuild when the required SQL.js runtime asset is missing", () => {
+    const projectRoot = createBuildFixture(".next");
+    unlinkSync(join(projectRoot, "node_modules", "sql.js", "dist", "sql-wasm.wasm"));
+
+    expect(() => copyStandaloneAssets({ projectRoot, distDir: ".next" }))
+      .toThrow("Required SQL.js runtime asset is missing");
   });
 });

@@ -54,9 +54,14 @@ describe("wrapQoderSSE billing detection", () => {
   }
 
   it("returns 403 response when first frame is billing block (code 112)", async () => {
+    const reflectedSecret = "SENSITIVE_QODER_BILLING_MESSAGE";
     const billingEnv = JSON.stringify({
       statusCodeValue: 403,
-      body: '{"code":"112","message":"Quota exhausted","pricingUrl":"https://qoder.sh/pricing"}',
+      body: JSON.stringify({
+        code: "112",
+        message: reflectedSecret,
+        pricingUrl: "https://qoder.sh/pricing",
+      }),
     });
     const upstream = `data: ${billingEnv}\n\n`;
 
@@ -67,6 +72,7 @@ describe("wrapQoderSSE billing detection", () => {
     const json = await wrapped.json();
     expect(json.error).toBeDefined();
     expect(json.error.message).toContain("112");
+    expect(JSON.stringify(json)).not.toContain(reflectedSecret);
   });
 
   it("returns 403 response when first frame is billing block (code 10605)", async () => {

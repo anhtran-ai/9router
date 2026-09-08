@@ -11,6 +11,13 @@
 
 import crypto from "node:crypto";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import { awaitWithSignal } from "../utils/abort.js";
+import {
+  awaitModelCatalogResponse,
+  cancelModelCatalogBody,
+  readModelCatalogJson,
+  readModelCatalogText,
+} from "../services/modelCatalogResponse.js";
 
 export const ZED_WEB_BASE_URL = "https://zed.dev";
 export const ZED_CLOUD_BASE_URL = "https://cloud.zed.dev";
@@ -30,10 +37,27 @@ export const ZED_HEADERS = {
 const PRIVATE_KEY_PREFIX = "zed-rsa-pkcs1:";
 const LLM_TOKEN_TTL_MS = 50 * 60 * 1000;
 const MODEL_CACHE_TTL_MS = 60 * 60 * 1000;
+const MODEL_FETCH_TIMEOUT_MS = 10_000;
+const ZED_JSON_FETCH_TIMEOUT_MS = 30_000;
 
 const llmTokenCache = new Map();
+const llmTokenLatestRequest = new Map();
 const modelCache = new Map();
 const modelInflight = new Map();
+let llmTokenCacheEpoch = 0;
+let modelCacheEpoch = 0;
+
+async function waitForZedModels(entry, signal) {
+  entry.waiters += 1;
+  try {
+    return await awaitWithSignal(entry.promise, signal);
+  } finally {
+    entry.waiters -= 1;
+    if (entry.waiters === 0 && !entry.settled && !entry.controller.signal.aborted) {
+      entry.controller.abort(new DOMException("Zed catalog has no active callers", "AbortError"));
+    }
+  }
+}
 
 function b64url(value) {
   return Buffer.from(value).toString("base64url");
@@ -173,25 +197,41 @@ function getSystemId(credentials) {
 }
 
 async function fetchJson(url, options, proxyOptions = null) {
-  const res = await proxyAwareFetch(url, options, proxyOptions);
-  const text = await res.text();
-  let data = null;
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { raw: text };
+  const deadline = new AbortController();
+  const timeoutId = setTimeout(
+    () => deadline.abort(new DOMException("Zed API request timed out", "TimeoutError")),
+    ZED_JSON_FETCH_TIMEOUT_MS,
+  );
+  timeoutId?.unref?.();
+  const signal = options?.signal
+    ? AbortSignal.any([options.signal, deadline.signal])
+    : deadline.signal;
+
+  try {
+    const res = await awaitModelCatalogResponse(
+      proxyAwareFetch(url, { ...options, signal }, proxyOptions),
+      signal,
+    );
+    if (!res.ok) {
+      cancelModelCatalogBody(res);
+      const err = new Error(`Zed API request failed with HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
     }
+
+    const text = await readModelCatalogText(res, {
+      signal,
+      fatalUtf8: true,
+    });
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new SyntaxError("Zed API returned malformed JSON");
+    }
+  } finally {
+    clearTimeout(timeoutId);
   }
-  if (!res.ok) {
-    const message =
-      data?.message || data?.error?.message || data?.error || text || `HTTP ${res.status}`;
-    const err = new Error(String(message));
-    err.status = res.status;
-    err.body = data;
-    throw err;
-  }
-  return data;
 }
 
 export async function fetchZedAuthenticatedUser(credentials, options = {}) {
@@ -264,6 +304,13 @@ export async function fetchZedLlmToken(credentials, options = {}) {
   const cached = llmTokenCache.get(cacheKey);
   if (!options.forceRefresh && cached && cached.expiresAt > Date.now()) return cached.token;
 
+  // More than one request can observe an expired/missing token concurrently.
+  // Track the newest request so a slower, older response cannot replace a
+  // token returned by the newer refresh or repopulate a cache that was cleared.
+  const requestEpoch = llmTokenCacheEpoch;
+  const requestIdentity = {};
+  llmTokenLatestRequest.set(cacheKey, requestIdentity);
+
   const headers = {
     "Content-Type": "application/json",
     Accept: "application/json",
@@ -272,20 +319,32 @@ export async function fetchZedLlmToken(credentials, options = {}) {
   const systemId = getSystemId(credentials);
   if (systemId) headers[ZED_HEADERS.systemId] = systemId;
 
-  const data = await fetchJson(
-    zedUrl(config, "cloudBaseUrl", "/client/llm_tokens", ZED_CLOUD_BASE_URL),
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ organization_id: organizationId }),
-      signal: options.signal ?? undefined,
-    },
-  );
-  const token =
-    typeof data?.token === "string" ? data.token : data?.token?.[0] || data?.token?.value;
-  if (!token) throw new Error("Zed did not return an LLM token");
-  llmTokenCache.set(cacheKey, { token, expiresAt: Date.now() + LLM_TOKEN_TTL_MS });
-  return token;
+  try {
+    const data = await fetchJson(
+      zedUrl(config, "cloudBaseUrl", "/client/llm_tokens", ZED_CLOUD_BASE_URL),
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ organization_id: organizationId }),
+        signal: options.signal ?? undefined,
+      },
+    );
+    const token =
+      typeof data?.token === "string" ? data.token : data?.token?.[0] || data?.token?.value;
+    if (!token) throw new Error("Zed did not return an LLM token");
+    if (
+      requestEpoch === llmTokenCacheEpoch
+      && llmTokenLatestRequest.get(cacheKey) === requestIdentity
+      && !options.signal?.aborted
+    ) {
+      llmTokenCache.set(cacheKey, { token, expiresAt: Date.now() + LLM_TOKEN_TTL_MS });
+    }
+    return token;
+  } finally {
+    if (llmTokenLatestRequest.get(cacheKey) === requestIdentity) {
+      llmTokenLatestRequest.delete(cacheKey);
+    }
+  }
 }
 
 export function shouldRefreshZedLlmToken(response) {
@@ -313,6 +372,7 @@ export async function zedLlmFetch(credentials, path, options = {}) {
 
   let response = await buildRequest(false);
   if (shouldRefreshZedLlmToken(response)) {
+    cancelModelCatalogBody(response, new Error("Refreshing Zed LLM token"));
     response = await buildRequest(true);
   }
   return response;
@@ -361,59 +421,104 @@ export async function resolveZedModels(credentials, options = {}) {
   if (!options.forceRefresh && cached && cached.expiresAt > Date.now()) return cached;
 
   const existing = modelInflight.get(key);
-  if (existing && !options.forceRefresh) return existing;
+  if (existing && !existing.controller.signal.aborted && !options.forceRefresh) {
+    return waitForZedModels(existing, options.signal);
+  }
 
-  const promise = (async () => {
-    const response = await zedLlmFetch(credentials, "/models", {
-      ...options,
-      fetchOptions: {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          [ZED_HEADERS.clientSupportsXai]: "true",
+  const requestEpoch = modelCacheEpoch;
+  const controller = new AbortController();
+  const entry = {
+    controller,
+    promise: null,
+    waiters: 0,
+    settled: false,
+  };
+  entry.promise = (async () => {
+    const timeoutId = setTimeout(
+      () => controller.abort(new DOMException("Zed model discovery timed out", "TimeoutError")),
+      MODEL_FETCH_TIMEOUT_MS,
+    );
+    // The fetch is shared by cache key, so an individual caller must only stop
+    // its own wait. The internal deadline remains authoritative for the job.
+    const signal = controller.signal;
+
+    try {
+      const response = await awaitModelCatalogResponse(zedLlmFetch(credentials, "/models", {
+        ...options,
+        signal,
+        fetchOptions: {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            [ZED_HEADERS.clientSupportsXai]: "true",
+          },
         },
-      },
-    });
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      throw new Error(`Zed models failed: ${response.status} ${text}`);
+      }), signal);
+      if (!response.ok) {
+        cancelModelCatalogBody(response);
+        const error = new Error(`Zed models failed with HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
+      const data = await readModelCatalogJson(response, { signal });
+      const rawModels = Array.isArray(data?.models) ? data.models : [];
+      const models = rawModels
+        .map(mapZedModel)
+        .filter(Boolean)
+        .filter((model) => !model.isDisabled);
+      const rawById = new Map();
+      for (const raw of rawModels) {
+        const id = normalizeZedModelId(raw?.id);
+        if (id) rawById.set(id, raw);
+      }
+      const catalogEntry = {
+        expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
+        models,
+        rawModels,
+        rawById,
+        defaultModel: normalizeZedModelId(data?.default_model ?? data?.defaultModel),
+        defaultFastModel: normalizeZedModelId(data?.default_fast_model ?? data?.defaultFastModel),
+        recommendedModels: (data?.recommended_models || data?.recommendedModels || [])
+          .map(normalizeZedModelId)
+          .filter(Boolean),
+      };
+      // A force refresh may supersede this request, and clearZedCaches() may
+      // invalidate every request that started before the clear. In either case
+      // the original caller may still consume its result, but it must not put
+      // stale data back into the shared cache.
+      if (
+        requestEpoch === modelCacheEpoch
+        && modelInflight.get(key) === entry
+      ) {
+        modelCache.set(key, catalogEntry);
+      }
+      return catalogEntry;
+    } finally {
+      clearTimeout(timeoutId);
     }
-    const data = await response.json();
-    const rawModels = Array.isArray(data?.models) ? data.models : [];
-    const models = rawModels
-      .map(mapZedModel)
-      .filter(Boolean)
-      .filter((model) => !model.isDisabled);
-    const rawById = new Map();
-    for (const raw of rawModels) {
-      const id = normalizeZedModelId(raw?.id);
-      if (id) rawById.set(id, raw);
-    }
-    const entry = {
-      expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
-      models,
-      rawModels,
-      rawById,
-      defaultModel: normalizeZedModelId(data?.default_model ?? data?.defaultModel),
-      defaultFastModel: normalizeZedModelId(data?.default_fast_model ?? data?.defaultFastModel),
-      recommendedModels: (data?.recommended_models || data?.recommendedModels || [])
-        .map(normalizeZedModelId)
-        .filter(Boolean),
-    };
-    modelCache.set(key, entry);
-    return entry;
   })();
 
-  modelInflight.set(key, promise);
-  try {
-    return await promise;
-  } finally {
-    if (modelInflight.get(key) === promise) modelInflight.delete(key);
-  }
+  modelInflight.set(key, entry);
+  entry.promise.then(
+    () => {
+      entry.settled = true;
+      if (modelInflight.get(key) === entry) modelInflight.delete(key);
+    },
+    () => {
+      entry.settled = true;
+      if (modelInflight.get(key) === entry) modelInflight.delete(key);
+    },
+  );
+  return waitForZedModels(entry, options.signal);
 }
 
 export function clearZedCaches() {
+  llmTokenCacheEpoch += 1;
+  if (!Number.isSafeInteger(llmTokenCacheEpoch)) llmTokenCacheEpoch = 1;
+  modelCacheEpoch += 1;
+  if (!Number.isSafeInteger(modelCacheEpoch)) modelCacheEpoch = 1;
   llmTokenCache.clear();
+  llmTokenLatestRequest.clear();
   modelCache.clear();
   modelInflight.clear();
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  appendSafeOAuthAuthorizeMeta,
   isLoopbackOAuthHostname,
   isTrustedOAuthMessageEvent,
   isTrustedOAuthMessageOrigin,
@@ -66,5 +67,19 @@ describe("OAuth postMessage origin policy", () => {
       ...base,
       data: { type: "oauth_callback", data: { code: "code", state: "wrong" } },
     }, options)).toBe(false);
+  });
+
+  it("keeps OAuth client secrets out of authorize query URLs", () => {
+    const url = new URL("https://router.example/api/oauth/gitlab/authorize?redirect_uri=http://localhost/callback");
+    appendSafeOAuthAuthorizeMeta(url, "gitlab", {
+      baseUrl: "https://gitlab.example",
+      clientId: "public-client-id",
+      clientSecret: "must-remain-in-post-body",
+    });
+
+    expect(url.searchParams.get("baseUrl")).toBe("https://gitlab.example");
+    expect(url.searchParams.get("clientId")).toBe("public-client-id");
+    expect(url.searchParams.has("clientSecret")).toBe(false);
+    expect(url.toString()).not.toContain("must-remain-in-post-body");
   });
 });

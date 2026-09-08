@@ -1,4 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.doUnmock("../../src/lib/oauth/services/xai.js");
+  vi.resetModules();
+});
 
 // We can't easily import the open-sse switch logic without real PROVIDERS config,
 // so verify the wrapper function shape directly via dynamic import.
@@ -59,5 +65,68 @@ describe("xai/token-refresh wrapper", () => {
 
     vi.doUnmock("../../src/lib/oauth/services/xai.js");
     vi.resetModules();
+  });
+
+  it("bounds an abort-ignoring xAI refresh service call", async () => {
+    vi.useFakeTimers();
+    let refreshSignal;
+    vi.resetModules();
+    vi.doMock("../../src/lib/oauth/services/xai.js", () => ({
+      XaiService: class {
+        async refreshAccessToken(_refreshToken, options) {
+          refreshSignal = options?.signal;
+          return new Promise(() => {});
+        }
+      },
+    }));
+
+    const mod = await import("../../open-sse/services/tokenRefresh.js");
+    const pending = mod.refreshTokenByProvider("xai", { refreshToken: "stalled-xai" }, null);
+    await vi.advanceTimersByTimeAsync(30_001);
+
+    await expect(pending).resolves.toBeNull();
+    expect(refreshSignal).toBeInstanceOf(AbortSignal);
+    expect(refreshSignal.aborted).toBe(true);
+  });
+
+  it("rejects an xAI HTTP 200 result without an access token", async () => {
+    vi.resetModules();
+    vi.doMock("../../src/lib/oauth/services/xai.js", () => ({
+      XaiService: class {
+        async refreshAccessToken() {
+          return { expires_in: 900 };
+        }
+      },
+    }));
+
+    const mod = await import("../../open-sse/services/tokenRefresh.js");
+    await expect(mod.refreshTokenByProvider(
+      "xai",
+      { refreshToken: "malformed-xai" },
+      null,
+    )).resolves.toBeNull();
+  });
+
+  it("preserves safe invalid_grant classification without parsing an error message", async () => {
+    const reflectedSecret = "SENSITIVE_XAI_REFRESH_ERROR";
+    const log = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
+    vi.resetModules();
+    vi.doMock("../../src/lib/oauth/services/xai.js", () => ({
+      XaiService: class {
+        async refreshAccessToken() {
+          const error = new Error(reflectedSecret);
+          error.oauthCode = "invalid_grant";
+          throw error;
+        }
+      },
+    }));
+
+    const mod = await import("../../open-sse/services/tokenRefresh.js");
+    await expect(mod.refreshTokenByProvider(
+      "xai",
+      { refreshToken: "revoked-xai" },
+      log,
+    )).resolves.toEqual({ error: "invalid_grant" });
+    expect(JSON.stringify(log.warn.mock.calls)).not.toContain(reflectedSecret);
   });
 });

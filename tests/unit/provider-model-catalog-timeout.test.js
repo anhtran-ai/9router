@@ -120,6 +120,47 @@ describe("live provider model catalog body deadlines", () => {
     expect(upstream.body.locked).toBe(false);
   });
 
+  it("bounds Qoder response headers when the transport ignores abort", async () => {
+    let fetchSignal;
+    const fetchMock = vi.fn((_url, init) => {
+      fetchSignal = init.signal;
+      return new Promise(() => {});
+    });
+    globalThis.fetch = fetchMock;
+    const { resolveQoderModels } = await import("../../open-sse/services/qoderModels.js");
+
+    const pending = resolveQoderModels({
+      accessToken: "dt-header-timeout-fixture",
+      providerSpecificData: { userId: "user-header-timeout-fixture" },
+    }, { forceRefresh: true });
+
+    await waitForFetch(fetchMock);
+    await expect(expectDeadlineToSettle(pending, 15_000)).resolves.toBeNull();
+    expect(fetchSignal.aborted).toBe(true);
+  });
+
+  it("disposes a Qoder response that arrives after the header deadline", async () => {
+    let resolveFetch;
+    const fetchMock = vi.fn(() => new Promise((resolve) => { resolveFetch = resolve; }));
+    globalThis.fetch = fetchMock;
+    const { resolveQoderModels } = await import("../../open-sse/services/qoderModels.js");
+
+    const pending = resolveQoderModels({
+      accessToken: "dt-late-header-fixture",
+      providerSpecificData: { userId: "user-late-header-fixture" },
+    }, { forceRefresh: true });
+
+    await waitForFetch(fetchMock);
+    await expect(expectDeadlineToSettle(pending, 15_000)).resolves.toBeNull();
+
+    const late = trackedResponse({ text: '{"chat":[]}' });
+    resolveFetch(late.response);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(late.cancel).toHaveBeenCalledOnce();
+    expect(late.body.locked).toBe(false);
+  });
+
   it("bounds Qoder PAT exchange body consumption before catalog lookup", async () => {
     let upstream;
     let fetchSignal;
@@ -264,6 +305,118 @@ describe("live provider model catalog body deadlines", () => {
     expect(newer.body.locked).toBe(false);
   });
 
+  it("coalesces Kiro misses while one caller can abort independently", async () => {
+    vi.doMock("../../open-sse/services/tokenRefresh.js", () => ({
+      refreshKiroToken: vi.fn(),
+    }));
+    const upstream = controlledJsonResponse();
+    let transportSignal;
+    const fetchMock = vi.fn(async (_url, init) => {
+      transportSignal = init.signal;
+      return upstream.response;
+    });
+    globalThis.fetch = fetchMock;
+    const { resolveKiroModels } = await import("../../open-sse/services/kiroModels.js");
+    const credentials = {
+      accessToken: "kiro-shared",
+      providerSpecificData: { profileArn: "arn:aws:codewhisperer:us-east-1:1:profile/shared" },
+    };
+    const firstCaller = new AbortController();
+    const secondCaller = new AbortController();
+
+    const first = resolveKiroModels(credentials, { signal: firstCaller.signal });
+    const second = resolveKiroModels(credentials, { signal: secondCaller.signal });
+    await waitForFetch(fetchMock);
+    firstCaller.abort(new DOMException("first caller left", "AbortError"));
+
+    await expect(first).resolves.toBeNull();
+    expect(transportSignal.aborted).toBe(false);
+    upstream.finish({ models: [{ modelId: "kiro-shared", modelName: "Kiro Shared" }] });
+    await expect(second).resolves.toMatchObject({
+      models: expect.arrayContaining([expect.objectContaining({ id: "kiro-shared" })]),
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not let an older Kiro force refresh overwrite a newer catalog", async () => {
+    vi.doMock("../../open-sse/services/tokenRefresh.js", () => ({
+      refreshKiroToken: vi.fn(),
+    }));
+    const older = controlledJsonResponse();
+    const newer = controlledJsonResponse();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(older.response)
+      .mockResolvedValueOnce(newer.response);
+    globalThis.fetch = fetchMock;
+    const { resolveKiroModels } = await import("../../open-sse/services/kiroModels.js");
+    const credentials = {
+      accessToken: "kiro-order",
+      providerSpecificData: { profileArn: "arn:aws:codewhisperer:us-east-1:1:profile/order" },
+    };
+
+    const olderPending = resolveKiroModels(credentials, { forceRefresh: true });
+    await waitForFetch(fetchMock);
+    const newerPending = resolveKiroModels(credentials, { forceRefresh: true });
+    while (fetchMock.mock.calls.length < 2) await Promise.resolve();
+
+    newer.finish({ models: [{ modelId: "kiro-newer" }] });
+    await expect(newerPending).resolves.toMatchObject({
+      models: expect.arrayContaining([expect.objectContaining({ id: "kiro-newer" })]),
+    });
+    older.finish({ models: [{ modelId: "kiro-older" }] });
+    await expect(olderPending).resolves.toMatchObject({
+      models: expect.arrayContaining([expect.objectContaining({ id: "kiro-older" })]),
+    });
+
+    await expect(resolveKiroModels(credentials)).resolves.toMatchObject({
+      models: expect.arrayContaining([expect.objectContaining({ id: "kiro-newer" })]),
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["invalidate", "clear"])(
+    "does not repopulate a Kiro cache after %s during an in-flight request",
+    async (mode) => {
+      vi.doMock("../../open-sse/services/tokenRefresh.js", () => ({
+        refreshKiroToken: vi.fn(),
+      }));
+      const older = controlledJsonResponse();
+      const newer = controlledJsonResponse();
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(older.response)
+        .mockResolvedValueOnce(newer.response);
+      globalThis.fetch = fetchMock;
+      const {
+        clearKiroModelCache,
+        invalidateKiroModelCache,
+        resolveKiroModels,
+      } = await import("../../open-sse/services/kiroModels.js");
+      const credentials = {
+        accessToken: `kiro-${mode}`,
+        providerSpecificData: {
+          profileArn: `arn:aws:codewhisperer:us-east-1:1:profile/${mode}`,
+        },
+      };
+
+      const beforeReset = resolveKiroModels(credentials, { forceRefresh: true });
+      await waitForFetch(fetchMock);
+      if (mode === "clear") clearKiroModelCache();
+      else invalidateKiroModelCache(credentials);
+      older.finish({ models: [{ modelId: "kiro-before-reset" }] });
+      await expect(beforeReset).resolves.toMatchObject({
+        models: expect.arrayContaining([expect.objectContaining({ id: "kiro-before-reset" })]),
+      });
+
+      const afterReset = resolveKiroModels(credentials);
+      while (fetchMock.mock.calls.length < 2) await Promise.resolve();
+      newer.finish({ models: [{ modelId: "kiro-after-reset" }] });
+      await expect(afterReset).resolves.toMatchObject({
+        models: expect.arrayContaining([expect.objectContaining({ id: "kiro-after-reset" })]),
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it("interprets Qoder PAT expires_in as seconds and reuses the cached job token", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(Response.json({ token: "jt-cache-fixture", expires_in: 86_400 }))
@@ -368,6 +521,30 @@ describe("live provider model catalog body deadlines", () => {
 
     expect(result.models.some((model) => model.id === "claude-live")).toBe(true);
     expect(upstream.cancel).not.toHaveBeenCalled();
+    expect(upstream.body.locked).toBe(false);
+  });
+
+  it("does not log a Kiro error body that reflects the bearer token", async () => {
+    vi.doMock("../../open-sse/services/tokenRefresh.js", () => ({
+      refreshKiroToken: vi.fn(),
+    }));
+    const reflected = "Bearer kiro-secret-reflected-by-upstream";
+    const upstream = trackedResponse({
+      status: 502,
+      text: JSON.stringify({ message: reflected }),
+    });
+    globalThis.fetch = vi.fn(async () => upstream.response);
+    const log = { warn: vi.fn(), debug: vi.fn(), info: vi.fn() };
+    const { resolveKiroModels } = await import("../../open-sse/services/kiroModels.js");
+
+    await expect(resolveKiroModels({
+      accessToken: "kiro-secret-reflected-by-upstream",
+      providerSpecificData: {
+        profileArn: "arn:aws:codewhisperer:us-east-1:1:profile/reflected-error",
+      },
+    }, { forceRefresh: true, log })).resolves.toBeNull();
+
+    expect(JSON.stringify(log.warn.mock.calls)).not.toContain(reflected);
     expect(upstream.body.locked).toBe(false);
   });
 

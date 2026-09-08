@@ -77,4 +77,25 @@ describe("Grok CLI live models", () => {
     expect(fetchFn.mock.calls[1][1].headers.Authorization).toBe("Bearer new-token");
     expect(fetchFn.mock.calls[1][1].headers["x-grok-client-version"]).toBe("0.2.99");
   });
+
+  it("does not expose an upstream error body or transport message", async () => {
+    const reflected = "secret-upstream-detail";
+    const response = jsonResponse({ error: reflected }, 502);
+    const bodyCancel = vi.spyOn(response.body, "cancel");
+
+    const httpFailure = await resolveGrokCliModels(
+      { accessToken: "access-token" },
+      { fetchFn: vi.fn(async () => response) },
+    );
+    expect(httpFailure.warning).toBe("Grok CLI model discovery failed (502).");
+    expect(httpFailure.warning).not.toContain(reflected);
+    expect(bodyCancel).toHaveBeenCalledOnce();
+
+    const transportFailure = await resolveGrokCliModels(
+      { accessToken: "access-token" },
+      { fetchFn: vi.fn(async () => { throw new Error(reflected); }) },
+    );
+    expect(transportFailure.warning).toBe("Grok CLI model discovery failed.");
+    expect(transportFailure.warning).not.toContain(reflected);
+  });
 });

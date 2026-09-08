@@ -24,7 +24,7 @@ const GET_ACTIONS = new Set([
   "stop-proxy",
   "ide-status",
 ]);
-const POST_ACTIONS = new Set(["exchange", "poll", "manual-code", "register-session"]);
+const POST_ACTIONS = new Set(["exchange", "poll", "manual-code", "register-session", "start-proxy"]);
 const DIRECT_COMPLETION_ACTIONS = new Set(["exchange", "poll", "manual-code"]);
 const CALLBACK_PROXY_PROVIDERS = new Set(["codex", "xai", "trae", "windsurf", "zed"]);
 const PROXY_RESUME_ACTIONS = new Set(["register-session", "poll-status", "stop-proxy"]);

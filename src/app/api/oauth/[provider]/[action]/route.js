@@ -17,6 +17,8 @@ import {
   stopXaiProxy,
   registerXaiSession,
   getXaiSessionStatus,
+  claimXaiSession,
+  isXaiSessionCurrent,
   clearXaiSession,
   startTraeProxy,
   stopTraeProxy,
@@ -36,6 +38,7 @@ import {
 } from "@/lib/oauth/utils/server";
 import { detectIdeInstalled } from "@/lib/oauth/utils/ideDetect";
 import { ZED_HOSTED_CONFIG } from "@/lib/oauth/constants/oauth";
+import { readRequestJson } from "open-sse/utils/requestBody.js";
 
 class OAuthConnectionCommitRejectedError extends Error {
   constructor() {
@@ -47,7 +50,13 @@ class OAuthConnectionCommitRejectedError extends Error {
 
 async function persistOAuthConnection(data, internalOptions = {}) {
   const commit = internalOptions?.commitProviderConnection;
-  if (typeof commit !== "function") return createProviderConnection(data);
+  const shouldCommit = internalOptions?.shouldCommit;
+  if (shouldCommit && !shouldCommit()) throw new OAuthConnectionCommitRejectedError();
+  if (typeof commit !== "function") {
+    const connection = await createProviderConnection(data, { shouldCommit });
+    if (!connection) throw new OAuthConnectionCommitRejectedError();
+    return connection;
+  }
   const connection = await commit(data);
   if (!connection) throw new OAuthConnectionCommitRejectedError();
   return connection;
@@ -58,10 +67,134 @@ function oauthErrorStatus(error, fallback = 500) {
   return Number.isInteger(status) && status >= 400 && status <= 599 ? status : fallback;
 }
 
+function oauthPublicErrorMessage(error, fallback = "OAuth request failed") {
+  const status = Number(error?.status);
+  const message = typeof error?.message === "string" ? error.message.trim() : "";
+  // Explicit 4xx statuses are assigned only to local validation/session
+  // errors. Provider transport and response-body failures are intentionally
+  // untrusted and must not cross the API boundary.
+  if (Number.isInteger(status) && status >= 400 && status < 500 && message && message.length <= 512) {
+    return message;
+  }
+  return fallback;
+}
+
+function logOAuthFailure(label, error) {
+  // An upstream error can echo the submitted code, verifier, or client
+  // secret. Keep logs useful without serializing the exception itself.
+  console.log(`${label} (${oauthErrorStatus(error)})`);
+}
+
+const PUBLIC_POLL_FAILURES = Object.freeze({
+  authorization_pending: "Authorization is pending",
+  slow_down: "Authorization is pending; retry more slowly",
+  access_denied: "Authorization was denied",
+  expired_token: "Authorization code expired",
+  invalid_request: "Authorization request is invalid",
+  request_failed: "OAuth token polling failed",
+  poll_failed: "OAuth token polling failed",
+  invalid_response: "OAuth provider returned an invalid response",
+  no_access_token: "OAuth provider did not return an access token",
+  unknown_error: "OAuth token polling failed",
+});
+
+function publicPollFailure(result) {
+  const upstreamCode = typeof result?.error === "string" ? result.error : "";
+  const error = Object.hasOwn(PUBLIC_POLL_FAILURES, upstreamCode)
+    ? upstreamCode
+    : "oauth_poll_failed";
+  return {
+    error,
+    errorDescription: PUBLIC_POLL_FAILURES[error] || "OAuth token polling failed",
+    pending: error === "authorization_pending" || error === "slow_down",
+  };
+}
+
+const START_PROXY_QUERY_PRIVATE_KEYS = [
+  "state",
+  "code_verifier",
+  "codeVerifier",
+  "token",
+  "access_token",
+  "accessToken",
+  "refresh_token",
+  "refreshToken",
+];
+const MAX_OAUTH_REQUEST_BODY_BYTES = 1024 * 1024;
+
+function validAppPort(value) {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
+
+async function startFixedCallbackProxy(provider, payload = {}, internalOptions = {}) {
+  const appPort = validAppPort(payload.appPort ?? payload.app_port);
+  if (!appPort) {
+    return NextResponse.json({ error: "Invalid or missing app_port" }, { status: 400 });
+  }
+
+  const state = typeof payload.state === "string" ? payload.state : null;
+  const codeVerifier = typeof (payload.codeVerifier ?? payload.code_verifier) === "string"
+    ? (payload.codeVerifier ?? payload.code_verifier)
+    : null;
+  const redirectUri = typeof (payload.redirectUri ?? payload.redirect_uri) === "string"
+    ? (payload.redirectUri ?? payload.redirect_uri)
+    : null;
+  const contributorCommit = typeof internalOptions?.commitProviderConnection === "function";
+  if (
+    contributorCommit
+    && (
+      !internalOptions.contributorReservationHash
+      || !state
+      || !codeVerifier
+      || !redirectUri
+    )
+  ) {
+    return NextResponse.json(
+      { error: "Contributor proxy requires its reservation, state, codeVerifier, and redirectUri" },
+      { status: 400 },
+    );
+  }
+
+  const result = provider === "xai"
+    ? await startXaiProxy(appPort, internalOptions.contributorReservationHash)
+    : await startCodexProxy(appPort, internalOptions.contributorReservationHash);
+  let serverSide = false;
+  if (result.success && state && codeVerifier && redirectUri) {
+    serverSide = provider === "xai"
+      ? registerXaiSession({
+          state,
+          codeVerifier,
+          redirectUri,
+          commitProviderConnection: internalOptions.commitProviderConnection,
+          contributorReservationHash: internalOptions.contributorReservationHash,
+        })
+      : registerCodexSession({
+          state,
+          codeVerifier,
+          redirectUri,
+          commitProviderConnection: internalOptions.commitProviderConnection,
+          contributorReservationHash: internalOptions.contributorReservationHash,
+        });
+  }
+  if (result.success && contributorCommit && !serverSide) {
+    if (provider === "xai") stopXaiProxy(internalOptions.contributorReservationHash);
+    else stopCodexProxy(internalOptions.contributorReservationHash);
+    return NextResponse.json(
+      { error: "Unable to register the contributor proxy session" },
+      { status: 409 },
+    );
+  }
+  return NextResponse.json({ ...result, serverSide });
+}
+
 async function completeXaiManualCode(code, state, internalOptions = {}) {
-  const session = state ? getXaiSessionStatus(state) : null;
+  if (!code) throw new Error("Missing xAI authorization code");
+  const session = claimXaiSession(state, internalOptions.contributorReservationHash);
   if (!session) {
-    throw new Error("xAI OAuth session not found; restart the login flow and paste the code again");
+    const error = new Error("xAI OAuth session is missing or already being completed; restart the login flow");
+    error.status = 409;
+    throw error;
   }
   if (
     typeof internalOptions?.commitProviderConnection === "function"
@@ -72,8 +205,6 @@ async function completeXaiManualCode(code, state, internalOptions = {}) {
   ) {
     throw new OAuthConnectionCommitRejectedError();
   }
-  if (!code) throw new Error("Missing xAI authorization code");
-
   try {
     const tokenData = await exchangeTokens(
       "xai",
@@ -82,6 +213,9 @@ async function completeXaiManualCode(code, state, internalOptions = {}) {
       session.codeVerifier,
       state
     );
+    if (!isXaiSessionCurrent(state, session, internalOptions.contributorReservationHash)) {
+      throw new OAuthConnectionCommitRejectedError();
+    }
     const connection = await persistOAuthConnection({
       provider: "xai",
       authType: "oauth",
@@ -90,9 +224,16 @@ async function completeXaiManualCode(code, state, internalOptions = {}) {
         ? new Date(Date.now() + tokenData.expiresIn * 1000).toISOString()
         : null,
       testStatus: "active",
-    }, internalOptions);
-    clearXaiSession(state);
-    stopXaiProxy(internalOptions.contributorReservationHash);
+    }, {
+      ...internalOptions,
+      shouldCommit: () => isXaiSessionCurrent(
+        state,
+        session,
+        internalOptions.contributorReservationHash,
+      ),
+    });
+    clearXaiSession(state, session);
+    stopXaiProxy(internalOptions.contributorReservationHash, session._proxyGeneration);
     return {
       id: connection.id,
       provider: connection.provider,
@@ -100,8 +241,8 @@ async function completeXaiManualCode(code, state, internalOptions = {}) {
       displayName: connection.displayName,
     };
   } catch (err) {
-    clearXaiSession(state);
-    stopXaiProxy(internalOptions.contributorReservationHash);
+    clearXaiSession(state, session);
+    stopXaiProxy(internalOptions.contributorReservationHash, session._proxyGeneration);
     throw err;
   }
 }
@@ -119,8 +260,14 @@ export async function GET(request, { params }, internalOptions = {}) {
     const { searchParams } = new URL(request.url);
 
     if (action === "authorize") {
+      // Authorization endpoints are GETs and their URLs are commonly retained
+      // by browsers, reverse proxies and access logs. Secrets belong only in
+      // the bounded POST /exchange body.
+      if (searchParams.has("clientSecret") || searchParams.has("client_secret")) {
+        return NextResponse.json({ error: "OAuth client secrets are not accepted in authorize URLs" }, { status: 400 });
+      }
       const redirectUri = searchParams.get("redirect_uri") || "http://localhost:8080/callback";
-      // Collect provider-specific meta params (e.g. gitlab passes baseUrl, clientId, clientSecret)
+      // Collect provider-specific public metadata (e.g. GitLab baseUrl/clientId).
       const reservedParams = new Set(["redirect_uri"]);
       const meta = {};
       searchParams.forEach((value, key) => { if (!reservedParams.has(key)) meta[key] = value; });
@@ -134,6 +281,12 @@ export async function GET(request, { params }, internalOptions = {}) {
     }
 
     if (action === "start-proxy") {
+      if (START_PROXY_QUERY_PRIVATE_KEYS.some((key) => searchParams.has(key))) {
+        return NextResponse.json(
+          { error: "OAuth state, verifier, and tokens are not accepted in start-proxy URLs" },
+          { status: 400 },
+        );
+      }
       // Trae/Windsurf/Zed use a dynamic-port local callback server (singleton session,
       // state is registered separately via /register-session after /authorize).
       if (provider === "trae") {
@@ -156,58 +309,9 @@ export async function GET(request, { params }, internalOptions = {}) {
       if (!["codex", "xai"].includes(provider)) {
         return NextResponse.json({ error: "Proxy only supported for codex/xai/trae/windsurf/zed" }, { status: 400 });
       }
-      const appPort = searchParams.get("app_port");
-      if (!appPort) {
-        return NextResponse.json({ error: "Missing app_port" }, { status: 400 });
-      }
-      const state = searchParams.get("state");
-      const codeVerifier = searchParams.get("code_verifier");
-      const redirectUri = searchParams.get("redirect_uri");
-      const contributorCommit = typeof internalOptions?.commitProviderConnection === "function";
-      if (
-        contributorCommit
-        && (
-          !internalOptions.contributorReservationHash
-          || !state
-          || !codeVerifier
-          || !redirectUri
-        )
-      ) {
-        return NextResponse.json(
-          { error: "Contributor proxy requires its reservation, state, code_verifier, and redirect_uri" },
-          { status: 400 },
-        );
-      }
-      const result = provider === "xai"
-        ? await startXaiProxy(Number(appPort), internalOptions.contributorReservationHash)
-        : await startCodexProxy(Number(appPort), internalOptions.contributorReservationHash);
-      let serverSide = false;
-      if (result.success && state && codeVerifier && redirectUri) {
-        serverSide = provider === "xai"
-          ? registerXaiSession({
-              state,
-              codeVerifier,
-              redirectUri,
-              commitProviderConnection: internalOptions.commitProviderConnection,
-              contributorReservationHash: internalOptions.contributorReservationHash,
-            })
-          : registerCodexSession({
-              state,
-              codeVerifier,
-              redirectUri,
-              commitProviderConnection: internalOptions.commitProviderConnection,
-              contributorReservationHash: internalOptions.contributorReservationHash,
-            });
-      }
-      if (result.success && contributorCommit && !serverSide) {
-        if (provider === "xai") stopXaiProxy();
-        else stopCodexProxy();
-        return NextResponse.json(
-          { error: "Unable to register the contributor proxy session" },
-          { status: 409 },
-        );
-      }
-      return NextResponse.json({ ...result, serverSide });
+      return startFixedCallbackProxy(provider, {
+        appPort: searchParams.get("app_port"),
+      }, internalOptions);
     }
 
     if (action === "poll-status") {
@@ -326,8 +430,11 @@ export async function GET(request, { params }, internalOptions = {}) {
 
     return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   } catch (error) {
-    console.log("OAuth GET error:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    logOAuthFailure("OAuth GET error", error);
+    return NextResponse.json(
+      { error: oauthPublicErrorMessage(error) },
+      { status: oauthErrorStatus(error) },
+    );
   }
 }
 
@@ -338,16 +445,47 @@ export async function POST(request, { params }, internalOptions = {}) {
     const { provider, action } = await params;
     let body;
     try {
-      body = await request.json();
-    } catch {
+      body = await readRequestJson(request, {
+        maxBytes: MAX_OAUTH_REQUEST_BODY_BYTES,
+        label: "OAuth request body",
+        requireBody: true,
+      });
+    } catch (error) {
+      const status = Number(error?.status);
+      if ([408, 413, 499].includes(status)) {
+        return NextResponse.json({ error: error.message }, { status });
+      }
       return NextResponse.json({ error: "Invalid or empty request body" }, { status: 400 });
     }
 
-    if (action === "register-session") {
-      // Register proxy session out of URL query (state) + body (codeVerifier).
-      // Zed's codeVerifier encodes the RSA private key — must stay out of URL/logs.
+    if (action === "start-proxy") {
       const searchParams = new URL(request.url).searchParams;
-      const state = searchParams.get("state") || body?.state;
+      if (START_PROXY_QUERY_PRIVATE_KEYS.some((key) => searchParams.has(key))) {
+        return NextResponse.json(
+          { error: "OAuth state, verifier, and tokens are not accepted in start-proxy URLs" },
+          { status: 400 },
+        );
+      }
+      if (!["codex", "xai"].includes(provider)) {
+        return NextResponse.json(
+          { error: "POST start-proxy is only supported for codex/xai" },
+          { status: 400 },
+        );
+      }
+      return startFixedCallbackProxy(provider, body, internalOptions);
+    }
+
+    if (action === "register-session") {
+      // Session state and Zed's RSA private-key verifier must stay in the POST
+      // body so browser, reverse-proxy, and access logs never retain them.
+      const searchParams = new URL(request.url).searchParams;
+      if (START_PROXY_QUERY_PRIVATE_KEYS.some((key) => searchParams.has(key))) {
+        return NextResponse.json(
+          { error: "OAuth state, verifier, and tokens are not accepted in register-session URLs" },
+          { status: 400 },
+        );
+      }
+      const state = body?.state;
       if (!state) return NextResponse.json({ error: "Missing state" }, { status: 400 });
       if (
         typeof internalOptions?.commitProviderConnection === "function"
@@ -415,7 +553,11 @@ export async function POST(request, { params }, internalOptions = {}) {
             }
           });
         } catch (err) {
-          return NextResponse.json({ error: err.message }, { status: oauthErrorStatus(err) });
+          logOAuthFailure("OAuth exchange error", err);
+          return NextResponse.json(
+            { error: oauthPublicErrorMessage(err) },
+            { status: oauthErrorStatus(err) },
+          );
         }
       }
 
@@ -546,14 +688,13 @@ export async function POST(request, { params }, internalOptions = {}) {
         });
       }
 
-      // Still pending or error - don't create connection for pending states
-      const isPending = result.pending || result.error === "authorization_pending" || result.error === "slow_down";
-      
+      // Still pending or error - don't create a connection. Provider payloads
+      // may reflect the submitted device code or client secret, so return only
+      // stable public codes and descriptions.
+      const publicFailure = publicPollFailure(result);
       return NextResponse.json({
         success: false,
-        error: result.error,
-        errorDescription: result.errorDescription,
-        pending: isPending,
+        ...publicFailure,
       });
     }
 
@@ -572,7 +713,10 @@ export async function POST(request, { params }, internalOptions = {}) {
 
     return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   } catch (error) {
-    console.log("OAuth POST error:", error);
-    return NextResponse.json({ error: error.message }, { status: oauthErrorStatus(error) });
+    logOAuthFailure("OAuth POST error", error);
+    return NextResponse.json(
+      { error: oauthPublicErrorMessage(error) },
+      { status: oauthErrorStatus(error) },
+    );
   }
 }

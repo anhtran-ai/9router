@@ -3,7 +3,13 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { commandCodeToOpenAIResponse } from "../translator/response/commandcode-to-openai.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
-import { cancelReaderBestEffort } from "../utils/reader.js";
+import {
+  cancelReaderBestEffort,
+  MAX_STREAM_FRAME_CHARS,
+  readReaderWithDeadline,
+  ReaderDeadlineError,
+} from "../utils/reader.js";
+import { FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 
 /**
  * CommandCodeExecutor — talks to https://api.commandcode.ai/alpha/generate
@@ -43,7 +49,10 @@ export class CommandCodeExecutor extends BaseExecutor {
   async execute(opts) {
     const result = await super.execute(opts);
     if (!result?.response?.ok || !result.response.body) return result;
-    result.response = await inspectAndWrapCommandCodeResponse(result.response, opts.model);
+    result.response = await inspectAndWrapCommandCodeResponse(result.response, opts.model, {
+      signal: opts.signal,
+      firstFrameTimeoutMs: this.config?.timeoutMs || FETCH_CONNECT_TIMEOUT_MS,
+    });
     return result;
   }
 
@@ -124,29 +133,65 @@ export function parseCommandCodeError(event) {
   return { statusCode, message, type };
 }
 
-export async function inspectAndWrapCommandCodeResponse(originalResponse, model) {
+function publicCommandCodeError(statusCode) {
+  if (statusCode === 401) return { message: "CommandCode authentication failed", type: "authentication_error" };
+  if (statusCode === 402) return { message: "CommandCode billing limit reached", type: "billing_error" };
+  if (statusCode === 403) return { message: "CommandCode request is not permitted", type: "permission_error" };
+  if (statusCode === 404) return { message: "CommandCode model or endpoint was not found", type: "invalid_request_error" };
+  if (statusCode === 429) return { message: "CommandCode rate limit reached", type: "rate_limit_error" };
+  if (statusCode === 503) return { message: "CommandCode is temporarily unavailable", type: "server_error" };
+  return { message: "CommandCode upstream request failed", type: "upstream_error" };
+}
+
+export async function inspectAndWrapCommandCodeResponse(
+  originalResponse,
+  model,
+  { signal, firstFrameTimeoutMs = FETCH_CONNECT_TIMEOUT_MS } = {},
+) {
   const reader = originalResponse.body.getReader();
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
   const bufferedLines = [];
+  let bufferedChars = 0;
   let detectedError = null;
+  const deadlineAt = Date.now() + firstFrameTimeoutMs;
+  const bufferLine = line => {
+    const nextSize = bufferedChars + line.length + (bufferedLines.length ? 1 : 0);
+    if (line.length > MAX_STREAM_FRAME_CHARS || nextSize > MAX_STREAM_FRAME_CHARS) {
+      const error = new Error("CommandCode stream prelude exceeds size limit");
+      error.code = "upstream_stream_frame_too_large";
+      throw error;
+    }
+    bufferedChars = nextSize;
+    bufferedLines.push(line);
+  };
 
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await readReaderWithDeadline(reader, {
+        signal,
+        deadlineAt,
+        label: "CommandCode first stream event",
+      });
       if (done) {
+        buffer += decoder.decode();
         const trimmed = buffer.trim();
         if (trimmed) {
+          if (trimmed.length > MAX_STREAM_FRAME_CHARS) {
+            const error = new Error("CommandCode stream prelude exceeds size limit");
+            error.code = "upstream_stream_frame_too_large";
+            throw error;
+          }
           try {
             const jsonStr = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
             const parsed = JSON.parse(jsonStr);
             if (parsed?.type === "error") {
               detectedError = parsed;
             } else {
-              bufferedLines.push(trimmed);
+              bufferLine(trimmed);
             }
           } catch {
-            bufferedLines.push(trimmed);
+            bufferLine(trimmed);
           }
         }
         break;
@@ -155,6 +200,11 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
+      if (buffer.length > MAX_STREAM_FRAME_CHARS) {
+        const error = new Error("CommandCode stream prelude exceeds size limit");
+        error.code = "upstream_stream_frame_too_large";
+        throw error;
+      }
 
       let stopLoop = false;
       let lineIndex = 0;
@@ -162,9 +212,14 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
         const line = lines[lineIndex];
         const trimmed = line.trim();
         if (!trimmed) continue;
+        if (trimmed.length > MAX_STREAM_FRAME_CHARS) {
+          const error = new Error("CommandCode stream prelude exceeds size limit");
+          error.code = "upstream_stream_frame_too_large";
+          throw error;
+        }
         const jsonStr = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
         if (!jsonStr || jsonStr === "[DONE]") {
-          bufferedLines.push(trimmed);
+          bufferLine(trimmed);
           stopLoop = true;
           break;
         }
@@ -173,7 +228,7 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
         try {
           event = JSON.parse(jsonStr);
         } catch {
-          bufferedLines.push(trimmed);
+          bufferLine(trimmed);
           continue;
         }
 
@@ -183,7 +238,7 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
           break;
         }
 
-        bufferedLines.push(trimmed);
+        bufferLine(trimmed);
 
         if (
           event?.type === "text-delta" ||
@@ -199,23 +254,39 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
       }
 
       if (stopLoop) {
-        const unreadLines = lines.slice(lineIndex + 1).join("\n");
-        if (unreadLines) buffer = buffer ? `${unreadLines}\n${buffer}` : unreadLines;
+        const completeUnreadLines = lines.slice(lineIndex + 1);
+        if (completeUnreadLines.length > 0) {
+          const unreadPrefix = `${completeUnreadLines.join("\n")}\n`;
+          buffer = `${unreadPrefix}${buffer}`;
+        }
         break;
       }
     }
-  } catch {
-    try { reader.releaseLock(); } catch { /* ignore */ }
-    return originalResponse;
+  } catch (error) {
+    cancelReaderBestEffort(reader, "CommandCode stream prelude rejected");
+    if (signal?.aborted) throw error;
+    const timedOut = error instanceof ReaderDeadlineError;
+    return new Response(
+      JSON.stringify({ error: {
+        message: timedOut ? "CommandCode first stream event timed out" : "Invalid CommandCode stream prelude",
+        type: "upstream_error",
+        code: timedOut ? "upstream_stream_timeout" : "invalid_upstream_response",
+      } }),
+      {
+        status: timedOut ? 504 : 502,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      },
+    );
   }
 
   if (detectedError) {
     cancelReaderBestEffort(reader, "CommandCode error event");
-    const { statusCode, message, type } = parseCommandCodeError(detectedError);
+    const { statusCode } = parseCommandCodeError(detectedError);
+    const { message, type } = publicCommandCodeError(statusCode);
     return new Response(
       JSON.stringify({
         error: {
-          message: `[CommandCode error: ${message}]`,
+          message,
           type,
           code: statusCode,
         },
@@ -274,12 +345,13 @@ function createReplayedStream(bufferedLines, remainingBuffer, reader) {
 }
 
 function wrapNdjsonAsOpenAISse(streamBody, model, originalResponse = null) {
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   const encoder = new TextEncoder();
   let buffer = "";
   const state = { model };
   let terminalSeen = false;
   let failed = false;
+  let doneEmitted = false;
 
   const emitChunks = (chunks, controller) => {
     if (!chunks) return;
@@ -302,12 +374,22 @@ function wrapNdjsonAsOpenAISse(streamBody, model, originalResponse = null) {
     })}\n\n`));
   };
 
+  const emitDone = controller => {
+    if (doneEmitted) return;
+    doneEmitted = true;
+    controller.enqueue(encoder.encode(SSE_DONE));
+  };
+
   const processLine = (line, controller) => {
     if (failed) return;
     const trimmed = line.trim();
     if (!trimmed) return;
     const jsonText = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
-    if (!jsonText || jsonText === "[DONE]") return;
+    if (!jsonText) return;
+    if (jsonText === "[DONE]") {
+      terminalSeen = true;
+      return;
+    }
 
     let event;
     try { event = JSON.parse(jsonText); } catch {
@@ -328,20 +410,49 @@ function wrapNdjsonAsOpenAISse(streamBody, model, originalResponse = null) {
 
   const transform = new TransformStream({
     transform(chunk, controller) {
-      buffer += decoder.decode(chunk, { stream: true });
+      try {
+        buffer += decoder.decode(chunk, { stream: true });
+      } catch {
+        emitFailure(controller, "commandcode_malformed_stream", "invalid CommandCode stream encoding");
+        controller.terminate();
+        return;
+      }
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
+        if (line.length > MAX_STREAM_FRAME_CHARS) {
+          emitFailure(controller, "commandcode_frame_too_large", "CommandCode stream event exceeds size limit");
+          controller.terminate();
+          return;
+        }
         processLine(line, controller);
+        if (failed) {
+          controller.terminate();
+          return;
+        }
+        if (terminalSeen) {
+          emitDone(controller);
+          controller.terminate();
+          return;
+        }
+      }
+      if (buffer.length > MAX_STREAM_FRAME_CHARS) {
+        emitFailure(controller, "commandcode_frame_too_large", "CommandCode stream event exceeds size limit");
+        controller.terminate();
       }
     },
     flush(controller) {
+      try { buffer += decoder.decode(); } catch {
+        emitFailure(controller, "commandcode_malformed_stream", "invalid CommandCode stream encoding");
+      }
       const trimmed = buffer.trim();
-      if (trimmed) processLine(trimmed, controller);
+      if (!failed && trimmed.length > MAX_STREAM_FRAME_CHARS) {
+        emitFailure(controller, "commandcode_frame_too_large", "CommandCode stream event exceeds size limit");
+      } else if (!failed && trimmed) processLine(trimmed, controller);
       if (!failed && !terminalSeen) {
         emitFailure(controller, "commandcode_missing_terminal", "CommandCode stream ended without a finish event");
       }
-      controller.enqueue(encoder.encode(SSE_DONE));
+      emitDone(controller);
     },
   });
 

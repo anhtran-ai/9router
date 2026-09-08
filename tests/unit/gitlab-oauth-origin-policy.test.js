@@ -31,20 +31,52 @@ function jsonResponse(body, init = {}) {
 }
 
 describe("GitLab OAuth origin policy", () => {
+  it.each([
+    "javascript:alert(document.domain)",
+    "ftp://gitlab.example",
+    "https://user:password@gitlab.example",
+    "https://gitlab.example/root?redirect=javascript:alert(1)",
+    "https://gitlab.example/root#javascript:alert(1)",
+  ])("rejects unsafe authorize base URL %s before returning a browser URL", (baseUrl) => {
+    let error;
+    try {
+      gitlab.buildAuthUrl(
+        gitlab.config,
+        "http://localhost:20128/callback",
+        "state",
+        "challenge",
+        { baseUrl, clientId: "admin-client" },
+      );
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ status: 400 });
+    expect(error?.message).toMatch(/GitLab base URL/i);
+  });
+
+  it("builds a self-hosted authorize URL only after normalizing its HTTP origin", () => {
+    const authUrl = gitlab.buildAuthUrl(
+      gitlab.config,
+      "http://localhost:20128/callback",
+      "state",
+      "challenge",
+      { baseUrl: "https://gitlab.example/root/", clientId: "admin-client" },
+    );
+
+    const parsed = new URL(authUrl);
+    expect(`${parsed.origin}${parsed.pathname}`).toBe("https://gitlab.example/root/oauth/authorize");
+    expect(parsed.searchParams.get("client_id")).toBe("admin-client");
+    expect(parsed.searchParams.get("state")).toBe("state");
+  });
+
   it("preserves explicit self-hosted GitLab for the administrator OAuth flow", async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          access_token: "gitlab-access-token",
-          refresh_token: "gitlab-refresh-token",
-          expires_in: 3600,
-        }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ username: "admin-approved-user" }),
-      });
+      .mockResolvedValueOnce(jsonResponse({
+        access_token: "gitlab-access-token",
+        refresh_token: "gitlab-refresh-token",
+        expires_in: 3600,
+      }))
+      .mockResolvedValueOnce(jsonResponse({ username: "admin-approved-user" }));
     vi.stubGlobal("fetch", fetchMock);
 
     const tokens = await gitlab.exchangeToken(
@@ -206,5 +238,44 @@ describe("GitLab OAuth origin policy", () => {
     expect(requestSignal.aborted).toBe(true);
     expect(readerCancel).toHaveBeenCalledOnce();
     expect(bodyCancel).toHaveBeenCalledOnce();
+  });
+
+  it("does not call unbounded text/json fallbacks on response-like objects", async () => {
+    const text = vi.fn(async () => "secret=" + "x".repeat(2 * 1024 * 1024));
+    const json = vi.fn(async () => ({ access_token: "should-not-be-read" }));
+    const cancel = vi.fn();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      bodyUsed: false,
+      body: { cancel },
+      text,
+      json,
+    }));
+
+    await expect(exchangeToken()).rejects.toThrow(/not stream-readable/i);
+    expect(text).not.toHaveBeenCalled();
+    expect(json).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("stops awaiting an abort-ignoring fetch and cancels its late response", async () => {
+    vi.useFakeTimers();
+    let resolveFetch;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise((resolve) => { resolveFetch = resolve; })));
+
+    const resultPromise = exchangeToken();
+    const rejection = expect(resultPromise).rejects.toThrow(/request timeout/i);
+    await vi.advanceTimersByTimeAsync(15_000);
+    await rejection;
+
+    const lateResponse = jsonResponse({ access_token: "late-secret" });
+    const cancel = vi.spyOn(lateResponse.body, "cancel");
+    resolveFetch(lateResponse);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });

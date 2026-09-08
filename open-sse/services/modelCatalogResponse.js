@@ -32,6 +32,24 @@ export function cancelModelCatalogBody(response, reason) {
   cancelBody(response?.body, reason);
 }
 
+/**
+ * Race a model-catalog fetch against its deadline and dispose a Response that
+ * arrives after the caller has stopped waiting. awaitWithSignal observes late
+ * rejections; this additional handler prevents a late successful response from
+ * leaving its body and transport open.
+ */
+export function awaitModelCatalogResponse(responsePromise, signal) {
+  const pending = Promise.resolve(responsePromise);
+  if (!signal) return pending;
+  pending.then(
+    (response) => {
+      if (signal.aborted) cancelModelCatalogBody(response, abortReason(signal));
+    },
+    () => {},
+  );
+  return awaitWithSignal(pending, signal);
+}
+
 function declaredBodyLength(response) {
   const raw = response?.headers?.get?.("content-length");
   if (raw == null || !/^\d+$/.test(String(raw).trim())) return null;

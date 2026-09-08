@@ -138,6 +138,26 @@ describe("streaming response contract", () => {
     expect(result.trackDone).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects an oversized unterminated SSE frame before consuming an unbounded stream", async () => {
+    let pulls = 0;
+    const input = new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(encoder.encode(`${pulls === 1 ? "data: " : ""}${"x".repeat(64 * 1024)}`));
+        if (pulls >= 40) controller.close();
+      },
+    }, { highWaterMark: 0 });
+
+    const result = await run(input);
+    const text = await result.response.text();
+
+    expect(text).toContain("event: error");
+    expect(text).not.toContain("event: message_stop");
+    expect(result.onRequestFailure).toHaveBeenCalledTimes(1);
+    expect(result.onStreamComplete).not.toHaveBeenCalled();
+    expect(pulls).toBeLessThan(40);
+  });
+
   it.each([FORMATS.CLAUDE, FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES])("holds Claude terminal metadata until message_stop for %s", async (source) => {
     const result = await run(events([claudeStart, ...textBlock, claudeEnd()[0]]), { target: FORMATS.CLAUDE, source });
     const text = await result.response.text();

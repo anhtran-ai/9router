@@ -7,8 +7,26 @@ import {
 } from "../config/grokCli.js";
 import { refreshProviderCredentials } from "./oauthCredentialManager.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import { awaitWithSignal } from "../utils/abort.js";
+import {
+  awaitModelCatalogResponse,
+  cancelModelCatalogBody,
+  readModelCatalogJson,
+  ModelCatalogBodyTooLargeError,
+} from "./modelCatalogResponse.js";
 
 const MODELS_URL = `${GROK_CLI_BASE_URL}/models`;
+const FETCH_TIMEOUT_MS = 10_000;
+
+function publicDiscoveryFailure(error) {
+  if (error instanceof ModelCatalogBodyTooLargeError) return error.message;
+  if (error?.name === "TimeoutError") return "Grok CLI model discovery timed out.";
+  if (error?.name === "AbortError") return "Grok CLI model discovery was cancelled.";
+  if (error instanceof SyntaxError || error instanceof TypeError) {
+    return "Grok CLI returned an invalid model catalog.";
+  }
+  return "Grok CLI model discovery failed.";
+}
 
 function modelEntries(data) {
   const value = Array.isArray(data) ? data : data?.data ?? data?.models ?? data?.results ?? [];
@@ -76,32 +94,44 @@ export async function resolveGrokCliModels(credentials, options = {}) {
     log = console,
     proxyOptions = null,
     onCredentialsRefreshed,
+    signal: callerSignal = null,
   } = options;
   let accessToken = credentials?.accessToken;
   if (!accessToken) return { models: [], warning: "Grok CLI access token is missing." };
 
-  const request = (token) => fetchFn(
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(new DOMException("Grok CLI model discovery timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  const signal = callerSignal
+    ? AbortSignal.any([callerSignal, controller.signal])
+    : controller.signal;
+
+  const request = (token) => awaitModelCatalogResponse(fetchFn(
     MODELS_URL,
     {
       method: "GET",
       headers: buildHeaders(token, credentials?.providerSpecificData),
+      signal,
     },
     proxyOptions,
-  );
+  ), signal);
 
   try {
     let response = await request(accessToken);
     if ((response.status === 401 || response.status === 403) && credentials?.refreshToken) {
-      const refreshed = await refreshProviderCredentials(
+      cancelModelCatalogBody(response, new Error("Retrying Grok CLI model discovery"));
+      const refreshed = await awaitWithSignal(refreshProviderCredentials(
         "grok-cli",
         credentials,
         log,
         proxyOptions,
-      );
+      ), signal);
       if (refreshed?.accessToken) {
         accessToken = refreshed.accessToken;
         try {
-          await onCredentialsRefreshed?.(refreshed);
+          await awaitWithSignal(onCredentialsRefreshed?.(refreshed), signal);
         } catch (error) {
           log?.warn?.("Grok CLI credential persistence failed", error);
         }
@@ -110,18 +140,20 @@ export async function resolveGrokCliModels(credentials, options = {}) {
     }
 
     if (!response.ok) {
-      const detail = await response.text().catch(() => "");
+      cancelModelCatalogBody(response, new Error("Grok CLI model discovery failed"));
       return {
         models: [],
-        warning: `Grok CLI model discovery failed (${response.status})${detail ? `: ${detail.slice(0, 160)}` : ""}`,
+        warning: `Grok CLI model discovery failed (${response.status}).`,
       };
     }
 
-    const models = parseGrokCliModels(await response.json());
+    const models = parseGrokCliModels(await readModelCatalogJson(response, { signal }));
     return models.length
       ? { models }
       : { models: [], warning: "Grok CLI returned no selectable models." };
   } catch (error) {
-    return { models: [], warning: `Grok CLI model discovery failed: ${error.message}` };
+    return { models: [], warning: publicDiscoveryFailure(error) };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }

@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { XAI_CONFIG, XAI_PKCE_VERIFIER_BYTES } from "../constants/xai.js";
 import { validateXaiOAuthEndpoint, decodeXaiIdTokenEmail } from "../providerHelpers.js";
+import { requestXaiOAuthJson } from "../utils/xaiHttp.js";
 
 // Inlined from services/xai.js to keep web route bundle free of `open` (CLI-only) package
 let cachedXaiDiscovery = null;
@@ -8,9 +9,13 @@ let cachedXaiDiscovery = null;
 async function discoverXaiEndpoints() {
   if (cachedXaiDiscovery) return cachedXaiDiscovery;
   try {
-    const res = await fetch(XAI_CONFIG.discoveryUrl, { headers: { Accept: "application/json" } });
-    if (res.ok) {
-      const data = await res.json();
+    const result = await requestXaiOAuthJson(
+      XAI_CONFIG.discoveryUrl,
+      { headers: { Accept: "application/json" } },
+      { label: "xAI endpoint discovery" },
+    );
+    if (result.ok) {
+      const data = result.data;
       cachedXaiDiscovery = {
         authorizeUrl: validateXaiOAuthEndpoint(data.authorization_endpoint, "authorization_endpoint"),
         tokenUrl: validateXaiOAuthEndpoint(data.token_endpoint, "token_endpoint"),
@@ -57,25 +62,28 @@ const xai = {
     return `${config.authorizeUrl}?${qs}`;
   },
   exchangeToken: async (config, code, redirectUri, codeVerifier) => {
-    const response = await fetch(config.tokenUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        client_id: config.clientId,
-        code,
-        redirect_uri: redirectUri,
-        code_verifier: codeVerifier,
-      }),
-    });
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`xAI token exchange failed: ${error}`);
+    try {
+      const result = await requestXaiOAuthJson(config.tokenUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: config.clientId,
+          code,
+          redirect_uri: redirectUri,
+          code_verifier: codeVerifier,
+        }),
+      }, { label: "xAI token exchange" });
+      if (!result.ok || !result.data?.access_token) {
+        throw new Error("xAI token exchange was rejected");
+      }
+      return result.data;
+    } catch {
+      throw new Error("xAI token exchange failed");
     }
-    return await response.json();
   },
   mapTokens: (tokens) => {
     const mapped = {

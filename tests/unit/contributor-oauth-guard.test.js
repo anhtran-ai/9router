@@ -313,14 +313,23 @@ describe("contributor OAuth guard", () => {
 
   it("rejects a fixed-port contributor proxy without server-side registration", async () => {
     mocks.session.invite.allowedProviders.push("codex");
-    mocks.upstreamGet.mockResolvedValueOnce(Response.json({
+    mocks.upstreamPost.mockResolvedValueOnce(Response.json({
       success: true,
       port: 1455,
       serverSide: false,
     }));
 
-    const response = await route.GET(
-      request("GET", "https://router.example", { action: "start-proxy", provider: "codex" }),
+    const response = await route.POST(
+      request("POST", "https://router.example", {
+        action: "start-proxy",
+        provider: "codex",
+        body: {
+          appPort: 3210,
+          state: "body-state",
+          codeVerifier: "body-verifier",
+          redirectUri: "http://localhost:1455/auth/callback",
+        },
+      }),
       context("codex", "start-proxy"),
     );
 
@@ -329,6 +338,41 @@ describe("contributor OAuth guard", () => {
       "invite-1",
       { sessionId: "session-1", leaseId: "lease-1" },
     );
+    expect(mocks.release).not.toHaveBeenCalled();
+  });
+
+  it("supports contributor fixed-proxy start through bounded POST JSON", async () => {
+    mocks.session.invite.allowedProviders.push("codex");
+    mocks.upstreamPost.mockImplementationOnce(async (upstreamRequest, _context, internalOptions) => {
+      expect(upstreamRequest.method).toBe("POST");
+      await expect(upstreamRequest.json()).resolves.toEqual({
+        appPort: 3210,
+        state: "body-state",
+        codeVerifier: "body-verifier",
+        redirectUri: "http://localhost:1455/auth/callback",
+      });
+      expect(internalOptions.contributorReservationHash).toBe("lease-hash-1");
+      expect(internalOptions.commitProviderConnection).toEqual(expect.any(Function));
+      return Response.json({ success: true, port: 1455, serverSide: true });
+    });
+
+    const response = await route.POST(
+      request("POST", "https://router.example", {
+        action: "start-proxy",
+        provider: "codex",
+        body: {
+          appPort: 3210,
+          state: "body-state",
+          codeVerifier: "body-verifier",
+          redirectUri: "http://localhost:1455/auth/callback",
+        },
+      }),
+      context("codex", "start-proxy"),
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.reserve).toHaveBeenCalledWith("invite-1", "session-1");
+    expect(mocks.cancel).not.toHaveBeenCalled();
     expect(mocks.release).not.toHaveBeenCalled();
   });
 

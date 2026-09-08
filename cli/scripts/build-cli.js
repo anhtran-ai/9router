@@ -148,6 +148,28 @@ function assertRequiredApiArtifacts(cliAppDir) {
   }
 }
 
+function ensureSqlJsWasmInBundle(appDir, rootDir, cliAppDir) {
+  const relativeAsset = path.join("sql.js", "dist", "sql-wasm.wasm");
+  const destination = path.join(cliAppDir, "node_modules", relativeAsset);
+  if (fs.existsSync(destination)) return destination;
+
+  const source = [
+    path.join(appDir, "node_modules", relativeAsset),
+    path.join(rootDir, "node_modules", relativeAsset),
+  ].find((candidate) => fs.existsSync(candidate));
+
+  if (!source) {
+    throw new Error(
+      "Required CLI SQL.js runtime asset is missing; expected sql.js/dist/sql-wasm.wasm " +
+      "in the app or workspace node_modules",
+    );
+  }
+
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(source, destination);
+  return destination;
+}
+
 function buildCliPackage() {
   console.log("📦 Building 9Router CLI package with Next.js...\n");
 
@@ -246,6 +268,13 @@ function buildCliPackage() {
     console.log(`✅ Bundled ${pkg}`);
   }
   ensureModuleInBundle("sql.js");
+  try {
+    ensureSqlJsWasmInBundle(appDir, rootDir, cliAppDir);
+    console.log("✅ SQL.js WebAssembly runtime bundled");
+  } catch (error) {
+    console.error(`❌ ${error.message}`);
+    process.exit(1);
+  }
   // `open` is external (see serverExternalPackages in next.config.mjs), so it must exist in
   // the bundle's node_modules or every importer throws MODULE_NOT_FOUND at runtime. Output
   // tracing normally copies it; this is the same belt-and-braces guard used for sql.js.
@@ -346,6 +375,7 @@ function buildCliPackage() {
 module.exports = {
   assertRequiredApiArtifacts,
   copyStandaloneBuild,
+  ensureSqlJsWasmInBundle,
   mergeServerArtifacts,
 };
 

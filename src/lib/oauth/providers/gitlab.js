@@ -5,6 +5,27 @@ const GITLAB_RESPONSE_MAX_BYTES = 1024 * 1024;
 const GITLAB_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+function normalizeGitLabBaseUrl(value) {
+  const invalid = (message) => {
+    const error = new Error(message);
+    error.status = 400;
+    return error;
+  };
+  let parsed;
+  try {
+    parsed = new URL(String(value || "").trim());
+  } catch {
+    throw invalid("GitLab base URL must be a valid HTTP or HTTPS URL");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw invalid("GitLab base URL must use HTTP or HTTPS");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw invalid("GitLab base URL cannot contain credentials, query parameters, or fragments");
+  }
+  return parsed.toString().replace(/\/+$/, "");
+}
+
 function discardBody(response) {
   if (!response?.body || response.bodyUsed === true) return;
   try {
@@ -28,8 +49,8 @@ function releaseReader(reader) {
   try { reader.releaseLock?.(); } catch { /* a pending read releases after cancellation settles */ }
 }
 
-function readWithSignal(reader, signal) {
-  if (!signal) return reader.read();
+function awaitWithSignal(operation, signal) {
+  if (!signal) return Promise.resolve(operation);
   if (signal.aborted) {
     return Promise.reject(signal.reason instanceof Error
       ? signal.reason
@@ -43,15 +64,24 @@ function readWithSignal(reader, signal) {
       : new DOMException("Request aborted", "AbortError"));
     signal.addEventListener("abort", onAbort, { once: true });
   });
-  return Promise.race([reader.read(), aborted])
+  return Promise.race([operation, aborted])
     .finally(() => signal.removeEventListener("abort", onAbort));
 }
 
+function readWithSignal(reader, signal) {
+  return awaitWithSignal(reader.read(), signal);
+}
+
 async function readBoundedText(response, maxBytes, signal) {
-  if (!response?.body?.getReader) {
-    if (typeof response?.text === "function") return await response.text();
-    if (typeof response?.json === "function") return JSON.stringify(await response.json());
-    return "";
+  if (!response?.body) return "";
+  if (typeof response.body.getReader !== "function") {
+    // Fetch Response bodies are streams. Refuse response-like fallbacks whose
+    // text()/json() methods cannot be bounded while they allocate their body.
+    throw new Error("GitLab response body is not stream-readable");
+  }
+  const contentLength = Number(response.headers?.get?.("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new Error("GitLab response body is too large");
   }
 
   const reader = response.body.getReader();
@@ -110,11 +140,18 @@ async function requestGitLab(url, init, approvedOrigin) {
         throw new Error("GitLab OAuth redirect origin is not approved");
       }
 
-      response = await fetch(currentUrl, {
+      const fetchPromise = Promise.resolve().then(() => fetch(currentUrl, {
         ...currentInit,
         redirect: "manual",
         signal,
-      });
+      }));
+      // A custom transport may ignore AbortSignal. Stop awaiting at the
+      // deadline and discard any response that arrives after cancellation.
+      fetchPromise.then(
+        (lateResponse) => { if (signal.aborted) discardBody(lateResponse); },
+        () => {},
+      );
+      response = await awaitWithSignal(fetchPromise, signal);
       const location = REDIRECT_STATUSES.has(response.status)
         ? response.headers?.get?.("location")
         : null;
@@ -160,7 +197,7 @@ const gitlab = {
   config: GITLAB_CONFIG,
   flowType: "authorization_code_pkce",
   buildAuthUrl: (config, redirectUri, state, codeChallenge, meta = {}) => {
-    const baseUrl = meta.baseUrl || config.defaultBaseUrl;
+    const baseUrl = normalizeGitLabBaseUrl(meta.baseUrl || config.defaultBaseUrl);
     const clientId = meta.clientId || "";
     const params = new URLSearchParams({
       client_id: clientId,
@@ -174,11 +211,8 @@ const gitlab = {
     return `${baseUrl}${config.authorizeUrlPath}?${params.toString()}`;
   },
   exchangeToken: async (config, code, redirectUri, codeVerifier, state, meta = {}) => {
-    const baseUrl = meta.baseUrl || config.defaultBaseUrl;
+    const baseUrl = normalizeGitLabBaseUrl(meta.baseUrl || config.defaultBaseUrl);
     const parsedBaseUrl = new URL(baseUrl);
-    if (!["http:", "https:"].includes(parsedBaseUrl.protocol)) {
-      throw new Error("GitLab base URL must use HTTP or HTTPS");
-    }
     const approvedOrigin = parsedBaseUrl.origin;
     const clientId = meta.clientId || "";
     const clientSecret = meta.clientSecret || "";

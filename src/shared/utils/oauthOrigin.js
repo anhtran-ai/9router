@@ -1,4 +1,7 @@
 const HTTP_PROTOCOLS = new Set(["http:", "https:"]);
+const SAFE_AUTHORIZE_META_KEYS = {
+  gitlab: ["baseUrl", "clientId"],
+};
 
 function normalizeHostname(hostname) {
   const normalized = String(hostname || "").toLowerCase();
@@ -48,4 +51,14 @@ export function isTrustedOAuthMessageEvent(event, {
   if (!isTrustedOAuthMessageOrigin(event.origin, applicationOrigin, expectedCallbackOrigin)) return false;
   const callbackState = event.data?.data?.state;
   return typeof expectedState === "string" && expectedState.length > 0 && callbackState === expectedState;
+}
+
+/** Append only metadata that is safe to expose in the local authorize URL. */
+export function appendSafeOAuthAuthorizeMeta(url, provider, meta) {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return url;
+  for (const key of SAFE_AUTHORIZE_META_KEYS[provider] || []) {
+    const value = meta[key];
+    if (typeof value === "string" && value) url.searchParams.set(key, value);
+  }
+  return url;
 }

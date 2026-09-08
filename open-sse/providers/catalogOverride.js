@@ -13,7 +13,7 @@ export const CATALOG_FILE = path.join(DATA_DIR, "model-catalog.json");
 // Trimmed upstream catalog, read by the add-models skill (not by the router).
 export const CATALOG_RAW_FILE = path.join(DATA_DIR, "model-catalog-raw.json");
 
-const EMPTY = { models: {}, providers: {} };
+const EMPTY = { models: {}, fallbackModels: {}, providers: {} };
 let cache = EMPTY;
 let cachedMtime = -1;
 
@@ -38,17 +38,48 @@ function load() {
   cachedMtime = mtime;
   try {
     const parsed = JSON.parse(fs.readFileSync(CATALOG_FILE, "utf8"));
-    cache = { models: parsed?.models || {}, providers: parsed?.providers || {} };
+    cache = {
+      models: parsed?.models || {},
+      fallbackModels: parsed?.fallbackModels || {},
+      providers: parsed?.providers || {},
+    };
   } catch {
     cache = EMPTY;
   }
   return cache;
 }
 
-// Modality is a property of the model itself — any gateway serving it inherits
-// the same image/video/pdf support, so this is keyed by model id alone.
+// Backward-compatible model-only lookup for callers that do not know which
+// provider will serve the request. Routing code uses the scoped lookup below.
 export function getCatalogModalities(model) {
   return load().models[baseId(model)] || null;
+}
+
+function providerModalities(catalog, provider, model) {
+  const byProvider = catalog.providers[provider];
+  const normalized = baseId(model);
+  const hasExact = byProvider && Object.prototype.hasOwnProperty.call(byProvider, model);
+  const hasNormalized = byProvider && Object.prototype.hasOwnProperty.call(byProvider, normalized);
+  const entry = hasExact ? byProvider[model] : (hasNormalized ? byProvider[normalized] : null);
+
+  // An explicit empty provider record means models.dev observed this exact
+  // provider/model and declared no additive modalities. Only models absent from
+  // the registered provider snapshot may use the conservative global fallback.
+  if (!hasExact && !hasNormalized) return catalog.fallbackModels[normalized] || null;
+  const modalities = {};
+  for (const key of ["vision", "pdf", "audioInput", "videoInput"]) {
+    if (entry[key] === true) modalities[key] = true;
+  }
+  return Object.keys(modalities).length ? modalities : null;
+}
+
+// Provider-aware lookup used by request routing. Ambiguous majority data is
+// never reused across providers: ids such as "auto" can refer to unrelated
+// models on different gateways. A model absent from the registered provider
+// snapshot may use only the stricter all-providers-agree fallback.
+export function getProviderCatalogModalities(provider, model) {
+  if (!provider) return getCatalogModalities(model);
+  return providerModalities(load(), provider, model);
 }
 
 // Context and output limits are a property of the gateway, not the model: each
@@ -68,5 +99,11 @@ export function invalidateCatalog() {
 // too, so it cannot import this file directly — the server pushes it in.
 export async function installCatalogSource() {
   const { setCatalogSource } = await import("./capabilities.js");
-  setCatalogSource({ getModalities: getCatalogModalities, getLimits: getCatalogLimits });
+  setCatalogSource({
+    getModalities: getCatalogModalities,
+    getProviderModalities: getProviderCatalogModalities,
+    getLimits: getCatalogLimits,
+  });
 }
+
+export const __test__ = { providerModalities };

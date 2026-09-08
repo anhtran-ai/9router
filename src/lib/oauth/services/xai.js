@@ -5,6 +5,7 @@ import { XAI_CONFIG, XAI_PKCE_VERIFIER_BYTES } from "../constants/xai.js";
 import { startLocalServer } from "../utils/server.js";
 import { generateCodeVerifier, generateCodeChallenge, generateState } from "../utils/pkce.js";
 import { spinner as createSpinner } from "../utils/ui.js";
+import { requestXaiOAuthJson } from "../utils/xaiHttp.js";
 
 /**
  * xAI (Grok) OAuth Service
@@ -49,15 +50,18 @@ export function validateOAuthEndpoint(rawUrl, field) {
 /**
  * Discover authorization + token endpoints. Cached process-wide.
  */
-export async function discoverEndpoints() {
+export async function discoverEndpoints({ signal = null } = {}) {
   if (cachedDiscovery) return cachedDiscovery;
 
   try {
-    const res = await fetch(XAI_CONFIG.discoveryUrl, {
+    const result = await requestXaiOAuthJson(XAI_CONFIG.discoveryUrl, {
       headers: { Accept: "application/json" },
+    }, {
+      label: "xAI endpoint discovery",
+      signal,
     });
-    if (res.ok) {
-      const data = await res.json();
+    if (result.ok) {
+      const data = result.data;
       cachedDiscovery = {
         authorizeUrl: validateOAuthEndpoint(data.authorization_endpoint, "authorization_endpoint"),
         tokenUrl: validateOAuthEndpoint(data.token_endpoint, "token_endpoint"),
@@ -126,51 +130,69 @@ export class XaiService extends OAuthService {
    * Exchange authorization code for tokens.
    * xAI is a public PKCE client — no client_secret.
    */
-  async exchangeXaiCode({ tokenUrl, code, redirectUri, codeVerifier }) {
-    const res = await fetch(tokenUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        client_id: XAI_CONFIG.clientId,
-        code,
-        redirect_uri: redirectUri,
-        code_verifier: codeVerifier,
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`xAI token exchange failed: ${err}`);
+  async exchangeXaiCode({ tokenUrl, code, redirectUri, codeVerifier, signal = null }) {
+    try {
+      const result = await requestXaiOAuthJson(tokenUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: XAI_CONFIG.clientId,
+          code,
+          redirect_uri: redirectUri,
+          code_verifier: codeVerifier,
+        }),
+      }, {
+        label: "xAI token exchange",
+        signal,
+      });
+      if (!result.ok || !result.data?.access_token) {
+        throw new Error("xAI token exchange was rejected");
+      }
+      return result.data;
+    } catch {
+      throw new Error("xAI token exchange failed");
     }
-    return await res.json();
   }
 
   /**
    * Refresh an access token using a refresh_token.
    */
-  async refreshAccessToken(refreshToken) {
-    const { tokenUrl } = await discoverEndpoints();
-    const res = await fetch(tokenUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        client_id: XAI_CONFIG.clientId,
-        refresh_token: refreshToken,
-      }),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`xAI token refresh failed: ${err}`);
+  async refreshAccessToken(refreshToken, { signal = null } = {}) {
+    try {
+      const { tokenUrl } = await discoverEndpoints({ signal });
+      const result = await requestXaiOAuthJson(tokenUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: XAI_CONFIG.clientId,
+          refresh_token: refreshToken,
+        }),
+      }, {
+        label: "xAI token refresh",
+        signal,
+      });
+      if (!result.ok || !result.data?.access_token) {
+        const oauthCode = typeof result.data?.error === "string"
+          ? result.data.error.slice(0, 128)
+          : null;
+        const error = new Error("xAI token refresh was rejected");
+        if (oauthCode) error.oauthCode = oauthCode;
+        throw error;
+      }
+      return result.data;
+    } catch (error) {
+      const safeError = new Error("xAI token refresh failed");
+      if (error?.oauthCode) safeError.oauthCode = error.oauthCode;
+      throw safeError;
     }
-    return await res.json();
   }
 
   /**

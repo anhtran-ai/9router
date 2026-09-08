@@ -249,6 +249,66 @@ describe("Qoder OAuth response deadlines", () => {
   });
 });
 
+describe("Qoder PAT failure hardening", () => {
+  it("does not reflect a PAT exchange error body into exceptions, logs, or responses", async () => {
+    const originalFetch = globalThis.fetch;
+    const marker = "SENSITIVE_QODER_PAT_ERROR";
+    const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn() };
+    try {
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response(marker, { status: 401 }));
+      vi.resetModules();
+      const { resolveQoderCredentials } = await import("../../open-sse/services/qoderModels.js");
+      const { QoderExecutor } = await import("../../open-sse/executors/qoder.js");
+
+      await expect(resolveQoderCredentials({ apiKey: "pt-redaction-fixture" }))
+        .rejects.toMatchObject({ status: 401 });
+
+      const result = await new QoderExecutor().execute({
+        model: "qoder/auto",
+        body: { messages: [{ role: "user", content: "hello" }] },
+        stream: true,
+        credentials: { apiKey: "pt-redaction-executor-fixture" },
+        signal: null,
+        log,
+      });
+      const body = await result.response.text();
+
+      expect(body).not.toContain(marker);
+      expect(JSON.stringify(log.error.mock.calls)).not.toContain(marker);
+      expect(body).toContain("reconnect the account");
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.resetModules();
+    }
+  });
+
+  it("cancels a PAT exchange response that arrives after the deadline", async () => {
+    const originalFetch = globalThis.fetch;
+    vi.useFakeTimers();
+    let resolveFetch;
+    const cancel = vi.fn();
+    try {
+      globalThis.fetch = vi.fn(() => new Promise(resolve => { resolveFetch = resolve; }));
+      vi.resetModules();
+      const { resolveQoderCredentials } = await import("../../open-sse/services/qoderModels.js");
+      const pending = resolveQoderCredentials({ apiKey: "pt-late-response-fixture" });
+      const rejected = expect(pending).rejects.toMatchObject({ name: "TimeoutError" });
+      await vi.advanceTimersByTimeAsync(QODER_FETCH_TIMEOUT_MS + 1);
+      await rejected;
+
+      resolveFetch({ body: { cancel } });
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(cancel).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+      vi.resetModules();
+    }
+  });
+});
+
 describe("QODER_MODEL_MAP", () => {
   it("allows Qoder's latest model key", () => {
     expect(QODER_MODEL_MAP.qmodel_latest).toBe("qmodel_latest");
@@ -761,6 +821,160 @@ describe("wrapQoderSSE", () => {
 
     const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto");
     await expect(drain(wrapped)).resolves.toContain("data: [DONE]\n\n");
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes after finish_reason when Qoder omits [DONE] and keeps the socket open", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const inner = JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] });
+    const envelope = JSON.stringify({ statusCodeValue: 200, body: inner });
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${envelope}\n\n`));
+      },
+      cancel,
+    });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto");
+    const out = await Promise.race([
+      drain(wrapped),
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("Qoder finish_reason did not terminate the stream")),
+        250,
+      )),
+    ]);
+
+    expect(out).toContain(`data: ${inner}\n\n`);
+    expect(out.match(/data: \[DONE\]/g)).toHaveLength(1);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not drain Qoder upstream beyond downstream demand", async () => {
+    const encoder = new TextEncoder();
+    const cancel = vi.fn();
+    let pulls = 0;
+    const dataFrames = 20;
+    const source = new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        if (pulls <= dataFrames) {
+          const inner = JSON.stringify({ choices: [{ delta: { content: String(pulls) } }] });
+          const envelope = JSON.stringify({ statusCodeValue: 200, body: inner });
+          controller.enqueue(encoder.encode(`data: ${envelope}\n\n`));
+          return;
+        }
+        const terminal = JSON.stringify({ statusCodeValue: 200, body: "[DONE]" });
+        controller.enqueue(encoder.encode(`data: ${terminal}\n\n`));
+        controller.close();
+      },
+      cancel,
+    }, { highWaterMark: 0 });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto", {
+      firstFrameTimeoutMs: 100,
+    });
+
+    // The billing prelude peek needs one chunk. Constructing the wrapper may
+    // prefill one transformed frame, but must not read the second upstream one.
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(pulls).toBe(1);
+
+    const reader = wrapped.body.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain('"content":"1"');
+
+    // Once the first frame is consumed, the wrapper may prefetch exactly one
+    // more frame into its bounded queue; it must not continue draining.
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(pulls).toBeLessThanOrEqual(2);
+
+    await reader.cancel("test complete");
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("terminates a long non-emitting sequence of unsupported SSE fields", async () => {
+    const encoder = new TextEncoder();
+    const cancel = vi.fn();
+    let pulls = 0;
+    const source = new ReadableStream({
+      pull(controller) {
+        pulls += 1;
+        if (pulls === 1) {
+          const inner = JSON.stringify({ choices: [{ delta: { content: "first" } }] });
+          const envelope = JSON.stringify({ statusCodeValue: 200, body: inner });
+          controller.enqueue(encoder.encode(`data: ${envelope}\n\n`));
+          return;
+        }
+        if (pulls <= 1050) {
+          controller.enqueue(encoder.encode("event: heartbeat\n"));
+          return;
+        }
+        controller.close();
+      },
+      cancel,
+    }, { highWaterMark: 0 });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto", {
+      firstFrameTimeoutMs: 100,
+    });
+    const reader = wrapped.body.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain("first");
+
+    const failure = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("non-emitting stream did not terminate")), 1000)),
+    ]);
+    expect(new TextDecoder().decode(failure.value)).toContain("qoder_non_emitting_stream");
+    expect(pulls).toBeLessThan(1100);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("peeks past SSE comments and event fields to the first Qoder data frame", async () => {
+    const inner = JSON.stringify({ choices: [{ delta: { content: "after heartbeat" } }] });
+    const envelope = JSON.stringify({ statusCodeValue: 200, body: inner });
+    const terminal = JSON.stringify({ statusCodeValue: 200, body: "[DONE]" });
+    const wrapped = await wrapQoderSSE(makeResponse([
+      `: heartbeat\n\nevent: message\ndata: ${envelope}\n\ndata: ${terminal}\n\n`,
+    ]), "qoder/auto", { firstFrameTimeoutMs: 100 });
+
+    const out = await drain(wrapped);
+    expect(out).toContain("after heartbeat");
+    expect(out).toContain("data: [DONE]\n\n");
+  });
+
+  it("times out a stalled first frame without waiting for reader cancellation", async () => {
+    const cancel = vi.fn(() => new Promise(() => {}));
+    const source = new ReadableStream({ start() {}, cancel });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto", {
+      firstFrameTimeoutMs: 10,
+    });
+
+    expect(wrapped.status).toBe(504);
+    await expect(wrapped.json()).resolves.toMatchObject({
+      error: { code: "upstream_stream_timeout" },
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an oversized unterminated first frame", async () => {
+    const cancel = vi.fn();
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${"x".repeat(1024 * 1024 + 1)}`));
+      },
+      cancel,
+    });
+
+    const wrapped = await wrapQoderSSE(new Response(source), "qoder/auto", {
+      firstFrameTimeoutMs: 100,
+    });
+
+    expect(wrapped.status).toBe(502);
+    await expect(wrapped.json()).resolves.toMatchObject({
+      error: { code: "invalid_upstream_response" },
+    });
     expect(cancel).toHaveBeenCalledTimes(1);
   });
 

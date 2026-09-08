@@ -5,13 +5,94 @@ import { awaitWithSignal, throwIfAborted } from "../../utils/abort.js";
 import { dedupRefresh } from "./dedup.js";
 import { buildExternalIdpRefreshParams } from "../../../src/lib/oauth/kiroExternalIdp.js";
 import {
+  awaitModelCatalogResponse,
   readModelCatalogJson,
   readModelCatalogText,
 } from "../modelCatalogResponse.js";
 
 const TOKEN_REFRESH_BODY_LIMIT_BYTES = 256 * 1024;
+const TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 const COPILOT_REFRESH_TIMEOUT_MS = 10_000;
 const KIRO_REFRESH_TIMEOUT_MS = 30_000;
+
+// OAuth error bodies are controlled by remote servers and may reflect request
+// credentials. Only expose fixed, recognized codes to logs; status codes are
+// supplied by the local HTTP client and are safe to retain.
+const SAFE_REFRESH_ERROR_CODES = new Set([
+  "access_denied",
+  "authorization_pending",
+  "expired_token",
+  "insufficient_scope",
+  "invalid_client",
+  "invalid_grant",
+  "invalid_request",
+  "invalid_scope",
+  "invalid_token",
+  "refresh_token_expired",
+  "refresh_token_invalidated",
+  "refresh_token_reused",
+  "server_error",
+  "slow_down",
+  "temporarily_unavailable",
+  "unauthorized_client",
+  "unsupported_grant_type",
+  // CodeBuddy's documented device-flow pending response.
+  "11217",
+]);
+
+function allowlistedRefreshErrorCode(value) {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const normalized = String(value).trim().toLowerCase();
+  return SAFE_REFRESH_ERROR_CODES.has(normalized) ? normalized : null;
+}
+
+function refreshErrorCode(value) {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    const direct = allowlistedRefreshErrorCode(parsed);
+    if (direct) return direct;
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object") return null;
+  const candidates = [
+    parsed.error?.code,
+    parsed.error,
+    parsed.error_code,
+    parsed.code,
+  ];
+  for (const candidate of candidates) {
+    const code = allowlistedRefreshErrorCode(candidate);
+    if (code) return code;
+  }
+  return null;
+}
+
+function refreshFailureLog(status, upstreamValue, extra = null) {
+  const details = {};
+  if (Number.isInteger(status) && status >= 100 && status <= 599) {
+    details.status = status;
+  }
+  const code = refreshErrorCode(upstreamValue);
+  if (code) details.code = code;
+  if (extra && typeof extra === "object") Object.assign(details, extra);
+  return details;
+}
+
+function describeRefreshFailure(label, error) {
+  if (error?.name === "TimeoutError") return `${label} timed out`;
+  if (error?.name === "AbortError") return `${label} was aborted`;
+  if (error?.code === "ERR_MODEL_CATALOG_BODY_TOO_LARGE") {
+    return `${label} response was too large`;
+  }
+  if (error?.name === "SyntaxError") return `${label} returned malformed JSON`;
+  if (error?.name === "EncodingError") return `${label} returned invalid UTF-8`;
+  return `${label} failed`;
+}
 
 async function runTokenRefreshWithDeadline(label, timeoutMs, operation) {
   const controller = new AbortController();
@@ -52,26 +133,63 @@ async function readRefreshJson(response, signal) {
   return awaitWithSignal(response?.json?.() ?? Promise.reject(new TypeError("Missing JSON body")), signal);
 }
 
+export async function requestRefreshJson(label, url, init, log) {
+  try {
+    return await runTokenRefreshWithDeadline(label, TOKEN_REFRESH_TIMEOUT_MS, async (signal) => {
+      const response = await awaitModelCatalogResponse(
+        fetch(url, { ...init, signal }),
+        signal,
+      );
+      if (!response.ok) {
+        return {
+          response,
+          errorText: await readRefreshText(response, signal),
+          data: null,
+        };
+      }
+      return {
+        response,
+        errorText: "",
+        data: await readRefreshJson(response, signal),
+      };
+    });
+  } catch (error) {
+    log?.error?.("TOKEN_REFRESH", `Error during ${label}`, {
+      error: describeRefreshFailure(label, error),
+    });
+    return { transportError: error, response: null, errorText: "", data: null };
+  }
+}
+
 let _xaiServiceSingleton = null;
 export async function refreshXaiToken(refreshToken, log) {
   if (!refreshToken) return null;
   return dedupRefresh("xai", refreshToken, async () => {
     try {
-      if (!_xaiServiceSingleton) {
-        const mod = await import("../../../src/lib/oauth/services/xai.js");
-        _xaiServiceSingleton = new mod.XaiService();
-      }
-      const tokens = await _xaiServiceSingleton.refreshAccessToken(refreshToken);
-      return {
-        accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token || refreshToken,
-        expiresIn: tokens.expires_in,
-        idToken: tokens.id_token,
-      };
+      return await runTokenRefreshWithDeadline(
+        "xAI token refresh",
+        TOKEN_REFRESH_TIMEOUT_MS,
+        async (signal) => {
+          if (!_xaiServiceSingleton) {
+            const mod = await import("../../../src/lib/oauth/services/xai.js");
+            _xaiServiceSingleton = new mod.XaiService();
+          }
+          const tokens = await _xaiServiceSingleton.refreshAccessToken(refreshToken, { signal });
+          if (!tokens?.access_token) return null;
+          return {
+            accessToken: tokens.access_token,
+            refreshToken: tokens.refresh_token || refreshToken,
+            expiresIn: tokens.expires_in,
+            idToken: tokens.id_token,
+          };
+        },
+      );
     } catch (e) {
-      log?.warn?.("TOKEN_REFRESH", `xai refresh failed: ${e?.message || e}`);
-      const msg = String(e?.message || "");
-      if (msg.includes("invalid_grant") || msg.includes("invalid_request")) {
+      log?.warn?.("TOKEN_REFRESH", "xAI token refresh failed", {
+        error: describeRefreshFailure("xAI token refresh", e),
+      });
+      const code = String(e?.oauthCode || e?.cause?.oauthCode || "");
+      if (code === "invalid_grant" || code === "invalid_request") {
         return { error: "invalid_grant" };
       }
       return null;
@@ -155,21 +273,29 @@ export async function refreshAccessToken(provider, refreshToken, credentials, lo
       Accept: "application/json",
       ...(profile.extraHeaders ? (profile.extraHeaders(credentials, config) || {}) : {}),
     };
-    const response = await fetch(url, { method: "POST", headers, body });
+    const refreshResult = await requestRefreshJson(
+      `${provider} token refresh`,
+      url,
+      { method: "POST", headers, body },
+      log,
+    );
+    if (refreshResult.transportError) return null;
+    const { response, errorText, data: tokens } = refreshResult;
 
     if (!response.ok) {
-      const errorText = await response.text();
       log?.error?.("TOKEN_REFRESH", `Failed to refresh token for ${provider}`, {
-        status: response.status,
-        error: errorText,
+        ...refreshFailureLog(response.status, errorText),
       });
       return null;
     }
 
-    const tokens = await response.json();
+    if (!tokens?.access_token) {
+      log?.error?.("TOKEN_REFRESH", `Token refresh for ${provider} returned no access token`);
+      return null;
+    }
 
     log?.info?.("TOKEN_REFRESH", `Successfully refreshed token for ${provider}`, {
-      hasNewAccessToken: !!tokens.access_token,
+      hasNewAccessToken: true,
       hasNewRefreshToken: !!tokens.refresh_token,
       expiresIn: tokens.expires_in,
     });
@@ -182,7 +308,7 @@ export async function refreshAccessToken(provider, refreshToken, credentials, lo
     };
   } catch (error) {
     log?.error?.("TOKEN_REFRESH", `Error refreshing token for ${provider}`, {
-      error: error.message,
+      error: describeRefreshFailure(`${provider} token refresh`, error),
     });
     return null;
   }
@@ -200,7 +326,7 @@ export async function refreshClineToken(refreshToken, log) {
 
   return dedupRefresh("cline", refreshToken, async () => {
     try {
-      const response = await fetch(PROVIDERS.cline?.refreshUrl, {
+      const refreshResult = await requestRefreshJson("Cline token refresh", PROVIDERS.cline?.refreshUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -211,20 +337,22 @@ export async function refreshClineToken(refreshToken, log) {
           grantType: "refresh_token",
           clientType: "extension",
         }),
-      });
+      }, log);
+      if (refreshResult.transportError) return null;
+      const { response, errorText, data: body } = refreshResult;
 
       if (!response.ok) {
-        const errorText = await response.text();
         log?.error?.("TOKEN_REFRESH", "Failed to refresh Cline token", {
-          status: response.status,
-          error: errorText,
+          ...refreshFailureLog(response.status, errorText),
         });
         return null;
       }
 
-      const body = await response.json();
       const tokens = body?.data || body;
-      if (!tokens?.accessToken) return null;
+      if (!tokens?.accessToken) {
+        log?.error?.("TOKEN_REFRESH", "Cline token refresh returned no access token");
+        return null;
+      }
 
       const expiresIn = tokens.expiresAt
         ? Math.max(1, Math.floor((new Date(tokens.expiresAt).getTime() - Date.now()) / 1000))
@@ -236,7 +364,9 @@ export async function refreshClineToken(refreshToken, log) {
         expiresIn,
       };
     } catch (error) {
-      log?.error?.("TOKEN_REFRESH", `Error refreshing Cline token: ${error.message}`);
+      log?.error?.("TOKEN_REFRESH", "Error refreshing Cline token", {
+        error: describeRefreshFailure("Cline token refresh", error),
+      });
       return null;
     }
   }, log);
@@ -251,7 +381,7 @@ export async function refreshGoogleToken(refreshToken, clientId, clientSecret, l
   if (!refreshToken) return null;
   return dedupRefresh(`google:${clientId}`, refreshToken, async () => {
   try {
-    const response = await fetch(OAUTH_ENDPOINTS.google.token, {
+    const refreshResult = await requestRefreshJson("Google token refresh", OAUTH_ENDPOINTS.google.token, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -263,19 +393,27 @@ export async function refreshGoogleToken(refreshToken, clientId, clientSecret, l
         client_id: clientId,
         client_secret: clientSecret,
       }),
-    });
+    }, log);
+    if (refreshResult.transportError) return null;
+    const { response, errorText, data: tokens } = refreshResult;
 
     if (!response.ok) {
-      const errorText = await response.text();
-      log?.error?.("TOKEN_REFRESH", "Failed to refresh Google token", { status: response.status, error: errorText });
+      log?.error?.("TOKEN_REFRESH", "Failed to refresh Google token", {
+        ...refreshFailureLog(response.status, errorText),
+      });
       return null;
     }
 
-    const tokens = await response.json();
-    log?.info?.("TOKEN_REFRESH", "Successfully refreshed Google token", { hasNewAccessToken: !!tokens.access_token, expiresIn: tokens.expires_in });
+    if (!tokens?.access_token) {
+      log?.error?.("TOKEN_REFRESH", "Google token refresh returned no access token");
+      return null;
+    }
+    log?.info?.("TOKEN_REFRESH", "Successfully refreshed Google token", { hasNewAccessToken: true, expiresIn: tokens.expires_in });
     return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token || refreshToken, expiresIn: tokens.expires_in };
   } catch (error) {
-    log?.error?.("TOKEN_REFRESH", `Network error refreshing Google token: ${error.message}`);
+    log?.error?.("TOKEN_REFRESH", "Error refreshing Google token", {
+      error: describeRefreshFailure("Google token refresh", error),
+    });
     return null;
   }
   }, log);
@@ -306,7 +444,7 @@ export async function refreshCodexToken(refreshToken, log) {
   if (!refreshToken) return null;
   return dedupRefresh("codex", refreshToken, async () => {
     try {
-      const response = await fetch(OAUTH_ENDPOINTS.openai.token, {
+      const refreshResult = await requestRefreshJson("Codex token refresh", OAUTH_ENDPOINTS.openai.token, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -317,32 +455,35 @@ export async function refreshCodexToken(refreshToken, log) {
           grant_type: "refresh_token",
           refresh_token: refreshToken,
         }),
-      });
+      }, log);
+      if (refreshResult.transportError) return null;
+      const { response, errorText, data: tokens } = refreshResult;
 
       if (!response.ok) {
-        const errorText = await response.text();
         const failure = classifyOAuthRefreshError(errorText, response.status);
         if (failure.permanent) {
           log?.error?.("TOKEN_REFRESH", "Codex refresh token already used or invalid. Re-auth required.", {
-            status: response.status,
-            code: failure.code,
+            ...refreshFailureLog(response.status, failure.code),
           });
-          return { error: "unrecoverable_refresh_error", code: failure.code };
+          const safeCode = refreshErrorCode(errorText) || "invalid_grant";
+          return { error: "unrecoverable_refresh_error", code: safeCode };
         }
 
         log?.error?.("TOKEN_REFRESH", "Failed to refresh Codex token", {
-          status: response.status,
-          error: errorText,
-          code: failure.code,
-          permanent: failure.permanent,
+          ...refreshFailureLog(response.status, failure.code, {
+            permanent: failure.permanent,
+          }),
         });
         return null;
       }
 
-      const tokens = await response.json();
+      if (!tokens?.access_token) {
+        log?.error?.("TOKEN_REFRESH", "Codex token refresh returned no access token");
+        return null;
+      }
 
       log?.info?.("TOKEN_REFRESH", "Successfully refreshed Codex token", {
-        hasNewAccessToken: !!tokens.access_token,
+        hasNewAccessToken: true,
         hasNewRefreshToken: !!tokens.refresh_token,
         hasIdToken: !!tokens.id_token,
         expiresIn: tokens.expires_in,
@@ -355,7 +496,9 @@ export async function refreshCodexToken(refreshToken, log) {
         expiresIn: tokens.expires_in,
       };
     } catch (error) {
-      log?.error?.("TOKEN_REFRESH", `Network error refreshing Codex token: ${error.message}`);
+      log?.error?.("TOKEN_REFRESH", "Error refreshing Codex token", {
+        error: describeRefreshFailure("Codex token refresh", error),
+      });
       return null;
     }
   }, log);
@@ -366,9 +509,7 @@ async function resolveKiroProfileArnPatch(providerSpecificData, accessToken, ref
   let profileArn = refreshedArn?.trim?.() || null;
   if (!profileArn) {
     const { fetchKiroProfileArn } = await import("../../../src/lib/oauth/providers.js");
-    // The legacy helper does not accept a signal. Stop this refresh's wait at
-    // the deadline and keep observing the helper's eventual completion.
-    profileArn = await awaitWithSignal(fetchKiroProfileArn(accessToken), signal);
+    profileArn = await awaitWithSignal(fetchKiroProfileArn(accessToken, { signal }), signal);
   }
   return profileArn ? { providerSpecificData: { profileArn } } : {};
 }
@@ -395,11 +536,13 @@ export async function refreshKiroToken(
     try {
       refreshRequest = buildExternalIdpRefreshParams(refreshToken, providerSpecificData);
     } catch (error) {
-      log?.warn?.("TOKEN_REFRESH", `Invalid Kiro external_idp refresh config: ${error.message}`);
+      log?.warn?.("TOKEN_REFRESH", "Invalid Kiro external_idp refresh config", {
+        error: describeRefreshFailure("Kiro external_idp refresh config", error),
+      });
       return null;
     }
 
-    const response = await proxyAwareFetch(refreshRequest.tokenEndpoint, {
+    const response = await awaitModelCatalogResponse(proxyAwareFetch(refreshRequest.tokenEndpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -407,18 +550,21 @@ export async function refreshKiroToken(
       },
       body: refreshRequest.body,
       signal: refreshSignal,
-    }, proxyOptions);
+    }, proxyOptions), refreshSignal);
 
     if (!response.ok) {
       const errorText = await readRefreshText(response, refreshSignal);
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Kiro external_idp token", {
-        status: response.status,
-        error: errorText.slice(0, 4096),
+        ...refreshFailureLog(response.status, errorText),
       });
       return null;
     }
 
     const tokens = await readRefreshJson(response, refreshSignal);
+    if (!tokens?.access_token) {
+      log?.error?.("TOKEN_REFRESH", "Kiro external_idp refresh returned no access token");
+      return null;
+    }
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed Kiro external_idp token", {
       hasNewAccessToken: !!tokens.access_token,
@@ -440,7 +586,7 @@ export async function refreshKiroToken(
       ? `https://oidc.${region}.amazonaws.com/token`
       : "https://oidc.us-east-1.amazonaws.com/token";
 
-    const response = await proxyAwareFetch(endpoint, {
+    const response = await awaitModelCatalogResponse(proxyAwareFetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -453,18 +599,21 @@ export async function refreshKiroToken(
         grantType: "refresh_token",
       }),
       signal: refreshSignal,
-    }, proxyOptions);
+    }, proxyOptions), refreshSignal);
 
     if (!response.ok) {
       const errorText = await readRefreshText(response, refreshSignal);
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Kiro AWS token", {
-        status: response.status,
-        error: errorText.slice(0, 4096),
+        ...refreshFailureLog(response.status, errorText),
       });
       return null;
     }
 
     const tokens = await readRefreshJson(response, refreshSignal);
+    if (!tokens?.accessToken) {
+      log?.error?.("TOKEN_REFRESH", "Kiro AWS refresh returned no access token");
+      return null;
+    }
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed Kiro AWS token", {
       hasNewAccessToken: !!tokens.accessToken,
@@ -484,7 +633,7 @@ export async function refreshKiroToken(
     };
   }
 
-  const response = await proxyAwareFetch(PROVIDERS.kiro.tokenUrl, {
+  const response = await awaitModelCatalogResponse(proxyAwareFetch(PROVIDERS.kiro.tokenUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -495,18 +644,21 @@ export async function refreshKiroToken(
       refreshToken: refreshToken,
     }),
     signal: refreshSignal,
-  }, proxyOptions);
+  }, proxyOptions), refreshSignal);
 
   if (!response.ok) {
     const errorText = await readRefreshText(response, refreshSignal);
     log?.error?.("TOKEN_REFRESH", "Failed to refresh Kiro social token", {
-      status: response.status,
-      error: errorText.slice(0, 4096),
+      ...refreshFailureLog(response.status, errorText),
     });
     return null;
   }
 
   const tokens = await readRefreshJson(response, refreshSignal);
+  if (!tokens?.accessToken) {
+    log?.error?.("TOKEN_REFRESH", "Kiro social refresh returned no access token");
+    return null;
+  }
 
   log?.info?.("TOKEN_REFRESH", "Successfully refreshed Kiro social token", {
     hasNewAccessToken: !!tokens.accessToken,
@@ -527,7 +679,7 @@ export async function refreshKiroToken(
   });
   } catch (error) {
     log?.error?.("TOKEN_REFRESH", "Error refreshing Kiro token", {
-      error: error?.message || String(error),
+      error: describeRefreshFailure("Kiro token refresh", error),
     });
     return null;
   }
@@ -554,7 +706,7 @@ export async function refreshCopilotToken(githubAccessToken, log, requestOptions
         "Copilot token refresh",
         COPILOT_REFRESH_TIMEOUT_MS,
         async (refreshSignal) => {
-    const response = await fetch(PROVIDER_OAUTH["github"]?.copilotTokenUrl, {
+    const response = await awaitModelCatalogResponse(fetch(PROVIDER_OAUTH["github"]?.copilotTokenUrl, {
       headers: {
         "Authorization": `token ${githubAccessToken}`,
         "User-Agent": GITHUB_COPILOT.USER_AGENT,
@@ -564,18 +716,21 @@ export async function refreshCopilotToken(githubAccessToken, log, requestOptions
         "x-github-api-version": GITHUB_COPILOT.API_VERSION
       },
       signal: refreshSignal,
-    });
+    }), refreshSignal);
 
     if (!response.ok) {
       const errorText = await readRefreshText(response, refreshSignal);
       log?.error?.("TOKEN_REFRESH", "Failed to refresh Copilot token", {
-        status: response.status,
-        error: errorText.slice(0, 4096),
+        ...refreshFailureLog(response.status, errorText),
       });
       return null;
     }
 
     const data = await readRefreshJson(response, refreshSignal);
+    if (!data?.token) {
+      log?.error?.("TOKEN_REFRESH", "Copilot token refresh returned no token");
+      return null;
+    }
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed Copilot token", {
       hasToken: !!data.token,
@@ -590,7 +745,7 @@ export async function refreshCopilotToken(githubAccessToken, log, requestOptions
       );
     } catch (error) {
       log?.error?.("TOKEN_REFRESH", "Error refreshing Copilot token", {
-        error: error?.message || String(error),
+        error: describeRefreshFailure("Copilot token refresh", error),
       });
       return null;
     }
@@ -605,7 +760,7 @@ export async function refreshCodebuddyToken(refreshToken, log) {
   if (!refreshToken) return null;
   return dedupRefresh("codebuddy-cn", refreshToken, async () => {
     const oauth = PROVIDER_OAUTH["codebuddy-cn"] || {};
-    const response = await fetch(oauth.refreshUrl, {
+    const refreshResult = await requestRefreshJson("CodeBuddy token refresh", oauth.refreshUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -618,28 +773,26 @@ export async function refreshCodebuddyToken(refreshToken, log) {
         "X-Product": "SaaS",
       },
       body: "{}",
-    });
+    }, log);
+    if (refreshResult.transportError) return null;
+    const { response, errorText, data } = refreshResult;
 
     if (!response.ok) {
-      const errorText = await response.text();
       log?.error?.("TOKEN_REFRESH", "Failed to refresh CodeBuddy token", {
-        status: response.status,
-        error: errorText,
+        ...refreshFailureLog(response.status, errorText),
       });
       return null;
     }
 
-    const data = await response.json();
-    if (data.code !== 0 || !data.data?.accessToken) {
+    if (!data || typeof data !== "object" || Array.isArray(data) || data.code !== 0 || !data.data?.accessToken) {
       log?.error?.("TOKEN_REFRESH", "CodeBuddy token refresh returned no token", {
-        code: data.code,
-        msg: data.msg,
+        ...refreshFailureLog(null, data),
       });
       return null;
     }
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed CodeBuddy token", {
-      hasNewAccessToken: !!data.data.accessToken,
+      hasNewAccessToken: true,
       hasNewRefreshToken: !!data.data.refreshToken,
       expiresIn: data.data.expiresIn,
     });
@@ -656,7 +809,7 @@ export async function refreshCodebuddyIntlToken(refreshToken, log) {
   if (!refreshToken) return null;
   return dedupRefresh("codebuddy-intl", refreshToken, async () => {
     const oauth = PROVIDER_OAUTH["codebuddy-intl"] || {};
-    const response = await fetch(oauth.refreshUrl, {
+    const refreshResult = await requestRefreshJson("CodeBuddy intl token refresh", oauth.refreshUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -669,28 +822,26 @@ export async function refreshCodebuddyIntlToken(refreshToken, log) {
         "X-Product": "SaaS",
       },
       body: "{}",
-    });
+    }, log);
+    if (refreshResult.transportError) return null;
+    const { response, errorText, data } = refreshResult;
 
     if (!response.ok) {
-      const errorText = await response.text();
       log?.error?.("TOKEN_REFRESH", "Failed to refresh CodeBuddy intl token", {
-        status: response.status,
-        error: errorText,
+        ...refreshFailureLog(response.status, errorText),
       });
       return null;
     }
 
-    const data = await response.json();
-    if (data.code !== 0 || !data.data?.accessToken) {
+    if (!data || typeof data !== "object" || Array.isArray(data) || data.code !== 0 || !data.data?.accessToken) {
       log?.error?.("TOKEN_REFRESH", "CodeBuddy intl token refresh returned no token", {
-        code: data.code,
-        msg: data.msg,
+        ...refreshFailureLog(null, data),
       });
       return null;
     }
 
     log?.info?.("TOKEN_REFRESH", "Successfully refreshed CodeBuddy intl token", {
-      hasNewAccessToken: !!data.data.accessToken,
+      hasNewAccessToken: true,
       hasNewRefreshToken: !!data.data.refreshToken,
       expiresIn: data.data.expiresIn,
     });
@@ -716,7 +867,7 @@ export async function refreshTraeToken(refreshToken, credentials, log) {
 
   return dedupRefresh("trae", refreshToken, async () => {
     try {
-      const response = await fetch(url, {
+      const refreshResult = await requestRefreshJson("Trae token refresh", url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -729,22 +880,23 @@ export async function refreshTraeToken(refreshToken, credentials, log) {
           ClientSecret: oauth.clientSecret || "-",
           UserID: "",
         }),
-      });
+      }, log);
+      if (refreshResult.transportError) return null;
+      const { response, errorText, data: payload } = refreshResult;
 
       if (!response.ok) {
-        const errorText = await response.text();
         log?.error?.("TOKEN_REFRESH", "Failed to refresh Trae token", {
-          status: response.status,
-          error: errorText,
+          ...refreshFailureLog(response.status, errorText),
         });
         return null;
       }
 
-      const payload = await response.json();
       const result = payload?.Result || payload?.result || payload;
       const accessToken = result?.AccessToken || result?.accessToken;
       if (!accessToken) {
-        log?.error?.("TOKEN_REFRESH", "Trae refresh returned no AccessToken", { payload });
+        log?.error?.("TOKEN_REFRESH", "Trae refresh returned no AccessToken", {
+          ...refreshFailureLog(null, payload),
+        });
         return null;
       }
 
@@ -759,7 +911,7 @@ export async function refreshTraeToken(refreshToken, credentials, log) {
       }
 
       log?.info?.("TOKEN_REFRESH", "Successfully refreshed Trae token", {
-        hasNewAccessToken: !!accessToken,
+        hasNewAccessToken: true,
         hasNewRefreshToken: newRefresh !== refreshToken,
         expiresIn,
       });
@@ -770,7 +922,9 @@ export async function refreshTraeToken(refreshToken, credentials, log) {
         expiresIn,
       };
     } catch (error) {
-      log?.error?.("TOKEN_REFRESH", `Error refreshing Trae token: ${error.message}`);
+      log?.error?.("TOKEN_REFRESH", "Error refreshing Trae token", {
+        error: describeRefreshFailure("Trae token refresh", error),
+      });
       return null;
     }
   }, log);

@@ -1,4 +1,9 @@
 import { buildClineHeaders } from "../shared/clineAuth.js";
+import {
+  awaitModelCatalogResponse,
+  cancelModelCatalogBody,
+  readModelCatalogJson,
+} from "./modelCatalogResponse.js";
 
 const CLINEPASS_MODELS_ENDPOINT = "https://api.cline.bot/api/v1/models";
 const FETCH_TIMEOUT_MS = 5000;
@@ -24,26 +29,35 @@ function buildModelListHeaders(token, isApiKey) {
  * @param {object} credentials - Connection credentials ({ accessToken, apiKey })
  * @returns {Promise<{ models: { id: string, name: string }[] } | null>}
  */
-export async function resolveClinepassModels(credentials) {
+export async function resolveClinepassModels(credentials, options = {}) {
   const isApiKey = Boolean(credentials?.apiKey);
   const token = isApiKey ? credentials.apiKey : credentials?.accessToken;
   if (!token) return null;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("ClinePass model discovery timed out", "TimeoutError")),
+    FETCH_TIMEOUT_MS,
+  );
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, controller.signal])
+    : controller.signal;
 
   try {
     const headers = buildModelListHeaders(token, isApiKey);
 
-    const response = await fetch(CLINEPASS_MODELS_ENDPOINT, {
+    const response = await awaitModelCatalogResponse(fetch(CLINEPASS_MODELS_ENDPOINT, {
       method: "GET",
       headers,
-      signal: controller.signal,
-    });
+      signal,
+    }), signal);
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      cancelModelCatalogBody(response);
+      return null;
+    }
 
-    const json = await response.json();
+    const json = await readModelCatalogJson(response, { signal });
     const rawList = Array.isArray(json) ? json : json?.data;
     if (!Array.isArray(rawList)) return null;
 

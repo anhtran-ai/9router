@@ -29,7 +29,12 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
-import { cancelReaderBestEffort } from "../utils/reader.js";
+import {
+  cancelReaderBestEffort,
+  MAX_STREAM_FRAME_CHARS,
+  readReaderWithDeadline,
+  ReaderDeadlineError,
+} from "../utils/reader.js";
 import { FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import {
   QODER_CHAT_URL_ENCODED,
@@ -40,6 +45,9 @@ import {
 import { getQoderModelConfig, resolveQoderModels, isQoderPat, resolveQoderCredentials } from "../services/qoderModels.js";
 import { OPENAI_BLOCK, CLAUDE_BLOCK } from "../translator/schema/blocks.js";
 import { encodeDataUri } from "../translator/concerns/image.js";
+import { awaitModelCatalogResponse } from "../services/modelCatalogResponse.js";
+
+const MAX_NON_EMITTING_LINES = 1024;
 
 /**
  * Hoist role:"system" messages out of the messages array (Qoder rejects
@@ -283,10 +291,15 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
  * Signatures: code 112 (quota exhausted), code 10605 (queue throttle), pricingUrl field.
  */
 function isBillingBlock(inner) {
-  if (!inner || typeof inner !== "string") return false;
+  return billingBlockCode(inner) !== null;
+}
+
+function billingBlockCode(inner) {
+  if (!inner || typeof inner !== "string") return null;
   const lowerMsg = inner.toLowerCase();
-  // Match: {"code":"112",...}, {"code":"10605",...}, or pricingUrl field
-  return /\"code\"\s*:\s*\"(112|10605)\"/.test(inner) || lowerMsg.includes("pricingurl");
+  const match = inner.match(/\"code\"\s*:\s*\"(112|10605)\"/);
+  if (match) return match[1];
+  return lowerMsg.includes("pricingurl") ? "billing_required" : null;
 }
 
 /**
@@ -295,18 +308,12 @@ function isBillingBlock(inner) {
  * byte read so far (including the peeked line) so the caller can re-process
  * it and nothing is dropped from the stream.
  */
-async function peekFirstQoderFrame(reader, decoder) {
+async function peekFirstQoderFrame(reader, decoder, { signal, deadlineAt } = {}) {
   let consumed = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) return { isBilling: false, consumed, upstreamDone: true };
-
-    consumed += decoder.decode(value, { stream: true });
-    const nl = consumed.indexOf("\n");
-    if (nl === -1) continue; // need a full line first
-
-    const line = consumed.slice(0, nl).replace(/\r$/, "").trim();
-    if (!line.startsWith("data:")) continue;
+  let scanOffset = 0;
+  const inspectLine = rawLine => {
+    const line = rawLine.replace(/\r$/, "").trim();
+    if (!line.startsWith("data:")) return null;
 
     const data = line.slice(5).trimStart();
     if (data === "[DONE]") return { isBilling: false, consumed };
@@ -316,11 +323,39 @@ async function peekFirstQoderFrame(reader, decoder) {
 
     const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
     const inner = typeof envelope.body === "string" ? envelope.body : "";
-
-    if (statusVal !== 200 && isBillingBlock(inner)) {
-      return { isBilling: true, statusVal, message: inner || `qoder billing block (${statusVal})` };
+    const billingCode = billingBlockCode(inner);
+    if (statusVal !== 200 && billingCode) {
+      return { isBilling: true, statusVal, billingCode };
     }
     return { isBilling: false, consumed };
+  };
+
+  while (true) {
+    let nl;
+    while ((nl = consumed.indexOf("\n", scanOffset)) !== -1) {
+      const inspected = inspectLine(consumed.slice(scanOffset, nl));
+      scanOffset = nl + 1;
+      if (inspected) return inspected;
+    }
+
+    const { done, value } = await readReaderWithDeadline(reader, { signal, deadlineAt, label: "Qoder first stream frame" });
+    if (done) {
+      consumed += decoder.decode();
+      if (consumed.length > MAX_STREAM_FRAME_CHARS) {
+        const error = new Error("Qoder first stream frame exceeds size limit");
+        error.code = "upstream_stream_frame_too_large";
+        throw error;
+      }
+      const inspected = scanOffset < consumed.length ? inspectLine(consumed.slice(scanOffset)) : null;
+      return inspected || { isBilling: false, consumed, upstreamDone: true };
+    }
+
+    consumed += decoder.decode(value, { stream: true });
+    if (consumed.length > MAX_STREAM_FRAME_CHARS) {
+      const error = new Error("Qoder first stream frame exceeds size limit");
+      error.code = "upstream_stream_frame_too_large";
+      throw error;
+    }
   }
 }
 
@@ -343,32 +378,73 @@ async function peekFirstQoderFrame(reader, decoder) {
  * If detected, return 403 response so chatCore marks connection unavailable
  * and triggers combo fallback instead of leaking error text into chat.
  */
-async function wrapQoderSSE(response, model) {
+async function wrapQoderSSE(response, model, { signal, firstFrameTimeoutMs = FETCH_CONNECT_TIMEOUT_MS } = {}) {
   if (!response.ok || !response.body) return response;
 
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   const reader = response.body.getReader();
 
   // Peek first frame to detect billing block
-  const peek = await peekFirstQoderFrame(reader, decoder);
+  let peek;
+  try {
+    peek = await peekFirstQoderFrame(reader, decoder, {
+      signal,
+      deadlineAt: Date.now() + firstFrameTimeoutMs,
+    });
+  } catch (error) {
+    cancelReaderBestEffort(reader, "Qoder first stream frame rejected");
+    if (signal?.aborted) throw error;
+    const timedOut = error instanceof ReaderDeadlineError;
+    return new Response(
+      JSON.stringify({ error: {
+        message: timedOut ? "Qoder first stream frame timed out" : "Invalid Qoder stream prelude",
+        code: timedOut ? "upstream_stream_timeout" : "invalid_upstream_response",
+      } }),
+      { status: timedOut ? 504 : 502, headers: { "Content-Type": "application/json" } },
+    );
+  }
   if (peek?.isBilling) {
     // Billing block detected — return 403 so chatCore fails this connection
     cancelReaderBestEffort(reader, "Qoder billing block");
     return new Response(
-      JSON.stringify({ error: { message: peek.message, code: peek.statusVal } }),
+      JSON.stringify({
+        error: {
+          message: peek.billingCode === "billing_required"
+            ? "Qoder billing action is required"
+            : `Qoder quota or billing limit reached (${peek.billingCode})`,
+          code: peek.billingCode || "qoder_billing_block",
+        },
+      }),
       { status: 403, headers: { "Content-Type": "application/json" } }
     );
   }
 
   // Normal flow: re-process every byte the peek consumed, then continue.
   let buffer = peek.consumed || "";
-  const upstreamDrained = peek.upstreamDone === true;
+  let upstreamDone = peek.upstreamDone === true;
+  let decoderFlushed = upstreamDone;
   const encoder = new TextEncoder();
   let doneEmitted = false;
   let terminalSeen = false;
+  let closed = false;
+  let readerCancelled = false;
+  let consecutiveIgnoredLines = 0;
+
+  const cancelUpstream = reason => {
+    if (readerCancelled) return;
+    readerCancelled = true;
+    cancelReaderBestEffort(reader, reason);
+  };
+
+  const closeStream = (controller, reason) => {
+    if (closed) return;
+    closed = true;
+    try { controller.close(); } catch { /* downstream already cancelled */ }
+    cancelUpstream(reason);
+  };
 
   const emitFailure = (controller, code, reason) => {
-    if (doneEmitted) return;
+    if (doneEmitted) return false;
     const error = {
       error: {
         message: `Invalid upstream response: ${reason}`,
@@ -379,136 +455,161 @@ async function wrapQoderSSE(response, model) {
     controller.enqueue(encoder.encode(`data: ${JSON.stringify(error)}\n\n`));
     controller.enqueue(encoder.encode(SSE_DONE));
     doneEmitted = true;
+    return true;
   };
 
   // Process one already-extracted SSE line (no trailing newline).
   const processLine = (line, controller) => {
+    if (line.length > MAX_STREAM_FRAME_CHARS) {
+      return emitFailure(controller, "qoder_frame_too_large", "Qoder stream event exceeds size limit");
+    }
     const trimmed = line.replace(/\r$/, "").trim();
-    if (!trimmed) return;
-    if (!trimmed.startsWith("data:")) return;
-    if (doneEmitted) return;
+    if (!trimmed) return false;
+    if (trimmed.startsWith(":")) {
+      // Preserve SSE heartbeats as real queued output so an upstream that only
+      // sends comments remains governed by downstream backpressure.
+      controller.enqueue(encoder.encode(`${trimmed}\n\n`));
+      return true;
+    }
+    if (!trimmed.startsWith("data:")) return false;
+    if (doneEmitted) return false;
 
     const data = trimmed.slice(5).trimStart();
     if (data === "[DONE]") {
       controller.enqueue(encoder.encode(SSE_DONE));
       terminalSeen = true;
       doneEmitted = true;
-      return;
+      return true;
     }
 
     let envelope;
     try { envelope = JSON.parse(data); } catch {
-      emitFailure(controller, "qoder_malformed_stream", "malformed Qoder envelope");
-      return;
+      return emitFailure(controller, "qoder_malformed_stream", "malformed Qoder envelope");
     }
     if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
-      emitFailure(controller, "qoder_malformed_stream", "invalid Qoder envelope");
-      return;
+      return emitFailure(controller, "qoder_malformed_stream", "invalid Qoder envelope");
     }
     const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
     const inner = typeof envelope.body === "string" ? envelope.body : "";
     if (statusVal !== 200) {
-      emitFailure(controller, "qoder_upstream_error", `Qoder returned status ${statusVal}`);
-      return;
+      return emitFailure(controller, "qoder_upstream_error", `Qoder returned status ${statusVal}`);
     }
     if (!inner) {
-      emitFailure(controller, "qoder_malformed_stream", "Qoder envelope had no response body");
-      return;
+      return emitFailure(controller, "qoder_malformed_stream", "Qoder envelope had no response body");
     }
     if (inner === "[DONE]") {
       controller.enqueue(encoder.encode(SSE_DONE));
       terminalSeen = true;
       doneEmitted = true;
-      return;
+      return true;
     }
     // Strip embedded newlines so the SSE frame stays a single event.
     const sanitized = inner.replace(/\r?\n/g, "");
     let innerEvent;
     try { innerEvent = JSON.parse(sanitized); } catch {
-      emitFailure(controller, "qoder_malformed_stream", "malformed Qoder response event");
-      return;
+      return emitFailure(controller, "qoder_malformed_stream", "malformed Qoder response event");
     }
     if (!innerEvent || typeof innerEvent !== "object" || Array.isArray(innerEvent)) {
-      emitFailure(controller, "qoder_malformed_stream", "invalid Qoder response event");
-      return;
+      return emitFailure(controller, "qoder_malformed_stream", "invalid Qoder response event");
     }
     if (innerEvent.error) {
-      emitFailure(controller, "qoder_upstream_error", "Qoder returned an error event");
-      return;
+      return emitFailure(controller, "qoder_upstream_error", "Qoder returned an error event");
     }
-    if (innerEvent.choices?.some?.(choice => typeof choice?.finish_reason === "string" && choice.finish_reason)) {
-      terminalSeen = true;
-    }
+    const hasTerminalChoice = innerEvent.choices?.some?.(
+      choice => typeof choice?.finish_reason === "string" && choice.finish_reason,
+    );
     controller.enqueue(encoder.encode(`data: ${sanitized}\n\n`));
+    if (hasTerminalChoice) {
+      // Qoder can keep the socket open after the logical final chunk without
+      // sending its outer [DONE] envelope. Complete the client protocol here
+      // so non-streaming drains and streaming clients cannot wait forever.
+      controller.enqueue(encoder.encode(SSE_DONE));
+      terminalSeen = true;
+      doneEmitted = true;
+    }
+    return true;
   };
 
   const stream = new ReadableStream({
-    // Use start()+loop (not pull): a pull that buffers a partial line without
-    // enqueueing would never be re-invoked, hanging consumers like .text().
-    async start(controller) {
+    // Keep reading inside one pull until a complete outward frame is available.
+    // Returning immediately after that enqueue lets downstream demand govern how
+    // quickly the upstream reader is drained, while comments and partial lines
+    // cannot leave a pending consumer stuck waiting for another pull callback.
+    async pull(controller) {
+      if (closed) return;
+
       try {
-        // Drain whatever the peek already pulled off the socket first.
-        let nlSeed;
-        while ((nlSeed = buffer.indexOf("\n")) !== -1) {
-          const line = buffer.slice(0, nlSeed);
-          buffer = buffer.slice(nlSeed + 1);
-          processLine(line, controller);
-          if (doneEmitted) {
-            cancelReaderBestEffort(reader, "Qoder terminal frame");
-            controller.close();
+        while (!closed) {
+          const nl = buffer.indexOf("\n");
+          if (nl !== -1) {
+            const line = buffer.slice(0, nl);
+            buffer = buffer.slice(nl + 1);
+            const emitted = processLine(line, controller);
+            if (doneEmitted) {
+              closeStream(controller, "Qoder terminal frame");
+              return;
+            }
+            if (emitted) {
+              consecutiveIgnoredLines = 0;
+              return;
+            }
+            consecutiveIgnoredLines += 1;
+            if (consecutiveIgnoredLines >= MAX_NON_EMITTING_LINES) {
+              emitFailure(controller, "qoder_non_emitting_stream", "Qoder stream sent too many non-data lines");
+              closeStream(controller, "non-emitting Qoder stream");
+              return;
+            }
+            continue;
+          }
+
+          if (upstreamDone) {
+            if (buffer.length > 0) {
+              const trailingLine = buffer;
+              buffer = "";
+              const emitted = processLine(trailingLine, controller);
+              if (doneEmitted) {
+                closeStream(controller, "Qoder terminal frame");
+                return;
+              }
+              if (emitted) return;
+            }
+
+            if (!terminalSeen) {
+              emitFailure(controller, "qoder_missing_terminal", "Qoder stream ended without a terminal event");
+            }
+            closeStream(controller, "Qoder stream finished");
             return;
           }
-        }
-        if (upstreamDrained) {
-          // Peek hit end-of-stream: flush any trailing partial line.
-          buffer += decoder.decode();
-          if (buffer.length > 0) {
-            processLine(buffer, controller);
-            buffer = "";
-          }
-        }
 
-        while (!doneEmitted && !upstreamDrained) {
           const { done, value } = await reader.read();
+          if (closed) return;
           if (done) {
-            buffer += decoder.decode();
-            if (buffer.length > 0) {
-              processLine(buffer, controller);
-              buffer = "";
+            upstreamDone = true;
+            if (!decoderFlushed) {
+              buffer += decoder.decode();
+              decoderFlushed = true;
             }
-            break;
+            continue;
           }
 
           buffer += decoder.decode(value, { stream: true });
-          let nl;
-          while ((nl = buffer.indexOf("\n")) !== -1) {
-            const line = buffer.slice(0, nl);
-            buffer = buffer.slice(nl + 1);
-            processLine(line, controller);
-            if (doneEmitted) {
-              // Terminal frame received — drop upstream keepalive and end.
-              cancelReaderBestEffort(reader, "Qoder terminal frame");
-              controller.close();
-              return;
-            }
+          if (!buffer.includes("\n") && buffer.length > MAX_STREAM_FRAME_CHARS) {
+            emitFailure(controller, "qoder_frame_too_large", "Qoder stream event exceeds size limit");
+            closeStream(controller, "oversized Qoder stream event");
+            return;
           }
         }
       } catch {
+        if (closed) return;
         try {
           emitFailure(controller, "qoder_stream_interrupted", "Qoder stream was interrupted");
         } catch { /* downstream already cancelled */ }
-      } finally {
-        if (!doneEmitted && !terminalSeen) {
-          try {
-            emitFailure(controller, "qoder_missing_terminal", "Qoder stream ended without a terminal event");
-          } catch { /* already closed */ }
-        }
-        try { controller.close(); } catch { /* already closed */ }
-        cancelReaderBestEffort(reader, "Qoder stream finished");
+        closeStream(controller, "Qoder stream finished");
       }
     },
     cancel(reason) {
-      cancelReaderBestEffort(reader, reason);
+      closed = true;
+      cancelUpstream(reason);
     },
   });
 
@@ -551,9 +652,10 @@ export class QoderExecutor extends BaseExecutor {
       try {
         credentials = await resolveQoderCredentials(credentials, proxyOptions, signal);
       } catch (err) {
-        log?.error?.("QODER", `PAT exchange failed: ${err.message}`);
+        const details = Number.isInteger(err?.status) ? { status: err.status } : undefined;
+        log?.error?.("QODER", "PAT exchange failed", details);
         const fakeResp = new Response(
-          JSON.stringify({ error: { message: `qoder PAT exchange failed: ${err.message}` } }),
+          JSON.stringify({ error: { message: "qoder PAT exchange failed; reconnect the account" } }),
           { status: 401, headers: { "Content-Type": "application/json" } },
         );
         return { response: fakeResp, url: this.buildUrl(credentials), headers: {}, transformedBody: body };
@@ -587,7 +689,7 @@ export class QoderExecutor extends BaseExecutor {
       ({ qoderKey, payload } = await buildQoderRequestBody({ model, body, credentials, log, proxyOptions, signal }));
     } catch (err) {
       const fakeResp = new Response(
-        JSON.stringify({ error: { message: err.message } }),
+        JSON.stringify({ error: { message: "Qoder model configuration is unavailable" } }),
         { status: 400, headers: { "Content-Type": "application/json" } },
       );
       return { response: fakeResp, url, headers: {}, transformedBody: body };
@@ -614,7 +716,7 @@ export class QoderExecutor extends BaseExecutor {
       // cosy.js throws synchronously on missing userId/authToken — surface
       // as 401 so chatCore prompts re-auth instead of returning a 500.
       const fakeResp = new Response(
-        JSON.stringify({ error: { message: `qoder cosy signing failed: ${err.message}` } }),
+        JSON.stringify({ error: { message: "qoder request signing failed; reconnect the account" } }),
         { status: 401, headers: { "Content-Type": "application/json" } },
       );
       return { response: fakeResp, url, headers: {}, transformedBody: body };
@@ -640,10 +742,13 @@ export class QoderExecutor extends BaseExecutor {
 
     let response;
     try {
-      response = await proxyAwareFetch(
-        url,
-        { method: "POST", headers, body: encodedBodyBuf, signal: mergedSignal },
-        proxyOptions,
+      response = await awaitModelCatalogResponse(
+        proxyAwareFetch(
+          url,
+          { method: "POST", headers, body: encodedBodyBuf, signal: mergedSignal },
+          proxyOptions,
+        ),
+        mergedSignal,
       );
     } finally {
       clearTimeout(connectTimer);
@@ -654,7 +759,10 @@ export class QoderExecutor extends BaseExecutor {
       return { response, url, headers, transformedBody: payload };
     }
 
-    const wrapped = await wrapQoderSSE(response, `qoder/${qoderKey}`);
+    const wrapped = await wrapQoderSSE(response, `qoder/${qoderKey}`, {
+      signal,
+      firstFrameTimeoutMs: timeoutMs,
+    });
     return { response: wrapped, url, headers, transformedBody: payload };
   }
 

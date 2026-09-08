@@ -7,9 +7,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { CATALOG_FILE, CATALOG_RAW_FILE, invalidateCatalog, installCatalogSource } from "open-sse/providers/catalogOverride.js";
+import {
+  awaitModelCatalogResponse,
+  cancelModelCatalogBody,
+  readModelCatalogJson,
+} from "open-sse/services/modelCatalogResponse.js";
 
 const CATALOG_URL = "https://models.dev/api.json";
 const FETCH_TIMEOUT_MS = 60000;
+const CATALOG_BODY_LIMIT_BYTES = 16 * 1024 * 1024;
 
 export const SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60 * 1000;   // let the server boot and serve first requests
@@ -78,9 +84,9 @@ function slim(catalog) {
   return out;
 }
 
-function build(catalog, entries) {
-  // Index once: per provider for limits, and tallied across all of them for
-  // modalities.
+export function buildCatalogOverrides(catalog, entries) {
+  // Index once: exact provider records for routing, plus the existing
+  // model-only aggregate retained for callers that have no provider context.
   const byProvider = {};
   const tally = {};
   for (const [providerId, provider] of Object.entries(catalog)) {
@@ -103,19 +109,26 @@ function build(catalog, entries) {
     byProvider[providerId] = models;
   }
 
-  // Modalities belong to the model — every gateway serving it has the same
-  // weights — so they are keyed by model id and shared across providers.
+  // Retain the model-only aggregate for backward-compatible bare-id lookups.
+  // Request routing uses the provider-specific records built below; it must not
+  // consume this aggregate because generic ids can collide across gateways.
   const models = {};
+  const fallbackModels = {};
   for (const [id, counts] of Object.entries(tally)) {
     const declared = {};
+    const unanimous = {};
     for (const key of Object.values(MODALITY_BY_INPUT)) {
       if ((counts[key] || 0) / counts.total >= MIN_SHARE) declared[key] = true;
+      if ((counts[key] || 0) === counts.total) unanimous[key] = true;
     }
     if (Object.keys(declared).length) models[id] = declared;
+    if (Object.keys(unanimous).length) fallbackModels[id] = unanimous;
   }
 
-  // Limits belong to the gateway — each truncates differently — so only the
-  // matching provider's own numbers are used, keyed by provider + model.
+  // Provider-specific overrides are keyed by the registered 9router provider
+  // and model. Limits have always lived here because gateways truncate
+  // differently; modalities must live here too because generic ids such as
+  // "auto" and "default" do not identify the same model across providers.
   const providers = {};
   for (const { provider, model, contextLength, current } of entries) {
     const alias = PROVIDER_ALIASES[provider];
@@ -124,6 +137,10 @@ function build(catalog, entries) {
     if (!entry) continue;
 
     const delta = {};
+    for (const input of entry?.modalities?.input || []) {
+      const key = MODALITY_BY_INPUT[input];
+      if (key && current?.[key] !== true) delta[key] = true;
+    }
     const { context, output } = entry.limit || {};
     if (context > 0 && !contextLength
       && Math.abs(context - current.contextWindow) / current.contextWindow > LIMIT_TOLERANCE) {
@@ -133,10 +150,13 @@ function build(catalog, entries) {
       && Math.abs(output - current.maxOutput) / current.maxOutput > LIMIT_TOLERANCE) {
       delta.maxOutput = output;
     }
-    if (Object.keys(delta).length) (providers[provider] || (providers[provider] = {}))[model] = delta;
+    // Keep an explicit record even when the delta is empty. This distinguishes
+    // a known text-only provider/model from a custom model that is absent from
+    // the registered snapshot and may use the unanimous fallback above.
+    (providers[provider] || (providers[provider] = {}))[model] = delta;
   }
 
-  return { models, providers };
+  return { models, fallbackModels, providers };
 }
 
 // Snapshot every registered model with the capabilities the hand-written tables
@@ -166,6 +186,32 @@ async function collectEntries() {
   return entries;
 }
 
+async function fetchCatalogSnapshot(headers, signal, fetchFn = fetch) {
+  const response = await awaitModelCatalogResponse(
+    fetchFn(CATALOG_URL, { headers, signal }),
+    signal,
+  );
+
+  if (response.status === 304) {
+    cancelModelCatalogBody(response);
+    return { unchanged: true, catalog: null, etag: null };
+  }
+  if (!response.ok) {
+    cancelModelCatalogBody(response);
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const catalog = await readModelCatalogJson(response, {
+    signal,
+    maxBytes: CATALOG_BODY_LIMIT_BYTES,
+  });
+  return {
+    unchanged: false,
+    catalog,
+    etag: response.headers.get("etag") || null,
+  };
+}
+
 // Run one sync. Returns a summary, or null when it could not complete.
 export async function syncModelCatalog() {
   if (state.running) return null;
@@ -173,21 +219,26 @@ export async function syncModelCatalog() {
   try {
     const headers = { accept: "application/json" };
     if (state.etag) headers["if-none-match"] = state.etag;
-    const response = await fetch(CATALOG_URL, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+    const snapshot = await fetchCatalogSnapshot(headers, signal);
 
     let result;
-    if (response.status === 304) {
+    if (snapshot.unchanged) {
       result = { status: "unchanged" };
-    } else if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
     } else {
       // ~23ms to parse, once a day, on a server that is otherwise idle at this
       // point — not worth a worker thread.
-      const catalog = await response.json();
-      const etag = response.headers.get("etag") || null;
+      const { catalog, etag } = snapshot;
       const entries = await collectEntries();
-      const { models, providers } = build(catalog, entries);
-      const serialized = JSON.stringify({ v: 1, etag, syncedAt: Date.now(), models, providers });
+      const { models, fallbackModels, providers } = buildCatalogOverrides(catalog, entries);
+      const serialized = JSON.stringify({
+        v: 2,
+        etag,
+        syncedAt: Date.now(),
+        models,
+        fallbackModels,
+        providers,
+      });
 
       writeAtomic(CATALOG_FILE, serialized);
       writeAtomic(CATALOG_RAW_FILE, JSON.stringify(slim(catalog)));
@@ -218,6 +269,11 @@ export async function syncModelCatalog() {
     state.running = false;
   }
 }
+
+export const __test__ = {
+  catalogBodyLimitBytes: CATALOG_BODY_LIMIT_BYTES,
+  fetchCatalogSnapshot,
+};
 
 // The etag lives in the file we wrote, so a restart can resume from it instead
 // of re-downloading 4.3MB to be told nothing changed.
