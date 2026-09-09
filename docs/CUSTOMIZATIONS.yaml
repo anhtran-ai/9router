@@ -11,9 +11,10 @@
     "branch": "task/azox-9router-reset-upstream-prefill-contrib",
     "baseline": "The branch starts directly at upstream SHA eb712ca8 and re-applies the reviewed scopes below.",
     "diff_counts": {
-      "additive": 33,
+      "additive": 36,
       "modified": 33,
-      "total": 66
+      "total": 69,
+      "verify": "git diff --name-status v0.5.69 HEAD | awk '{print $1}' | sort | uniq -c"
     },
     "retired_old_fork_paths": 275,
     "note": "The previous fork differed at 340 paths. This reset intentionally removes the custom Responses/SSE conversion stack that caused content loss, duplicate Responses output, and InvalidStreamResponseError in live A/B tests."
