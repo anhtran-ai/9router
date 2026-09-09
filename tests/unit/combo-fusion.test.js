@@ -1,23 +1,43 @@
 import { describe, it, expect, vi } from "vitest";
+import { getEventListeners } from "node:events";
 
 import { handleFusionChat } from "../../open-sse/services/combo.js";
 
 const log = { info: () => {}, warn: () => {}, debug: () => {} };
 
-// Minimal OpenAI-chat Response stub with the .ok + .clone().json() surface the engine uses.
 function okResponse(content, { delayMs = 0 } = {}) {
   const json = { choices: [{ message: { role: "assistant", content } }] };
-  const make = () => ({ ok: true, status: 200, clone: make, json: async () => json });
-  const res = make();
+  const res = new Response(JSON.stringify(json), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
   return delayMs > 0 ? new Promise((r) => setTimeout(() => r(res), delayMs)) : res;
 }
 
 function errResponse(status = 500) {
-  const make = () => ({ ok: false, status, clone: make, json: async () => ({ error: { message: "boom" } }) });
-  return make();
+  return new Response(JSON.stringify({ error: { message: "boom" } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 describe("fusion combo", () => {
+  it("does not start a pre-aborted panel", async () => {
+    const client = new AbortController(); client.abort();
+    const handleSingleModel = vi.fn();
+    const result = await handleFusionChat({ body: {}, models: ["p/a", "p/b"], handleSingleModel, log, signal: client.signal });
+    expect(result.status).toBe(499);
+    expect(handleSingleModel).not.toHaveBeenCalled();
+  });
+
+  it("does not call the judge after client cancellation during the panel", async () => {
+    const client = new AbortController();
+    const handleSingleModel = vi.fn(async () => { await Promise.resolve(); client.abort(); return okResponse("fixture answer"); });
+    const result = await handleFusionChat({ body: {}, models: ["p/a", "p/b"], handleSingleModel, log, signal: client.signal });
+    expect(result.status).toBe(499);
+    expect(handleSingleModel).toHaveBeenCalledTimes(2);
+  });
+
   it("answers directly with a single-model panel (nothing to fuse)", async () => {
     const handleSingleModel = vi.fn(async () => okResponse("solo"));
     await handleFusionChat({
@@ -112,6 +132,258 @@ describe("fusion combo", () => {
     expect(judgeText).not.toContain("slow");
   });
 
+  it("does not count malformed HTTP 200 bodies toward quorum or abort a valid slow panel", async () => {
+    vi.useFakeTimers();
+    let slowAborted = false;
+    const handleSingleModel = vi.fn((_body, model, isPanel, panelSignal) => {
+      if (!isPanel) return okResponse("DIRECT");
+      if (model === "p/not-json") return new Response("not-json", { status: 200 });
+      if (model === "p/empty") return new Response(JSON.stringify({ choices: [] }), { status: 200 });
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(okResponse("valid-slow")), 50);
+        panelSignal.addEventListener("abort", () => {
+          slowAborted = true;
+          clearTimeout(timer);
+          resolve(errResponse(499));
+        }, { once: true });
+      });
+    });
+
+    try {
+      const pending = handleFusionChat({
+        body: { messages: [{ role: "user", content: "Q" }] },
+        models: ["p/not-json", "p/empty", "p/valid"],
+        handleSingleModel,
+        log,
+        tuning: { minPanel: 2, stragglerGraceMs: 5, panelHardTimeoutMs: 500 },
+      });
+      await vi.advanceTimersByTimeAsync(50);
+      const result = await pending;
+
+      expect(result.ok).toBe(true);
+      expect(slowAborted).toBe(false);
+      expect(handleSingleModel.mock.calls.filter(([, model]) => model === "p/valid")).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds stalled panel bodies concurrently within each panel hard timeout", async () => {
+    vi.useFakeTimers();
+    const cancels = [];
+    const handleSingleModel = vi.fn(async () => {
+      const cancel = vi.fn();
+      cancels.push(cancel);
+      return new Response(new ReadableStream({ cancel }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    try {
+      const pending = handleFusionChat({
+        body: { messages: [{ role: "user", content: "Q" }] },
+        models: ["p/stall-a", "p/stall-b"],
+        handleSingleModel,
+        log,
+        tuning: { minPanel: 2, stragglerGraceMs: 5, panelHardTimeoutMs: 25 },
+      });
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect((await pending).status).toBe(503);
+      await Promise.resolve();
+      expect(cancels).toHaveLength(2);
+      expect(cancels.every((cancel) => cancel.mock.calls.length === 1)).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts the unfinished panel call at quorum before starting the judge", async () => {
+    vi.useFakeTimers();
+    const panelSignals = new Map();
+    let slowAborted = false;
+    let judgeObservedAbort = false;
+    const handleSingleModel = vi.fn((_body, model, isPanel, panelSignal) => {
+      if (isPanel) panelSignals.set(model, panelSignal);
+      if (model === "p/slow") {
+        return new Promise((resolve) => {
+          panelSignal.addEventListener("abort", () => {
+            slowAborted = true;
+            resolve(errResponse(499));
+          }, { once: true });
+        });
+      }
+      if (model === "p/judge") {
+        judgeObservedAbort = slowAborted;
+        return okResponse("FINAL");
+      }
+      return okResponse(`fast-${model}`);
+    });
+
+    try {
+      const pending = handleFusionChat({
+        body: { messages: [{ role: "user", content: "Q" }] },
+        models: ["p/x", "p/y", "p/slow"],
+        handleSingleModel,
+        log,
+        judgeModel: "p/judge",
+        tuning: { minPanel: 2, stragglerGraceMs: 5, panelHardTimeoutMs: 1000 },
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      const result = await pending;
+
+      expect(result.ok).toBe(true);
+      expect(slowAborted).toBe(true);
+      expect(judgeObservedAbort).toBe(true);
+      expect(panelSignals.get("p/slow").aborted).toBe(true);
+      expect(panelSignals.get("p/x").aborted).toBe(false);
+      expect(panelSignals.get("p/y").aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a late response from a panel provider that ignored its abort", async () => {
+    vi.useFakeTimers();
+    let resolveSlow;
+    const slowResult = new Promise(resolve => { resolveSlow = resolve; });
+    const lateCancel = vi.fn();
+    const handleSingleModel = vi.fn((_body, model, isPanel) => {
+      if (isPanel && model === "p/slow") return slowResult;
+      return okResponse(isPanel ? `fast-${model}` : "FINAL");
+    });
+
+    try {
+      const pending = handleFusionChat({
+        body: { messages: [{ role: "user", content: "Q" }] },
+        models: ["p/a", "p/b", "p/slow"],
+        handleSingleModel,
+        log,
+        judgeModel: "p/judge",
+        tuning: { minPanel: 2, stragglerGraceMs: 5, panelHardTimeoutMs: 1000 },
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      expect((await pending).ok).toBe(true);
+
+      resolveSlow(new Response(new ReadableStream({ cancel: lateCancel }), { status: 200 }));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(lateCancel).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts every unresolved panel call at the hard timeout", async () => {
+    vi.useFakeTimers();
+    const aborted = new Set();
+    const handleSingleModel = vi.fn((_body, model, _isPanel, panelSignal) => {
+      panelSignal.addEventListener("abort", () => aborted.add(model), { once: true });
+      return new Promise(() => {});
+    });
+
+    try {
+      const pending = handleFusionChat({
+        body: { messages: [{ role: "user", content: "Q" }] },
+        models: ["p/hang-a", "p/hang-b"],
+        handleSingleModel,
+        log,
+        tuning: { minPanel: 2, stragglerGraceMs: 50, panelHardTimeoutMs: 100 },
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await pending;
+
+      expect(result.status).toBe(503);
+      expect(aborted).toEqual(new Set(["p/hang-a", "p/hang-b"]));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns promptly and aborts unresolved panel calls when the client disconnects", async () => {
+    const client = new AbortController();
+    const panelSignals = [];
+    const handleSingleModel = vi.fn((_body, _model, _isPanel, panelSignal) => {
+      panelSignals.push(panelSignal);
+      return new Promise(() => {});
+    });
+
+    const pending = handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["p/hang-a", "p/hang-b"],
+      handleSingleModel,
+      log,
+      signal: client.signal,
+      tuning: { minPanel: 2, stragglerGraceMs: 1000, panelHardTimeoutMs: 10000 },
+    });
+    await Promise.resolve();
+    client.abort();
+
+    const result = await pending;
+    expect(result.status).toBe(499);
+    expect(panelSignals).toHaveLength(2);
+    expect(panelSignals.every((signal) => signal.aborted)).toBe(true);
+  });
+
+  it("unlinks completed panel signals from later client cancellation", async () => {
+    const client = new AbortController();
+    const completedPanelSignals = [];
+    const handleSingleModel = vi.fn((_body, model, isPanel, panelSignal) => {
+      if (isPanel) completedPanelSignals.push(panelSignal);
+      return okResponse(`answer-${model}`);
+    });
+
+    await handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["p/a", "p/b"],
+      handleSingleModel,
+      log,
+      signal: client.signal,
+    });
+    client.abort();
+
+    expect(completedPanelSignals).toHaveLength(2);
+    expect(completedPanelSignals.every((signal) => !signal.aborted)).toBe(true);
+  });
+
+  it("releases the client listener and timeout wrappers for more than ten abort-ignoring panels", async () => {
+    vi.useFakeTimers();
+    const client = new AbortController();
+    const models = ["p/fast-a", "p/fast-b", ...Array.from({ length: 10 }, (_, i) => `p/hang-${i}`)];
+    const aborted = new Set();
+    const handleSingleModel = vi.fn((_body, model, isPanel, panelSignal) => {
+      if (!isPanel || model.startsWith("p/fast")) return okResponse(`answer-${model}`);
+      panelSignal.addEventListener("abort", () => aborted.add(model), { once: true });
+      // Deliberately ignore abort and never settle, matching the leak repro.
+      return new Promise(() => {});
+    });
+
+    try {
+      const pending = handleFusionChat({
+        body: { messages: [{ role: "user", content: "Q" }] },
+        models,
+        handleSingleModel,
+        log,
+        signal: client.signal,
+        judgeModel: "p/judge",
+        tuning: { minPanel: 2, stragglerGraceMs: 5, panelHardTimeoutMs: 90_000 },
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      const result = await pending;
+
+      expect(result.ok).toBe(true);
+      expect(aborted.size).toBe(10);
+      expect(getEventListeners(client.signal, "abort")).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("returns the lone survivor directly when only one panel model succeeds", async () => {
     const handleSingleModel = vi.fn(async (_body, model) => {
       if (model === "p/ok") return okResponse("lone");
@@ -140,6 +412,54 @@ describe("fusion combo", () => {
       tuning: { minPanel: 2, stragglerGraceMs: 50, panelHardTimeoutMs: 5000 },
     });
     expect(res.status).toBe(503);
+  });
+
+  it("cancels failed panel response bodies instead of retaining them", async () => {
+    const cancels = [];
+    const handleSingleModel = vi.fn(async () => {
+      const cancel = vi.fn();
+      cancels.push(cancel);
+      return new Response(new ReadableStream({ cancel }), { status: 503 });
+    });
+
+    const res = await handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["p/a", "p/b"],
+      handleSingleModel,
+      log,
+    });
+
+    expect(res.status).toBe(503);
+    await Promise.resolve();
+    expect(cancels).toHaveLength(2);
+    expect(cancels.every((cancel) => cancel.mock.calls.length === 1)).toBe(true);
+  });
+
+  it("cancels a stalled successful panel body when the client aborts", async () => {
+    const client = new AbortController();
+    const cancels = [];
+    const handleSingleModel = vi.fn(async () => {
+      const cancel = vi.fn();
+      cancels.push(cancel);
+      return new Response(new ReadableStream({ cancel }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    const pending = handleFusionChat({
+      body: { messages: [{ role: "user", content: "Q" }] },
+      models: ["p/a", "p/b"],
+      handleSingleModel,
+      log,
+      signal: client.signal,
+    });
+    await vi.waitFor(() => expect(handleSingleModel).toHaveBeenCalledTimes(2));
+    client.abort(new DOMException("client left", "AbortError"));
+
+    expect((await pending).status).toBe(499);
+    await Promise.resolve();
+    expect(cancels.every((cancel) => cancel.mock.calls.length === 1)).toBe(true);
   });
 
   it("flattens previous tool history and assistant tool_calls into prose for panel calls", async () => {
