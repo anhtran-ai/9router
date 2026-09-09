@@ -7,6 +7,9 @@ import {
   isSameOrigin,
 } from "@/lib/contributor/session";
 import { claimContributorToken } from "@/lib/contributor/store";
+import { readRequestJson, RequestBodyError } from "open-sse/utils/requestBody.js";
+
+const MAX_BODY_BYTES = 4 * 1024;
 
 export async function GET(request) {
   const session = await getContributorSession(request);
@@ -24,10 +27,21 @@ export async function POST(request) {
   if (!isSameOrigin(request)) {
     return NextResponse.json({ error: "Invalid origin" }, { status: 403 });
   }
+  // This route is in PUBLIC_API_PATHS, so it runs before any authentication.
+  // Use the bounded reader to cap the payload instead of buffering whatever an
+  // anonymous caller sends.
   let body;
   try {
-    body = await request.json();
-  } catch {
+    body = await readRequestJson(request, {
+      maxBytes: MAX_BODY_BYTES,
+      label: "Contribution session body",
+      requireBody: true,
+    });
+  } catch (error) {
+    const status = error instanceof RequestBodyError ? error.status : 400;
+    return NextResponse.json({ error: "Invalid request" }, { status });
+  }
+  if (!body || typeof body !== "object" || typeof body.token !== "string") {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
   const invite = await claimContributorToken(body.token);

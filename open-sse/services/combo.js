@@ -292,6 +292,11 @@ export function getComboModelsFromData(modelStr, combosData) {
 // HTTP Retry-After supports delay-seconds or dates; the legacy JSON field is a
 // timestamp. Reject malformed/overflow dates before they enter the minimum.
 function parseRetryDeadline(value, receivedAt, allowDelaySeconds = false) {
+  // The legacy JSON field may be an epoch timestamp number. HTTP Retry-After
+  // remains string-only and may additionally use delay-seconds.
+  if (typeof value === "number") {
+    return !allowDelaySeconds && Number.isFinite(value) ? value : null;
+  }
   if (typeof value !== "string" || !value.trim()) return null;
   const text = value.trim();
   let deadline;
@@ -789,3 +794,6 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   log.info("FUSION", `Judging ${answers.length} answers with ${judge}`);
   return handleSingleModel(judgeBody, judge);
 }
+
+// Exposed for regression tests only; not part of the module's runtime contract.
+export const __test__ = { parseRetryDeadline };

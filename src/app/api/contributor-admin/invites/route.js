@@ -6,9 +6,18 @@ import {
   revokeContributorInvite,
 } from "@/lib/contributor/store";
 import { isSameOrigin } from "@/lib/contributor/session";
+import { readRequestJson, RequestBodyError } from "open-sse/utils/requestBody.js";
 import { getPublicOrigin } from "@/lib/auth/oidc";
 
-export async function GET() {
+const MAX_BODY_BYTES = 16 * 1024;
+
+export async function GET(request) {
+  // The invite list is sensitive: guard reads with the same origin check the
+  // mutating handlers use, so an ambient dashboard cookie cannot be replayed
+  // from a cross-site page.
+  if (!isSameOrigin(request)) {
+    return NextResponse.json({ error: "Invalid origin" }, { status: 403 });
+  }
   return NextResponse.json({ invites: await listContributorInvites() });
 }
 
@@ -17,7 +26,20 @@ export async function POST(request) {
     return NextResponse.json({ error: "Invalid origin" }, { status: 403 });
   }
   try {
-    const body = await request.json();
+    let body;
+    try {
+      body = await readRequestJson(request, {
+        maxBytes: MAX_BODY_BYTES,
+        label: "Invite request body",
+        requireBody: true,
+      });
+    } catch (error) {
+      const status = error instanceof RequestBodyError ? error.status : 400;
+      return NextResponse.json({ error: "Invalid request body" }, { status });
+    }
+    if (!body || typeof body !== "object") {
+      return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    }
     const alias = typeof body.alias === "string" ? body.alias.trim().slice(0, 100) : "";
     if (!alias) {
       return NextResponse.json({ error: "Alias is required" }, { status: 400 });
@@ -43,7 +65,12 @@ export async function POST(request) {
     const { tokenHash, ...safeInvite } = invite;
     return NextResponse.json({ invite: safeInvite, url }, { status: 201 });
   } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    // Validation failures are the caller's problem and must not leak an
+    // internal message; only unexpected faults become a 500.
+    if (error instanceof RequestBodyError) {
+      return NextResponse.json({ error: "Invalid request body" }, { status: error.status });
+    }
+    return NextResponse.json({ error: "Failed to create invite" }, { status: 500 });
   }
 }
 

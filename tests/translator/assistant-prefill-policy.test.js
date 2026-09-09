@@ -3,6 +3,8 @@ import { normalizeClaudePassthrough, prepareClaudeRequest } from "../../open-sse
 import { DEFAULT_CAPABILITIES, MODEL_CAPABILITIES, PATTERN_CAPABILITIES } from "../../open-sse/providers/capabilities.js";
 
 const continuationPattern = /continue.*without repeating/i;
+// E-form signature: single-layer base64 whose first decoded byte is 0x12.
+const VALID_CLAUDE_SIGNATURE = "EnZhbGlkLWNsYXVkZS1zaWduYXR1cmU=";
 
 function translated(messages, options = {}) {
   return prepareClaudeRequest({
@@ -59,6 +61,29 @@ describe.each(paths)("assistant prefill policy — %s", (_name, run) => {
 
     expect(out.messages).toHaveLength(1);
     expect(out.messages.at(-1).role).toBe("user");
+  });
+
+  // Reasoning that survives the signature cleanup passes is provider-owned
+  // history: redacted_thinking in particular cannot be regenerated, so the
+  // prefill policy must add a user boundary instead of dropping the turn.
+  it.each([
+    ["signed thinking", { type: "thinking", thinking: "Draft", signature: VALID_CLAUDE_SIGNATURE }],
+    ["signed redacted thinking", {
+      type: "redacted_thinking",
+      data: "opaque-provider-blob",
+      signature: VALID_CLAUDE_SIGNATURE,
+    }],
+  ])("keeps trailing %s and restores the user boundary", (_case, block) => {
+    const out = run([
+      { role: "user", content: "Start" },
+      { role: "assistant", content: [block] },
+    ]);
+
+    expect(out.messages.map(message => message.role)).toEqual(["user", "assistant", "user"]);
+    expect(out.messages.at(-2).content).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: block.type }),
+    ]));
+    expect(JSON.stringify(out.messages.at(-1).content)).toMatch(continuationPattern);
   });
 
   it("completes trailing assistant tool_use with an error tool_result", () => {

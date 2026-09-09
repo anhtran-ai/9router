@@ -1,4 +1,5 @@
 import { CLAUDE_BLOCK, ROLE } from "../schema/index.js";
+import { isValidClaudeSignature } from "../../utils/claudeSignature.js";
 
 const ASSISTANT_CONTINUATION_PROMPT = "Continue from the assistant response above without repeating it.";
 const INCOMPLETE_TOOL_RESULT = "Tool execution was not completed before this request continued.";
@@ -17,6 +18,18 @@ function hasText(content) {
   if (typeof content === "string") return !!content.trim();
   return Array.isArray(content) && content.some(block =>
     block?.type === CLAUDE_BLOCK.TEXT && block.text?.trim()
+  );
+}
+
+// Signed reasoning is provider-owned history, and redacted_thinking is an
+// opaque blob that cannot be regenerated. A trailing turn holding such a block
+// must keep it and gain a user boundary rather than being dropped. Unsigned or
+// foreign-signature thinking is still discarded — Anthropic rejects it, and the
+// surrounding cleanup passes drop it anyway.
+function hasPreservableReasoning(content) {
+  return Array.isArray(content) && content.some(block =>
+    block?.type === CLAUDE_BLOCK.REDACTED_THINKING ||
+    (block?.type === CLAUDE_BLOCK.THINKING && isValidClaudeSignature(block.signature))
   );
 }
 
@@ -51,9 +64,10 @@ export function applyAssistantPrefillPolicy(body, rawHeaders = null) {
     return body;
   }
 
-  // A valid Anthropic server tool block is provider-owned history. Keep it,
-  // but still restore the terminal-user invariant used for the next request.
-  if (hasServerToolUse(trailingAssistant.content)) {
+  // A valid Anthropic server tool block or reasoning block is provider-owned
+  // history. Keep it, but still restore the terminal-user invariant used for
+  // the next request.
+  if (hasServerToolUse(trailingAssistant.content) || hasPreservableReasoning(trailingAssistant.content)) {
     body.messages.push({
       role: ROLE.USER,
       content: [{ type: CLAUDE_BLOCK.TEXT, text: ASSISTANT_CONTINUATION_PROMPT }],

@@ -12,10 +12,10 @@
     "baseline": "The branch starts directly at upstream SHA eb712ca8 and re-applies the reviewed scopes below.",
     "diff_counts": {
       "additive": 33,
-      "modified": 32,
-      "total": 65
+      "modified": 33,
+      "total": 66
     },
-    "retired_old_fork_paths": 282,
+    "retired_old_fork_paths": 275,
     "note": "The previous fork differed at 340 paths. This reset intentionally removes the custom Responses/SSE conversion stack that caused content loss, duplicate Responses output, and InvalidStreamResponseError in live A/B tests."
   },
   "supported_customizations": {
@@ -28,12 +28,14 @@
         "open-sse/services/accountFallback.js",
         "open-sse/services/combo.js",
         "open-sse/utils/error.js",
-        "src/sse/services/auth.js"
+        "src/sse/services/auth.js",
+        "open-sse/handlers/chatCore.js"
       ],
       "tests": [
         "tests/translator/assistant-prefill-policy.test.js",
         "tests/unit/account-fallback-prefill.test.js",
-        "tests/unit/combo-fusion.test.js"
+        "tests/unit/combo-fusion.test.js",
+        "tests/unit/combo-retry-after.test.js"
       ]
     },
     "contributor": {
@@ -64,7 +66,9 @@
         "tests/unit/contributor-proxy-atomic.test.js",
         "tests/unit/contributor-gitlab-oauth-ssrf.test.js",
         "tests/unit/oauth-register-session.test.js",
-        "tests/unit/custom-navigation.test.js"
+        "tests/unit/custom-navigation.test.js",
+        "tests/unit/contributor-route-hardening.test.js",
+        "tests/unit/contributor-secret.test.js"
       ]
     },
     "combo_import_export": {
@@ -116,18 +120,8 @@
     ],
     "rationale": "These files are retained because the supported features import their symbols or rely on their atomicity, bounded-request, OAuth-origin, database, or standalone-image contracts. Several are whole-file carryovers and therefore include hardening beyond the three user-facing customizations; they must remain regression-tested and are candidates for later surgical reduction."
   },
-  "explicitly_retired_seams": [
-    "open-sse/handlers/chatCore/nonStreamingHandler.js",
-    "open-sse/handlers/chatCore/sseToJsonHandler.js",
-    "open-sse/handlers/chatCore/streamingHandler.js",
-    "open-sse/handlers/responsesHandler.js",
-    "open-sse/executors/codex.js",
-    "open-sse/transformer/responsesTransformer.js",
-    "open-sse/transformer/streamToJsonConverter.js",
-    "open-sse/utils/streamContract.js"
-  ],
   "verification": {
-    "targeted": "12 test files / 142 tests passed",
+    "targeted": "17 test files / 197 tests passed",
     "full_suite_comparison": {
       "reset_branch_failed_assertions": 97,
       "vanilla_upstream_failed_assertions": 100,
@@ -143,5 +137,47 @@
     "Do not restore retired Responses/SSE conversion seams without isolated regression tests covering content loss, duplicate content, stream and non-stream parity, and InvalidStreamResponseError.",
     "Keep additive helpers additive where possible; reduce whole-file dependency carryovers only with feature-level and baseline tests.",
     "Update upstream.ref, upstream.sha, diff counts, retained paths, tests, and known behavior losses together on every upstream reset."
-  ]
+  ],
+  "restored_to_upstream_seams": {
+    "note": "Fork modifications to these seams were dropped and the files now match upstream byte-for-byte. They are live upstream code \u2014 do not delete them.",
+    "paths": [
+      "open-sse/handlers/chatCore/nonStreamingHandler.js",
+      "open-sse/handlers/chatCore/sseToJsonHandler.js",
+      "open-sse/handlers/chatCore/streamingHandler.js",
+      "open-sse/handlers/responsesHandler.js",
+      "open-sse/executors/codex.js",
+      "open-sse/transformer/responsesTransformer.js",
+      "open-sse/transformer/streamToJsonConverter.js"
+    ]
+  },
+  "deleted_fork_only_files": {
+    "note": "Fork inventions with no upstream counterpart, removed by the reset.",
+    "paths": [
+      "open-sse/utils/streamContract.js"
+    ]
+  },
+  "review_fixes": {
+    "note": "Defects found by independent review of the reset branch and fixed in place.",
+    "items": [
+      "chatCore now maps ToolCompatibilityError to HTTP 400 instead of letting it escape as an opaque 500 that a combo would retry.",
+      "chatCore passes raw client headers to normalizeClaudePassthrough so x-9router-assistant-prefill: preserve works on native passthrough.",
+      "The prefill policy keeps a trailing turn holding signed or redacted reasoning instead of silently dropping unregenerable provider history.",
+      "GET /api/contributor-admin/invites now enforces the same-origin check its mutating siblings use.",
+      "Both contributor routes use the bounded JSON reader with an explicit byte cap and reject malformed bodies with 400 rather than 500.",
+      "The invite route no longer returns raw internal error messages.",
+      "The contributor session secret only self-creates when genuinely absent or empty, uses exclusive create, and propagates other IO faults instead of rotating the live secret.",
+      "Combo import rejects a zero-model combo that would persist but never route.",
+      "parseRetryDeadline again accepts a numeric epoch retryAfter from the JSON error body, restoring the Retry-After signal.",
+      "The import/export route imports @/lib/db/index.js instead of the localDb compat shim."
+    ]
+  },
+  "known_inert_carryovers": {
+    "note": "Retained whole-file dependencies whose largest new blocks have no production caller, because their call sites remain at upstream. Tested in isolation but unreachable; candidates for symbol-level reduction or removal in a follow-up.",
+    "items": [
+      "src/sse/services/auth.js account-mutation ordering (beginAccountMutationAttempt and friends) has no callers.",
+      "open-sse/services/combo.js abort/signal plumbing is unreachable because src/sse/handlers/ remains at upstream arity.",
+      "open-sse/providers/capabilities.js getProviderModalities has no implementer.",
+      "src/lib/oauth/utils/server.js records createdAt on pending sessions but nothing reads or sweeps it."
+    ]
+  }
 }

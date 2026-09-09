@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getCombos, getSettings, importComboItems } from "@/lib/localDb";
+import { getCombos, getSettings, importComboItems } from "@/lib/db/index.js";
 import { resetComboRotation } from "open-sse/services/combo.js";
 import { readRequestJson, RequestBodyError } from "open-sse/utils/requestBody.js";
 
@@ -85,6 +85,9 @@ function normalizeItem(raw, index, strategyMap, strategyMapProvided) {
   }
 
   if (!Array.isArray(raw.models)) throw new Error("Models must be an array");
+  // A zero-model combo persists but can never route: getComboModels rejects it
+  // later with an opaque 400. Fail at import instead of reporting success.
+  if (raw.models.length === 0) throw new Error("A combo must contain at least one model");
   if (raw.models.length > MAX_MODELS_PER_COMBO) {
     throw new Error(`A combo may contain at most ${MAX_MODELS_PER_COMBO} models`);
   }

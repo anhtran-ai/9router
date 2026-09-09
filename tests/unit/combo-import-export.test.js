@@ -11,7 +11,7 @@ vi.mock("next/server", () => ({
   NextResponse: { json: (body, init) => Response.json(body, init) },
 }));
 
-vi.mock("@/lib/localDb", () => ({
+vi.mock("@/lib/db/index.js", () => ({
   getCombos: mocks.getCombos,
   getSettings: mocks.getSettings,
   importComboItems: mocks.importComboItems,
