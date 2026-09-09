@@ -99,6 +99,42 @@ export async function createSqlJsAdapter(filePath) {
     }
   }
 
+  function backupToFile(dest, tables) {
+    // Do not export/clone main: that copies excluded logs, resets pragmas, and
+    // invalidates live statements. Read included rows from the unflushed DB.
+    const backup = new SQLLib.Database();
+    try {
+      backup.exec("BEGIN");
+      for (const { name, sql } of tables) {
+        backup.exec(sql);
+        const table = `"${name.replaceAll('"', '""')}"`;
+        const rows = db.prepare(`SELECT * FROM main.${table}`);
+        const inserts = new Map();
+        try {
+          while (rows.step()) {
+            const values = rows.get(null, { useBigInt: true });
+            // SQL.js binds BigInt as text. Cast it back to INTEGER so 64-bit
+            // values keep both their exact value and their SQLite storage type.
+            const placeholders = values.map((v) => typeof v === "bigint" ? "CAST(? AS INTEGER)" : "?").join(", ");
+            let insert = inserts.get(placeholders);
+            if (!insert) {
+              insert = backup.prepare(`INSERT INTO ${table} VALUES (${placeholders})`);
+              inserts.set(placeholders, insert);
+            }
+            insert.run(values.map((v) => typeof v === "bigint" ? v.toString() : v));
+          }
+        } finally {
+          rows.free();
+          for (const insert of inserts.values()) insert.free();
+        }
+      }
+      backup.exec("COMMIT");
+      fs.writeFileSync(dest, Buffer.from(backup.export()));
+    } finally {
+      backup.close();
+    }
+  }
+
   function close() {
     if (saveTimer) clearTimeout(saveTimer);
     if (dirty) persist();
@@ -111,5 +147,5 @@ export async function createSqlJsAdapter(filePath) {
   process.on("SIGINT", flush);
   process.on("SIGTERM", flush);
 
-  return { driver: "sql.js", run, get, all, exec, transaction, close, raw: db };
+  return { driver: "sql.js", run, get, all, exec, transaction, backupToFile, close, raw: db };
 }

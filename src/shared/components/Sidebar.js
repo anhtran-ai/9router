@@ -6,6 +6,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/shared/utils/cn";
 import { APP_CONFIG, UPDATER_CONFIG } from "@/shared/constants/config";
+import { CUSTOM_NAV_ITEMS } from "@/shared/constants/customNavigation";
 import { MEDIA_PROVIDER_KINDS } from "@/shared/constants/providers";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import Button from "./Button";
@@ -304,6 +305,30 @@ export default function Sidebar({ onClose }) {
               </span>
               <span className="text-[13px] font-medium">9Remote</span>
             </button>
+
+            {CUSTOM_NAV_ITEMS.map((item) => (
+              <Link
+                key={item.href}
+                href={item.href}
+                onClick={onClose}
+                className={cn(
+                  "flex items-center gap-3 px-3 py-1 rounded-lg transition-all group",
+                  isActive(item.href)
+                    ? "bg-primary/10 text-primary"
+                    : "text-text-muted hover:bg-surface-2 hover:text-text-main"
+                )}
+              >
+                <span
+                  className={cn(
+                    "material-symbols-outlined text-[18px]",
+                    isActive(item.href) ? "fill-1" : "group-hover:text-primary transition-colors"
+                  )}
+                >
+                  {item.icon}
+                </span>
+                <span className="text-[13px] font-medium">{item.label}</span>
+              </Link>
+            ))}
 
             {/* 9English */}
             <a

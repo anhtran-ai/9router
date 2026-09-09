@@ -41,6 +41,15 @@ const nextConfig = {
     optimizePackageImports: ["@xyflow/react", "@dnd-kit/core", "@dnd-kit/sortable", "material-symbols", "marked"],
   },
   webpack: (config, { isServer }) => {
+    // better-sqlite3 is an optional native accelerator. Keep server builds
+    // reproducible when npm skips it and let the runtime database driver fall
+    // back to node:sqlite or sql.js.
+    if (isServer) {
+      config.externals = [
+        ...(config.externals || []),
+        { "better-sqlite3": "commonjs better-sqlite3" },
+      ];
+    }
     // Ignore fs/path modules in browser bundle
     if (!isServer) {
       config.resolve.fallback = {

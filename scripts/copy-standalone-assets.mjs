@@ -1,4 +1,4 @@
-import { cpSync, existsSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -37,6 +37,19 @@ export function copyStandaloneAssets({ projectRoot = process.cwd(), distDir = pr
     cpSync(serverWrapperSource, serverWrapperDestination, { force: true });
     console.log(`[standalone-assets] Copied custom-server.js to ${serverWrapperDestination}`);
   }
+
+  // sql.js resolves its WebAssembly binary at runtime, so Next's file tracer does
+  // not discover it from the externalized JavaScript entrypoint. Keep the
+  // documented SQLite fallback usable in standalone builds instead of shipping a
+  // bundle that fails only after better-sqlite3/node:sqlite are unavailable.
+  const sqlJsWasmSource = resolve(projectRoot, "node_modules", "sql.js", "dist", "sql-wasm.wasm");
+  const sqlJsWasmDestination = resolve(standaloneDir, "node_modules", "sql.js", "dist", "sql-wasm.wasm");
+  if (!existsSync(sqlJsWasmSource)) {
+    throw new Error(`[standalone-assets] Required SQL.js runtime asset is missing: ${sqlJsWasmSource}`);
+  }
+  mkdirSync(dirname(sqlJsWasmDestination), { recursive: true });
+  cpSync(sqlJsWasmSource, sqlJsWasmDestination, { force: true });
+  console.log(`[standalone-assets] Copied SQL.js runtime asset to ${sqlJsWasmDestination}`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(dirname(fileURLToPath(import.meta.url)), "copy-standalone-assets.mjs")) {

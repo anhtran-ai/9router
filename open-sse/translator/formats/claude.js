@@ -8,6 +8,9 @@ import { isValidClaudeSignature } from "../../utils/claudeSignature.js";
 import { PROVIDERS } from "../../providers/index.js";
 import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 import { DEFAULT_MAX_TOKENS } from "../../config/runtimeConfig.js";
+import { CLAUDE_SYSTEM_PROMPT } from "../../config/appConstants.js";
+import { applyAssistantPrefillPolicy } from "../concerns/assistantPrefillPolicy.js";
+import { ToolCompatibilityError } from "../concerns/hostedToolPolicy.js";
 
 const CACHE_CONTROL_5M = { type: "ephemeral" };
 const CACHE_CONTROL_1H = { type: "ephemeral", ttl: "1h" };
@@ -30,6 +33,8 @@ export function hasValidContent(msg) {
   if (Array.isArray(msg.content)) {
     return msg.content.some(block =>
       (block.type === CLAUDE_BLOCK.TEXT && block.text?.trim()) ||
+      block.type === CLAUDE_BLOCK.THINKING ||
+      block.type === CLAUDE_BLOCK.REDACTED_THINKING ||
       block.type === CLAUDE_BLOCK.TOOL_USE ||
       block.type === CLAUDE_BLOCK.TOOL_RESULT ||
       block.type === CLAUDE_BLOCK.IMAGE ||
@@ -138,7 +143,7 @@ function hasForeignServerToolUseId(block) {
 // 2. output_config.effort → unsupported on Haiku
 // 3. role "system" messages (mid-conversation-system beta) → only top-level system is allowed
 // 4. server_tool_use blocks carrying a foreign (non-srvtoolu_) id → rejected outright
-export function normalizeClaudePassthrough(body, model = "") {
+export function normalizeClaudePassthrough(body, model = "", rawHeaders = null) {
   if (!body || typeof body !== "object") return body;
 
   // 1. Downgrade adaptive thinking for models that don't support it
@@ -247,6 +252,8 @@ export function normalizeClaudePassthrough(body, model = "") {
     });
   }
 
+  applyAssistantPrefillPolicy(body, rawHeaders);
+
   return body;
 }
 
@@ -321,6 +328,22 @@ export function anchorClaudeCache(body) {
 // - Fix tool_use/tool_result ordering
 // - Apply cloaking (billing header + fake user ID) for OAuth tokens
 export function prepareClaudeRequest(body, provider = null, apiKey = null, connectionId = null, rawHeaders = null, sessionId = null) {
+  // The Claude Code identity is specific to the official Claude transport. It
+  // must not leak into unrelated Anthropic-compatible providers.
+  if (provider === "claude") {
+    const promptBlock = { type: CLAUDE_BLOCK.TEXT, text: CLAUDE_SYSTEM_PROMPT };
+    if (Array.isArray(body.system)) {
+      const alreadyPresent = body.system.some(block => block?.text === CLAUDE_SYSTEM_PROMPT);
+      if (!alreadyPresent) body.system = [promptBlock, ...body.system];
+    } else if (typeof body.system === "string" && body.system) {
+      if (!body.system.includes(CLAUDE_SYSTEM_PROMPT)) {
+        body.system = [promptBlock, { type: CLAUDE_BLOCK.TEXT, text: body.system }];
+      }
+    } else {
+      body.system = [promptBlock];
+    }
+  }
+
   // quirk: MiniMax's Claude-compatible endpoint rejects Anthropic's output_config (400 invalid params)
   if (PROVIDERS[provider]?.quirks?.dropOutputConfig) {
     delete body.output_config;
@@ -377,7 +400,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
       }
 
       // Keep final assistant even if empty, otherwise check valid content
-      const isFinalAssistant = i === len - 1 && msg.role === "assistant";
+      const isFinalAssistant = i === len - 1 && msg.role === ROLE.ASSISTANT;
       if (isFinalAssistant || hasValidContent(msg)) {
         filtered.push(msg);
       }
@@ -388,10 +411,12 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
     filtered = fixToolUseOrdering(filtered);
 
     body.messages = filtered;
+    applyAssistantPrefillPolicy(body, rawHeaders);
+    filtered = body.messages;
 
     // Check if thinking is enabled AND last message is from user
     const lastMessage = filtered[filtered.length - 1];
-    const lastMessageIsUser = lastMessage?.role === "user";
+    const lastMessageIsUser = lastMessage?.role === ROLE.USER;
     const thinkingEnabled = body.thinking?.type === "enabled" && lastMessageIsUser;
 
     // Pass 2 (reverse): add cache_control to last assistant + handle thinking for Anthropic
@@ -399,7 +424,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
     for (let i = filtered.length - 1; i >= 0; i--) {
       const msg = filtered[i];
 
-      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      if (msg.role === ROLE.ASSISTANT && Array.isArray(msg.content)) {
         // Add cache_control to last non-thinking block of first (from end) assistant with content
         // thinking/redacted_thinking blocks do not support cache_control
         if (!lastAssistantProcessed && msg.content.length > 0) {
@@ -423,6 +448,8 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
           // DeepSeek: keep existing thinking as-is; add an unsigned placeholder only if missing.
           const isClaudeNative = provider === "claude";
           const isDeepSeek = provider === "deepseek";
+          const hadThinking = msg.content.some(block =>
+            block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING);
           const kept = [];
           for (const block of msg.content) {
             const isThinking = block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING;
@@ -446,6 +473,9 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
             kept.push(block);
           }
           msg.content = kept;
+          if (isClaudeNative && hadThinking && kept.length === 0) {
+            throw new ToolCompatibilityError("Claude native cannot preserve unsigned reasoning-only assistant history");
+          }
 
           // Add thinking block if thinking enabled + has tool_use but no thinking
           if (thinkingEnabled && !hasKeptThinking && hasToolUse) {
@@ -457,6 +487,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
   }
 
   // 3. Tools: filter built-in tools for non-Anthropic providers, then handle cache_control
+  const requestedToolChoice = body.tool_choice;
   if (body.tools && Array.isArray(body.tools)) {
     // Strip built-in tools (e.g. web_search_20250305) and normalize to Anthropic-native shape
     // (drop `type` field, fold `function.{name,description,parameters}`) for non-Anthropic providers
@@ -490,6 +521,13 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
       delete body.tools;
       delete body.tool_choice;
     }
+  }
+
+  // Provider-specific filtering is the last tool boundary. A forced/required
+  // choice cannot disappear with a hosted declaration or point to another tool.
+  if ((requestedToolChoice?.type === "tool" && !body.tools?.some(tool => tool.name === requestedToolChoice.name)) ||
+      (requestedToolChoice?.type === "any" && !body.tools?.length)) {
+    throw new ToolCompatibilityError("Claude target removed a required or selected tool");
   }
 
   // Apply cloaking for OAuth tokens (billing header + fake user ID)

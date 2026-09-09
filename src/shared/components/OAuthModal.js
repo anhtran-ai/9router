@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import PropTypes from "prop-types";
 import { Modal, Button, Input } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { appendSafeOAuthAuthorizeMeta, isTrustedOAuthMessageEvent } from "@/shared/utils/oauthOrigin";
 
 // Providers using the dynamic-port local callback proxy.
 // Browser OAuth: popup → auto callback → auto exchange → poll-status.
@@ -35,7 +36,7 @@ const PASTE_TOKEN_PROVIDERS = {
  * - Localhost: Auto callback via popup message
  * - Remote: Manual paste callback URL
  */
-export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, onClose, oauthMeta, idcConfig }) {
+export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, onClose, oauthMeta, idcConfig, apiBase = "/api/oauth" }) {
   const [step, setStep] = useState("waiting"); // waiting | input | success | error
   const [authData, setAuthData] = useState(null);
   const [callbackUrl, setCallbackUrl] = useState("");
@@ -73,7 +74,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
   const exchangeTokens = useCallback(async (code, state) => {
     if (!authData) return;
     try {
-      const res = await fetch(`/api/oauth/${provider}/exchange`, {
+      const res = await fetch(`${apiBase}/${provider}/exchange`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -94,12 +95,12 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       setError(err.message);
       setStep("error");
     }
-  }, [authData, provider, onSuccess, oauthMeta]);
+  }, [authData, provider, onSuccess, oauthMeta, apiBase]);
 
   const completeXaiManualCode = useCallback(async (code) => {
     if (!authData?.state) return;
     try {
-      const res = await fetch("/api/oauth/xai/manual-code", {
+      const res = await fetch(`${apiBase}/xai/manual-code`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code, state: authData.state }),
@@ -113,7 +114,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       setError(err.message);
       setStep("error");
     }
-  }, [authData, onSuccess]);
+  }, [authData, onSuccess, apiBase]);
 
   // Poll for device code token
   const startPolling = useCallback(async (deviceCode, codeVerifier, interval, extraData, deadlineMs) => {
@@ -143,7 +144,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       }
 
       try {
-        const res = await fetch(`/api/oauth/${provider}/poll`, {
+        const res = await fetch(`${apiBase}/${provider}/poll`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ deviceCode, codeVerifier, extraData }),
@@ -177,38 +178,81 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     setError("Authorization timeout");
     setStep("error");
     setPolling(false);
-  }, [provider, onSuccess]);
+  }, [provider, onSuccess, apiBase]);
 
   // Trae/Windsurf proxy OAuth flow: dynamic-port local callback → auto exchange.
   const startProxyFlow = useCallback(async (providerId) => {
+    const stopProxyBestEffort = () => {
+      fetch(`${apiBase}/${providerId}/stop-proxy`).catch(() => {});
+    };
     // 1. Start the local callback server (returns a dynamic port + callback URL).
-    const startRes = await fetch(`/api/oauth/${providerId}/start-proxy`);
-    const startData = await startRes.json();
-    if (!startRes.ok || !startData.success || !startData.callbackUrl) {
-      throw new Error(startData.reason || startData.error || `Failed to start ${providerId} callback server`);
+    let startRes;
+    let startData;
+    try {
+      startRes = await fetch(`${apiBase}/${providerId}/start-proxy`);
+      startData = await startRes.json();
+    } catch (error) {
+      stopProxyBestEffort();
+      throw error;
+    }
+    if (!startRes.ok || startData?.success !== true || typeof startData.callbackUrl !== "string") {
+      // A structured {success:false} means no new listener was acquired. Any
+      // other shape is ambiguous, so close a listener the server may have started.
+      if (startData?.success !== false) stopProxyBestEffort();
+      throw new Error(startData?.reason || startData?.error || `Failed to start ${providerId} callback server`);
     }
     // 2. Build the authorize URL with redirect_uri = proxy callback URL.
-    const authorizeUrl = new URL(`/api/oauth/${providerId}/authorize`, window.location.origin);
+    const authorizeUrl = new URL(`${apiBase}/${providerId}/authorize`, window.location.origin);
     authorizeUrl.searchParams.set("redirect_uri", startData.callbackUrl);
-    const authRes = await fetch(authorizeUrl);
-    const authData = await authRes.json();
-    if (!authRes.ok) throw new Error(authData.error);
+    let authRes;
+    let authData;
+    try {
+      authRes = await fetch(authorizeUrl);
+      authData = await authRes.json();
+    } catch (error) {
+      stopProxyBestEffort();
+      throw error;
+    }
+    if (!authRes.ok) {
+      stopProxyBestEffort();
+      throw new Error(authData.error);
+    }
     // 3. Register the session so the proxy can match the incoming callback.
     //    Zed also passes code_verifier (encodes the RSA private key for decrypt);
     //    sent via POST body so the private key never lands in URL/query logs.
     const regBody = { state: authData.state };
     if (authData.codeVerifier) regBody.codeVerifier = authData.codeVerifier;
-    await fetch(`/api/oauth/${providerId}/register-session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(regBody),
-    });
+    let regRes;
+    try {
+      regRes = await fetch(`${apiBase}/${providerId}/register-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(regBody),
+      });
+    } catch (error) {
+      stopProxyBestEffort();
+      throw error;
+    }
+    let regData = null;
+    try {
+      regData = await regRes.json();
+    } catch {
+      // Handled by the strict response check below.
+    }
+    if (!regRes.ok || regData?.success !== true) {
+      stopProxyBestEffort();
+      throw new Error(
+        regData?.error
+        || regData?.reason
+        || `Failed to register ${providerId} callback session`,
+      );
+    }
     // 4. Open popup; proxy auto-exchanges on callback, modal polls poll-status.
-    setAuthData({ ...authData, proxyProvider: providerId });
+    setAuthData({ ...authData, redirectUri: startData.callbackUrl, proxyProvider: providerId });
     setStep("waiting");
     popupRef.current = window.open(authData.authUrl, "oauth_popup", "width=600,height=700");
     if (!popupRef.current) setStep("input"); // popup blocked → fall back to manual paste
-  }, []);
+  }, [apiBase]);
 
   // Start OAuth flow
   const startOAuthFlow = useCallback(async () => {
@@ -239,7 +283,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
         setIsDeviceCode(true);
         setStep("waiting");
 
-        const deviceCodeUrl = new URL(`/api/oauth/${provider}/device-code`, window.location.origin);
+        const deviceCodeUrl = new URL(`${apiBase}/${provider}/device-code`, window.location.origin);
         if (provider === "kiro" && idcConfig?.startUrl) {
           deviceCodeUrl.searchParams.set("start_url", idcConfig.startUrl);
           if (idcConfig.region) {
@@ -303,11 +347,9 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       }
 
       // Build authorize URL first to get codeVerifier/state for codex server-side mode
-      const authorizeUrl = new URL(`/api/oauth/${provider}/authorize`, window.location.origin);
+      const authorizeUrl = new URL(`${apiBase}/${provider}/authorize`, window.location.origin);
       authorizeUrl.searchParams.set("redirect_uri", redirectUri);
-      if (oauthMeta) {
-        Object.entries(oauthMeta).forEach(([k, v]) => { if (v) authorizeUrl.searchParams.set(k, v); });
-      }
+      appendSafeOAuthAuthorizeMeta(authorizeUrl, provider, oauthMeta);
       const res = await fetch(authorizeUrl.toString());
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
@@ -315,18 +357,35 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       // Codex: start proxy with server-side session (auto-exchange) + fallback to channels
       let codexProxyActive = false;
       let codexServerSide = false;
-      if (provider === "codex") {
+      if (provider === "codex" && isLocalhost) {
+        let ambiguousCodexStart = true;
         try {
-          const proxyUrl = new URL(`/api/oauth/codex/start-proxy`, window.location.origin);
-          proxyUrl.searchParams.set("app_port", appPort);
-          proxyUrl.searchParams.set("state", data.state);
-          proxyUrl.searchParams.set("code_verifier", data.codeVerifier);
-          proxyUrl.searchParams.set("redirect_uri", redirectUri);
-          const proxyRes = await fetch(proxyUrl.toString());
+          const proxyRes = await fetch(`${apiBase}/codex/start-proxy`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              appPort,
+              state: data.state,
+              codeVerifier: data.codeVerifier,
+              redirectUri,
+            }),
+          });
           const proxyData = await proxyRes.json();
+          if (!proxyRes.ok) {
+            ambiguousCodexStart = false;
+            throw new Error(proxyData?.error || "Failed to start Codex callback server");
+          }
+          if (
+            typeof proxyData?.success !== "boolean"
+            || typeof proxyData?.serverSide !== "boolean"
+          ) throw new Error("Malformed Codex callback server response");
+          ambiguousCodexStart = false;
           codexProxyActive = proxyData.success;
           codexServerSide = !!proxyData.serverSide;
         } catch {
+          if (ambiguousCodexStart) {
+            fetch(`${apiBase}/codex/stop-proxy`).catch(() => {});
+          }
           codexProxyActive = false;
         }
       }
@@ -334,21 +393,38 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       // xAI: same fixed-port server-side proxy pattern as codex (port 56121)
       let xaiProxyActive = false;
       let xaiServerSide = false;
-      if (provider === "xai") {
+      if (provider === "xai" && isLocalhost) {
+        let ambiguousXaiStart = true;
         try {
-          const proxyUrl = new URL(`/api/oauth/xai/start-proxy`, window.location.origin);
-          proxyUrl.searchParams.set("app_port", appPort);
-          proxyUrl.searchParams.set("state", data.state);
-          proxyUrl.searchParams.set("code_verifier", data.codeVerifier);
-          proxyUrl.searchParams.set("redirect_uri", redirectUri);
-          const proxyRes = await fetch(proxyUrl.toString());
+          const proxyRes = await fetch(`${apiBase}/xai/start-proxy`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              appPort,
+              state: data.state,
+              codeVerifier: data.codeVerifier,
+              redirectUri,
+            }),
+          });
           const proxyData = await proxyRes.json();
+          if (!proxyRes.ok) {
+            ambiguousXaiStart = false;
+            throw new Error(proxyData?.error || "Failed to start xAI callback server");
+          }
+          if (
+            typeof proxyData?.success !== "boolean"
+            || typeof proxyData?.serverSide !== "boolean"
+          ) throw new Error("Malformed xAI callback server response");
+          ambiguousXaiStart = false;
           xaiProxyActive = proxyData.success;
           xaiServerSide = !!proxyData.serverSide;
           if (!xaiProxyActive && proxyData.reason === "port_busy") {
             throw new Error("Port 56121 in use; close the conflicting process and retry");
           }
         } catch (e) {
+          if (ambiguousXaiStart) {
+            fetch(`${apiBase}/xai/stop-proxy`).catch(() => {});
+          }
           if (e?.message) throw e;
           xaiProxyActive = false;
         }
@@ -396,7 +472,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       setError(err.message);
       setStep("error");
     }
-  }, [provider, isLocalhost, startPolling, oauthMeta, idcConfig, authMode, startProxyFlow]);
+  }, [provider, isLocalhost, startPolling, oauthMeta, idcConfig, authMode, startProxyFlow, apiBase]);
 
   // Reset state and start OAuth when modal opens
   useEffect(() => {
@@ -416,7 +492,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       pollingAbortRef.current = false;
       // Best-effort IDE detection for paste-token providers (Trae/Windsurf)
       if (PASTE_TOKEN_PROVIDERS[provider]) {
-        fetch(`/api/oauth/${provider}/ide-status`)
+        fetch(`${apiBase}/${provider}/ide-status`)
           .then((r) => r.json())
           .then((data) => setIdeStatus(data))
           .catch(() => setIdeStatus({ installed: false, path: null }));
@@ -427,18 +503,18 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       pollingAbortRef.current = true;
       openedRef.current = false;
       if (provider === "codex") {
-        fetch("/api/oauth/codex/stop-proxy").catch(() => {});
+        fetch(`${apiBase}/codex/stop-proxy`).catch(() => {});
       } else if (provider === "xai") {
-        fetch("/api/oauth/xai/stop-proxy").catch(() => {});
+        fetch(`${apiBase}/xai/stop-proxy`).catch(() => {});
       } else if (provider === "trae") {
-        fetch("/api/oauth/trae/stop-proxy").catch(() => {});
+        fetch(`${apiBase}/trae/stop-proxy`).catch(() => {});
       } else if (provider === "windsurf") {
-        fetch("/api/oauth/windsurf/stop-proxy").catch(() => {});
+        fetch(`${apiBase}/windsurf/stop-proxy`).catch(() => {});
       } else if (provider === "zed") {
-        fetch("/api/oauth/zed/stop-proxy").catch(() => {});
+        fetch(`${apiBase}/zed/stop-proxy`).catch(() => {});
       }
     }
-  }, [isOpen, provider, startOAuthFlow]);
+  }, [isOpen, provider, startOAuthFlow, apiBase]);
 
   // Server-side proxy mode (codex/xai fixed-port + trae/windsurf dynamic-port):
   // poll status until the proxy auto-exchanges and saves the connection.
@@ -461,7 +537,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       if (cancelled || callbackProcessedRef.current) return;
       attempts += 1;
       try {
-          const res = await fetch(`/api/oauth/${pollProvider}/poll-status?state=${encodeURIComponent(authData.state)}`);
+          const res = await fetch(`${apiBase}/${pollProvider}/poll-status?state=${encodeURIComponent(authData.state)}`);
         const data = await res.json();
         if (cancelled || callbackProcessedRef.current) return;
         if (data.status === "done") {
@@ -489,7 +565,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     };
     setTimeout(tick, POLL_INTERVAL_MS);
     return () => { cancelled = true; };
-  }, [authData, onSuccess]);
+  }, [authData, onSuccess, apiBase]);
 
   // Listen for OAuth callback via multiple methods
   useEffect(() => {
@@ -499,8 +575,14 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     // Handler for callback data - only process once
     const handleCallback = async (data) => {
       if (callbackProcessedRef.current) return; // Already processed
+      if (!data || typeof data !== "object") return;
 
       const { code, token, state, error: callbackError, errorDescription } = data;
+
+      // All automatic callback transports are untrusted shared channels.
+      // Ignore stale/foreign flows unless the provider echoed this modal's
+      // high-entropy state exactly.
+      if (typeof authData.state !== "string" || !authData.state || state !== authData.state) return;
 
       if (callbackError) {
         callbackProcessedRef.current = true;
@@ -517,12 +599,12 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
 
     // Method 1: postMessage from popup
     const handleMessage = (event) => {
-      // Allow messages from same origin or localhost (any port)
-      const isLocalhost = event.origin.includes("localhost") || event.origin.includes("127.0.0.1");
-      const isSameOrigin = event.origin === window.location.origin;
-      if (!isLocalhost && !isSameOrigin) return;
-      
-      if (event.data?.type === "oauth_callback") {
+      if (event.data?.type === "oauth_callback" && isTrustedOAuthMessageEvent(event, {
+        applicationOrigin: window.location.origin,
+        expectedCallbackOrigin: authData.redirectUri,
+        expectedPopup: popupRef.current,
+        expectedState: authData.state,
+      })) {
         handleCallback(event.data.data);
       }
     };
@@ -581,7 +663,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       if (authMode === "paste-token" && PASTE_TOKEN_PROVIDERS[provider]) {
         const token = pasteToken.trim();
         if (!token) throw new Error("Missing token");
-        const res = await fetch(`/api/oauth/${provider}/exchange`, {
+        const res = await fetch(`${apiBase}/${provider}/exchange`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ code: token }),
@@ -597,7 +679,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
 
       // Trae/Windsurf proxy flow fallback (popup blocked): paste the full callback URL
       if (PROXY_OAUTH_PROVIDERS.has(provider) && input) {
-        const res = await fetch(`/api/oauth/${provider}/exchange`, {
+        const res = await fetch(`${apiBase}/${provider}/exchange`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ code: input, state: authData?.state }),
@@ -631,6 +713,10 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       const state = url.searchParams.get("state");
       const errorParam = url.searchParams.get("error");
 
+      if (authData?.state && state !== authData.state) {
+        throw new Error("OAuth callback state does not match this login attempt");
+      }
+
       if (errorParam) {
         throw new Error(url.searchParams.get("error_description") || errorParam);
       }
@@ -655,18 +741,18 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
   // Clear session on modal close + cleanup proxy
   const handleClose = useCallback(() => {
     if (provider === "codex") {
-      fetch("/api/oauth/codex/stop-proxy").catch(() => {});
+      fetch(`${apiBase}/codex/stop-proxy`).catch(() => {});
     } else if (provider === "xai") {
-      fetch("/api/oauth/xai/stop-proxy").catch(() => {});
+      fetch(`${apiBase}/xai/stop-proxy`).catch(() => {});
     } else if (provider === "trae") {
-      fetch("/api/oauth/trae/stop-proxy").catch(() => {});
+      fetch(`${apiBase}/trae/stop-proxy`).catch(() => {});
     } else if (provider === "windsurf") {
-      fetch("/api/oauth/windsurf/stop-proxy").catch(() => {});
+      fetch(`${apiBase}/windsurf/stop-proxy`).catch(() => {});
     } else if (provider === "zed") {
-      fetch("/api/oauth/zed/stop-proxy").catch(() => {});
+      fetch(`${apiBase}/zed/stop-proxy`).catch(() => {});
     }
     onClose();
-  }, [onClose, provider]);
+  }, [onClose, provider, apiBase]);
 
   if (!provider || !providerInfo) return null;
   const isXaiProvider = provider === "xai";
@@ -924,4 +1010,6 @@ OAuthModal.propTypes = {
     startUrl: PropTypes.string,
     region: PropTypes.string,
   }),
+  /** Override OAuth API prefix for scoped portals. */
+  apiBase: PropTypes.string,
 };

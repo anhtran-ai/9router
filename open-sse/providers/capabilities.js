@@ -415,7 +415,7 @@ let catalogSource = null;
 
 /**
  * Install the synced catalog reader (server only).
- * @param {{ getModalities: Function, getLimits: Function } | null} source
+ * @param {{ getModalities: Function, getProviderModalities?: Function, getLimits: Function } | null} source
  */
 export function setCatalogSource(source) {
   catalogSource = source;
@@ -428,7 +428,11 @@ function refine(base, provider, model) {
   const result = { ...DEFAULT_CAPABILITIES, ...base };
 
   if (catalogSource) {
-    const modalities = catalogSource.getModalities(model);
+    // New catalog readers resolve modalities by provider. Keep the model-only
+    // callback as a compatibility fallback for injected/older catalog sources.
+    const modalities = typeof catalogSource.getProviderModalities === "function"
+      ? catalogSource.getProviderModalities(provider, model)
+      : catalogSource.getModalities(model);
     if (modalities) {
       for (const key of MODALITY_KEYS) {
         if (modalities[key] === true) result[key] = true;
@@ -456,13 +460,13 @@ export function getCapabilitiesForModel(provider, model) {
   // 1. Provider-specific override
   if (provider) {
     const providerCaps = PROVIDER_CAPABILITIES[provider];
-    if (providerCaps?.[model]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[model] };
-    if (providerCaps?.[baseModel]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[baseModel] };
+    if (providerCaps?.[model]) return refine(providerCaps[model], provider, model);
+    if (providerCaps?.[baseModel]) return refine(providerCaps[baseModel], provider, model);
   }
 
   // 2. Canonical exact
-  if (MODEL_CAPABILITIES[baseModel]) return { ...DEFAULT_CAPABILITIES, ...MODEL_CAPABILITIES[baseModel] };
-  if (MODEL_CAPABILITIES[model]) return { ...DEFAULT_CAPABILITIES, ...MODEL_CAPABILITIES[model] };
+  if (MODEL_CAPABILITIES[baseModel]) return refine(MODEL_CAPABILITIES[baseModel], provider, model);
+  if (MODEL_CAPABILITIES[model]) return refine(MODEL_CAPABILITIES[model], provider, model);
 
   // 3. Pattern match (first match wins), refined by catalog + name heuristic
   for (const { pattern, caps } of PATTERN_CAPABILITIES) {

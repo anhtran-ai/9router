@@ -27,6 +27,16 @@ import { v4 as uuidv4 } from "uuid";
 // 5 minutes; an individual request that stalls beyond this is treated as a
 // failed poll attempt and the next poll iteration retries.
 const FETCH_TIMEOUT_MS = 15_000;
+export const QODER_OAUTH_MAX_RESPONSE_BYTES = 1024 * 1024;
+
+class QoderOAuthBodyTooLargeError extends Error {
+  constructor(actualBytes = null) {
+    const suffix = Number.isFinite(actualBytes) ? ` (${actualBytes} bytes)` : "";
+    super(`Qoder OAuth response exceeds ${QODER_OAUTH_MAX_RESPONSE_BYTES} bytes${suffix}`);
+    this.name = "QoderOAuthBodyTooLargeError";
+    this.code = "ERR_QODER_OAUTH_BODY_TOO_LARGE";
+  }
+}
 
 function base64Url(buf) {
   return buf
@@ -36,16 +46,171 @@ function base64Url(buf) {
     .replace(/\//g, "_");
 }
 
-/**
- * Wrap fetch with an AbortController-based timeout. Without this, a stalled
- * upstream socket hangs on Node's default keepalive timeout (minutes) and
- * abandoned polls accumulate hung sockets.
- */
-async function fetchWithTimeout(url, init = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS);
+function timeoutError() {
+  return new DOMException(`Qoder OAuth request timed out after ${FETCH_TIMEOUT_MS}ms`, "TimeoutError");
+}
+
+function signalError(signal) {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new DOMException("Qoder OAuth request aborted", "AbortError");
+}
+
+function awaitWithSignal(promise, signal) {
+  if (!signal) return Promise.resolve(promise);
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(signalError(signal));
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    // Observe late resolution/rejection even after the deadline wins.
+    Promise.resolve(promise).then(
+      value => { cleanup(); resolve(value); },
+      error => { cleanup(); reject(error); },
+    );
+  });
+}
+
+function cancelBody(body, reason) {
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const cancellation = body?.cancel?.(reason);
+    Promise.resolve(cancellation).catch(() => {});
+  } catch { /* best-effort transport cleanup */ }
+}
+
+function releaseReader(reader) {
+  try { reader?.releaseLock?.(); } catch { /* pending read or already released */ }
+}
+
+function declaredLength(response) {
+  const raw = response?.headers?.get?.("content-length");
+  if (raw == null || !/^\d+$/.test(String(raw).trim())) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : Number.POSITIVE_INFINITY;
+}
+
+async function readResponseBytes(response, signal) {
+  const declared = declaredLength(response);
+  if (declared !== null && declared > QODER_OAUTH_MAX_RESPONSE_BYTES) {
+    const error = new QoderOAuthBodyTooLargeError(declared);
+    cancelBody(response?.body, error);
+    throw error;
+  }
+  if (signal?.aborted) {
+    const error = signalError(signal);
+    cancelBody(response?.body, error);
+    throw error;
+  }
+  if (!response?.body) return new Uint8Array();
+
+  if (typeof response.body.getReader !== "function") {
+    // Compatibility for lightweight response doubles. Production fetch
+    // responses always take the bounded byte-stream path below.
+    if (typeof response.arrayBuffer === "function") {
+      const arrayBuffer = await awaitWithSignal(
+        Promise.resolve().then(() => response.arrayBuffer()),
+        signal,
+      );
+      const bytes = new Uint8Array(arrayBuffer);
+      if (bytes.byteLength > QODER_OAUTH_MAX_RESPONSE_BYTES) {
+        throw new QoderOAuthBodyTooLargeError(bytes.byteLength);
+      }
+      return bytes;
+    }
+    if (typeof response.text === "function") {
+      const text = await awaitWithSignal(
+        Promise.resolve().then(() => response.text()),
+        signal,
+      );
+      const bytes = new TextEncoder().encode(text);
+      if (bytes.byteLength > QODER_OAUTH_MAX_RESPONSE_BYTES) {
+        throw new QoderOAuthBodyTooLargeError(bytes.byteLength);
+      }
+      return bytes;
+    }
+    throw new TypeError("Qoder OAuth response body is not readable");
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  let completed = false;
+  let terminalError = null;
+  try {
+    while (true) {
+      const { done, value } = await awaitWithSignal(reader.read(), signal);
+      if (done) {
+        completed = true;
+        break;
+      }
+      if (!(value instanceof Uint8Array)) {
+        throw new TypeError("Qoder OAuth response returned an invalid stream chunk");
+      }
+      totalBytes += value.byteLength;
+      if (totalBytes > QODER_OAUTH_MAX_RESPONSE_BYTES) {
+        throw new QoderOAuthBodyTooLargeError(totalBytes);
+      }
+      if (value.byteLength) chunks.push(value);
+    }
+  } catch (error) {
+    terminalError = error;
+    throw error;
+  } finally {
+    let cancellation = null;
+    if (!completed) {
+      try { cancellation = Promise.resolve(reader.cancel(terminalError)).catch(() => {}); }
+      catch { /* preserve the primary body failure */ }
+    }
+    releaseReader(reader);
+    cancellation?.finally(() => releaseReader(reader));
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+async function readResponseText(response, signal, { fatalUtf8 = false } = {}) {
+  const bytes = await readResponseBytes(response, signal);
+  return new TextDecoder("utf-8", { fatal: fatalUtf8 }).decode(bytes);
+}
+
+/**
+ * Keep one absolute deadline across response headers and body consumption.
+ * Signal races remain authoritative even for injected/non-cooperative fetch
+ * implementations; cancellation is observed but never awaited.
+ */
+async function fetchWithTimeout(url, init = {}, consume) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(timeoutError()), FETCH_TIMEOUT_MS);
+  timer.unref?.();
+  let response;
+  try {
+    const fetchPromise = Promise.resolve().then(() => fetch(url, {
+      ...init,
+      signal: controller.signal,
+    }));
+    fetchPromise.then(
+      lateResponse => {
+        if (controller.signal.aborted) cancelBody(lateResponse?.body, controller.signal.reason);
+      },
+      () => {},
+    );
+    response = await awaitWithSignal(fetchPromise, controller.signal);
+    const consumption = Promise.resolve().then(() => consume(response, controller.signal));
+    return await awaitWithSignal(consumption, controller.signal);
+  } catch (error) {
+    if (controller.signal.aborted) {
+      cancelBody(response?.body, controller.signal.reason);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -100,53 +265,56 @@ export class QoderService {
     }
     const url = `${QODER_DEVICE_TOKEN_URL}?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(codeVerifier)}&challenge_method=S256`;
 
-    const response = await fetchWithTimeout(url, {
+    return fetchWithTimeout(url, {
       method: "GET",
       headers: {
         Accept: "application/json",
         "User-Agent": "Go-http-client/2.0",
       },
-    });
+    }, async (response, signal) => {
 
-    // Pending — server has registered the device code but the user hasn't
-    // finished the browser flow yet. Both 202 and 404 mean "keep polling".
-    if (response.status === 202 || response.status === 404) {
-      return { status: "pending" };
-    }
+      // Pending — server has registered the device code but the user hasn't
+      // finished the browser flow yet. Both 202 and 404 mean "keep polling".
+      if (response.status === 202 || response.status === 404) {
+        cancelBody(response.body);
+        return { status: "pending" };
+      }
 
-    const text = await response.text();
+      const text = await readResponseText(response, signal, { fatalUtf8: response.ok });
 
-    if (!response.ok) {
-      let message = `Qoder device token poll failed: HTTP ${response.status}`;
+      if (!response.ok) {
+        let message = `Qoder device token poll failed: HTTP ${response.status}`;
+        try {
+          const body = JSON.parse(text);
+          if (body.message) message = `Qoder device token poll failed: ${body.message}`;
+        } catch {}
+        throw new Error(message);
+      }
+
+      let body;
       try {
-        const body = JSON.parse(text);
-        if (body.message) message = `Qoder device token poll failed: ${body.message}`;
-      } catch {}
-      throw new Error(message);
-    }
+        body = JSON.parse(text);
+      } catch (err) {
+        throw new Error(`Qoder device token poll: invalid JSON response (${err.message})`);
+      }
 
-    let body;
-    try {
-      body = JSON.parse(text);
-    } catch (err) {
-      throw new Error(`Qoder device token poll: invalid JSON response (${err.message})`);
-    }
+      // Defensive: 200 + empty token means the upstream changed shape.
+      if (!body || typeof body !== "object" || Array.isArray(body)
+          || typeof body.token !== "string" || !body.token.trim()) {
+        throw new Error("Qoder device token poll returned 200 but no token");
+      }
 
-    // Defensive: 200 + empty token means the upstream changed shape.
-    if (!body.token) {
-      throw new Error("Qoder device token poll returned 200 but no token");
-    }
+      const expireMs = QoderService.parseExpiry(body.expires_at, body.expires_in);
 
-    const expireMs = QoderService.parseExpiry(body.expires_at, body.expires_in);
-
-    return {
-      status: "ok",
-      accessToken: body.token,
-      refreshToken: body.refresh_token || "",
-      userId: body.user_id || "",
-      expireTime: expireMs,
-      rawResponse: body,
-    };
+      return {
+        status: "ok",
+        accessToken: body.token,
+        refreshToken: body.refresh_token || "",
+        userId: body.user_id || "",
+        expireTime: expireMs,
+        rawResponse: body,
+      };
+    });
   }
 
   /**
@@ -155,21 +323,30 @@ export class QoderService {
    */
   async fetchUserInfo(accessToken) {
     try {
-      const response = await fetchWithTimeout(QODER_USERINFO_URL, {
+      return await fetchWithTimeout(QODER_USERINFO_URL, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${accessToken}`,
           Accept: "application/json",
           "User-Agent": "Go-http-client/2.0",
         },
+      }, async (response, signal) => {
+        if (!response.ok) {
+          cancelBody(response.body);
+          return { name: "", email: "" };
+        }
+        const text = await readResponseText(response, signal, { fatalUtf8: true });
+        const body = JSON.parse(text);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          throw new Error("Qoder user info returned an invalid JSON envelope");
+        }
+        const clean = value => typeof value === "string" ? value.trim() : "";
+        return {
+          name: clean(body.name) || clean(body.username),
+          email: clean(body.email),
+          organizationId: clean(body.organization_id),
+        };
       });
-      if (!response.ok) return { name: "", email: "" };
-      const body = await response.json();
-      return {
-        name: (body.name || body.username || "").trim(),
-        email: (body.email || "").trim(),
-        organizationId: (body.organization_id || "").trim(),
-      };
     } catch {
       return { name: "", email: "" };
     }

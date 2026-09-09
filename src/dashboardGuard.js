@@ -28,6 +28,7 @@ const PUBLIC_API_PATHS = [
   "/api/auth/logout",
   "/api/auth/status",
   "/api/auth/oidc",
+  "/api/contribute",
   "/api/auth/saml",
   "/api/version",
   "/api/settings/require-login",
@@ -194,6 +195,7 @@ function isPublicApi(pathname) {
 export const __test__ = {
   isLocalRequest,
   isPublicLlmApi,
+  isPublicApi,
   extractApiKey,
   canAccessPublicLlmApi,
   canAccessLocalOnlyRoute,
