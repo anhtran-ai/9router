@@ -153,6 +153,50 @@ describe("applyAssistantPrefillPolicy", () => {
     }
   });
 
+  it.each([
+    ["empty content", []],
+    ["empty text", [{ type: CLAUDE_BLOCK.TEXT, text: "" }]],
+    ["whitespace text", [{ type: CLAUDE_BLOCK.TEXT, text: "   " }]],
+    ["missing content", undefined],
+  ])("re-checks the invariant after dropping a stacked assistant with %s", (_name, content) => {
+    const body = {
+      messages: [
+        user("q"),
+        { role: ROLE.ASSISTANT, content: [{ type: CLAUDE_BLOCK.TEXT, text: "partial" }] },
+        { role: ROLE.ASSISTANT, ...(content === undefined ? {} : { content }) },
+      ],
+    };
+    applyAssistantPrefillPolicy(body);
+    expect(roles(body)).toEqual([ROLE.USER, ROLE.ASSISTANT, ROLE.USER]);
+  });
+
+  it("re-checks an interrupted tool_use exposed by dropping an empty assistant", () => {
+    const body = {
+      messages: [
+        user("run it"),
+        { role: ROLE.ASSISTANT, content: [{ type: CLAUDE_BLOCK.TOOL_USE, id: "toolu_1", name: "bash", input: {} }] },
+        { role: ROLE.ASSISTANT, content: [] },
+      ],
+    };
+    applyAssistantPrefillPolicy(body);
+    expect(body.messages.at(-1).content[0]).toMatchObject({
+      type: CLAUDE_BLOCK.TOOL_RESULT,
+      tool_use_id: "toolu_1",
+      is_error: true,
+    });
+  });
+
+  it("never leaves messages empty after dropping contentless assistant turns", () => {
+    const body = {
+      messages: [
+        { role: ROLE.ASSISTANT, content: [] },
+        { role: ROLE.ASSISTANT, content: [{ type: CLAUDE_BLOCK.TEXT, text: " " }] },
+      ],
+    };
+    applyAssistantPrefillPolicy(body);
+    expect(roles(body)).toEqual([ROLE.USER]);
+  });
+
   it("ignores bodies without a messages array", () => {
     expect(() => applyAssistantPrefillPolicy({})).not.toThrow();
     expect(() => applyAssistantPrefillPolicy(null)).not.toThrow();

@@ -22,6 +22,11 @@ import { isValidClaudeSignature } from "../../utils/claudeSignature.js";
 //   server_tool_use          -> keep the turn, append a user continuation
 //   text-only                -> keep the turn, append a user continuation
 //   empty / unsigned only    -> drop the turn (nothing recoverable)
+//
+// Dropping is not a single step: consecutive assistant turns do reach here (an
+// interrupted turn followed by an empty one), so removing the tail can expose
+// another assistant turn underneath and leave the request still rejected. The
+// invariant is therefore re-checked after every drop.
 
 const ASSISTANT_CONTINUATION_PROMPT = "Continue from the assistant response above without repeating it.";
 const INCOMPLETE_TOOL_RESULT = "Tool execution was not completed before this request continued.";
@@ -50,6 +55,13 @@ function hasServerToolUse(content) {
   );
 }
 
+function continuationTurn() {
+  return {
+    role: ROLE.USER,
+    content: [{ type: CLAUDE_BLOCK.TEXT, text: ASSISTANT_CONTINUATION_PROMPT }],
+  };
+}
+
 /**
  * Ensure a Claude Messages conversation ends with a user turn.
  *
@@ -63,44 +75,46 @@ function hasServerToolUse(content) {
 export function applyAssistantPrefillPolicy(body) {
   if (!Array.isArray(body?.messages)) return body;
 
-  const trailingAssistant = body.messages.at(-1);
-  if (trailingAssistant?.role !== ROLE.ASSISTANT) return body;
+  while (body.messages.length > 0) {
+    const trailingAssistant = body.messages.at(-1);
+    if (trailingAssistant?.role !== ROLE.ASSISTANT) return body;
 
-  // An unresolved tool_use must keep its pairing, otherwise the next request is
-  // structurally invalid. Close each one with an explicit error tool_result.
-  const toolUses = Array.isArray(trailingAssistant.content)
-    ? trailingAssistant.content.filter(block => block?.type === CLAUDE_BLOCK.TOOL_USE && block.id)
-    : [];
-  if (toolUses.length > 0) {
-    body.messages.push({
-      role: ROLE.USER,
-      content: toolUses.map(toolUse => ({
-        type: CLAUDE_BLOCK.TOOL_RESULT,
-        tool_use_id: toolUse.id,
-        is_error: true,
-        content: INCOMPLETE_TOOL_RESULT,
-      })),
-    });
+    // An unresolved tool_use must keep its pairing, otherwise the next request is
+    // structurally invalid. Close each one with an explicit error tool_result.
+    const toolUses = Array.isArray(trailingAssistant.content)
+      ? trailingAssistant.content.filter(block => block?.type === CLAUDE_BLOCK.TOOL_USE && block.id)
+      : [];
+    if (toolUses.length > 0) {
+      body.messages.push({
+        role: ROLE.USER,
+        content: toolUses.map(toolUse => ({
+          type: CLAUDE_BLOCK.TOOL_RESULT,
+          tool_use_id: toolUse.id,
+          is_error: true,
+          content: INCOMPLETE_TOOL_RESULT,
+        })),
+      });
+      return body;
+    }
+
+    if (hasServerToolUse(trailingAssistant.content) || hasPreservableReasoning(trailingAssistant.content)) {
+      body.messages.push(continuationTurn());
+      return body;
+    }
+
+    // Nothing recoverable in the turn, so removing it loses no information.
+    // Loop again: the turn underneath may itself be an assistant turn.
+    if (!hasText(trailingAssistant.content)) {
+      body.messages.pop();
+      continue;
+    }
+
+    body.messages.push(continuationTurn());
     return body;
   }
 
-  if (hasServerToolUse(trailingAssistant.content) || hasPreservableReasoning(trailingAssistant.content)) {
-    body.messages.push({
-      role: ROLE.USER,
-      content: [{ type: CLAUDE_BLOCK.TEXT, text: ASSISTANT_CONTINUATION_PROMPT }],
-    });
-    return body;
-  }
-
-  // Nothing recoverable in the turn, so removing it loses no information.
-  if (!hasText(trailingAssistant.content)) {
-    body.messages.pop();
-    return body;
-  }
-
-  body.messages.push({
-    role: ROLE.USER,
-    content: [{ type: CLAUDE_BLOCK.TEXT, text: ASSISTANT_CONTINUATION_PROMPT }],
-  });
+  // Every turn was a contentless assistant prefill. An empty messages array is
+  // itself rejected ("at least 1 message"), so leave a minimal user turn.
+  body.messages.push(continuationTurn());
   return body;
 }
